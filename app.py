@@ -15,6 +15,13 @@ from telegram import Update
 from telegram.ext import Application
 from telegram.request import HTTPXRequest
 
+from utils.storage import (
+    STATE_CLEANUP_INTERVAL,
+    GameState,
+    load_all_states,
+    prune_expired_states,
+)
+
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
@@ -101,6 +108,8 @@ class AppState:
         self.settings: Optional[Settings] = None
         self.telegram_app: Optional[Application] = None
         self.webhook_task: Optional[asyncio.Task[None]] = None
+        self.cleanup_task: Optional[asyncio.Task[None]] = None
+        self.active_states: dict[int, GameState] = {}
 
 
 state = AppState()
@@ -155,6 +164,28 @@ async def monitor_webhook(application: Application, settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Game state restoration and cleanup
+# ---------------------------------------------------------------------------
+
+
+async def cleanup_states_periodically(app_state: AppState) -> None:
+    """Periodically prune expired game states from memory and disk."""
+
+    logger.debug(
+        "Starting state cleanup task with interval %s seconds", STATE_CLEANUP_INTERVAL
+    )
+    while True:
+        try:
+            expired = prune_expired_states(app_state.active_states)
+            if expired:
+                logger.info("Removed %s expired game states", len(expired))
+        except Exception:  # noqa: BLE001 - log any cleanup issues
+            logger.exception("State cleanup task encountered an error")
+
+        await asyncio.sleep(STATE_CLEANUP_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle events
 # ---------------------------------------------------------------------------
 
@@ -163,6 +194,12 @@ async def monitor_webhook(application: Application, settings: Settings) -> None:
 async def on_startup() -> None:
     logger.debug("FastAPI startup initiated")
     ensure_storage_directories()
+
+    state.active_states = load_all_states()
+    if state.active_states:
+        logger.info("Restored %s active game states", len(state.active_states))
+    else:
+        logger.debug("No persisted game states found during startup")
 
     settings = load_settings()
     state.settings = settings
@@ -196,11 +233,19 @@ async def on_startup() -> None:
     logger.info("Webhook configured at %s", expected_url)
 
     state.webhook_task = asyncio.create_task(monitor_webhook(telegram_application, settings))
+    state.cleanup_task = asyncio.create_task(cleanup_states_periodically(state))
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     logger.debug("FastAPI shutdown initiated")
+
+    if state.cleanup_task:
+        logger.debug("Cancelling state cleanup task")
+        state.cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await state.cleanup_task
+        state.cleanup_task = None
 
     if state.webhook_task:
         logger.debug("Cancelling webhook monitor task")
