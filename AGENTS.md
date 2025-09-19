@@ -45,7 +45,7 @@
   - `states/{chat_id}.json` — текущее состояние игрока.  
 - JSON включает: `grid`, `slots`, `filled_cells`, `solved_slots`, `score`, `created_at`.
 
-### debut логи
+### debug логи
 -логируй ключевые шаги: LangChain-вызов, валидация слов, шаги backtracking, рендер PNG, приём ответа, обновление состояния.
 
 ---
