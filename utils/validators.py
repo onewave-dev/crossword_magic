@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import unicodedata
 from dataclasses import dataclass, replace
 from typing import Iterable, Sequence, TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
+from utils.logging_config import get_logger
+
+logger = get_logger("validators")
 
 if TYPE_CHECKING:  # pragma: no cover - used only for typing
     from utils.llm_generator import WordClue
@@ -183,7 +184,14 @@ def validate_word_list(
     _LAST_VALIDATION_ISSUES.extend(issues)
 
     if issues:
-        logger.debug("Validation rejected %s words for language %s", len(issues), language)
+        logger.info(
+            "Validation rejected %s words for language %s (accepted=%s)",
+            len(issues),
+            language,
+            len(accepted),
+        )
+    else:
+        logger.info("Validation accepted %s words for language %s", len(accepted), language)
 
     return accepted
 

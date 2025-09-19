@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +11,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
 from .crossword import Puzzle
+from utils.logging_config import get_logger, logging_context
 
 # ---------------------------------------------------------------------------
 # Typing helpers
@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - provide a runtime fallback
     GameState = Any  # type: ignore
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger("render")
 
 
 CELL_SIZE = 64
@@ -239,102 +239,103 @@ def _draw_centered_text(
 def render_puzzle(puzzle: Puzzle, state: GameState) -> Path:
     """Render the crossword puzzle state into a PNG image and return its path."""
 
-    start_time = perf_counter()
-    output_dir = Path("/var/data/puzzles")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{puzzle.id}.png"
+    with logging_context(puzzle_id=puzzle.id):
+        start_time = perf_counter()
+        output_dir = Path("/var/data/puzzles")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{puzzle.id}.png"
 
-    if _should_use_cache(output_path, state):
-        logger.debug("Using cached render for puzzle %s at %s", puzzle.id, output_path)
-        return output_path
+        if _should_use_cache(output_path, state):
+            logger.debug("Using cached render for puzzle %s at %s", puzzle.id, output_path)
+            return output_path
 
-    rows = puzzle.size_rows
-    cols = puzzle.size_cols
-    width = cols * CELL_SIZE + PADDING * 2
-    height = rows * CELL_SIZE + PADDING * 2
+        rows = puzzle.size_rows
+        cols = puzzle.size_cols
+        width = cols * CELL_SIZE + PADDING * 2
+        height = rows * CELL_SIZE + PADDING * 2
 
-    solved_slots_raw = getattr(state, "solved_slots", set()) or []
-    if isinstance(solved_slots_raw, (list, tuple, set)):
-        solved_slots = {str(slot_id) for slot_id in solved_slots_raw}
-    elif isinstance(solved_slots_raw, Mapping):
-        solved_slots = {str(key) for key, value in solved_slots_raw.items() if value}
-    else:
-        solved_slots = {str(solved_slots_raw)}
-
-    hinted_cells_source = (
-        getattr(state, "hinted_cells", None)
-        or getattr(state, "revealed_cells", None)
-        or getattr(state, "revealed_letters", None)
-    )
-    hinted_cells = set(_normalise_coord_collection(hinted_cells_source))
-
-    filled_cells = _normalise_filled_cells(getattr(state, "filled_cells", {}))
-
-    cell_slots = _cell_slot_mapping(puzzle)
-    cell_numbers = _cell_numbers(puzzle)
-
-    for slot in puzzle.slots:
-        if slot.slot_id not in solved_slots:
-            continue
-        if slot.answer:
-            answer = slot.answer
+        solved_slots_raw = getattr(state, "solved_slots", set()) or []
+        if isinstance(solved_slots_raw, (list, tuple, set)):
+            solved_slots = {str(slot_id) for slot_id in solved_slots_raw}
+        elif isinstance(solved_slots_raw, Mapping):
+            solved_slots = {str(key) for key, value in solved_slots_raw.items() if value}
         else:
-            letters = [puzzle.cell(r, c).letter for r, c in slot.coordinates()]
-            answer = "".join(letters)
-        for index, coord in enumerate(slot.coordinates()):
-            if not answer:
+            solved_slots = {str(solved_slots_raw)}
+
+        hinted_cells_source = (
+            getattr(state, "hinted_cells", None)
+            or getattr(state, "revealed_cells", None)
+            or getattr(state, "revealed_letters", None)
+        )
+        hinted_cells = set(_normalise_coord_collection(hinted_cells_source))
+
+        filled_cells = _normalise_filled_cells(getattr(state, "filled_cells", {}))
+
+        cell_slots = _cell_slot_mapping(puzzle)
+        cell_numbers = _cell_numbers(puzzle)
+
+        for slot in puzzle.slots:
+            if slot.slot_id not in solved_slots:
                 continue
-            if index >= len(answer):
-                break
-            filled_cells[coord] = answer[index].upper()
-
-    number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)))
-    letter_font = _load_font(max(18, math.floor(CELL_SIZE * 0.6)), bold=True)
-
-    image = Image.new("RGB", (width, height), COLOR_BACKGROUND)
-    draw = ImageDraw.Draw(image)
-
-    try:
-        for row in range(rows):
-            for col in range(cols):
-                x0 = PADDING + col * CELL_SIZE
-                y0 = PADDING + row * CELL_SIZE
-                x1 = x0 + CELL_SIZE
-                y1 = y0 + CELL_SIZE
-
-                cell = puzzle.cell(row, col)
-                if cell.is_block:
-                    draw.rectangle((x0, y0, x1, y1), fill=COLOR_BLOCK)
+            if slot.answer:
+                answer = slot.answer
+            else:
+                letters = [puzzle.cell(r, c).letter for r, c in slot.coordinates()]
+                answer = "".join(letters)
+            for index, coord in enumerate(slot.coordinates()):
+                if not answer:
                     continue
+                if index >= len(answer):
+                    break
+                filled_cells[coord] = answer[index].upper()
 
-                coord = (row, col)
-                cell_slot_ids = cell_slots.get(coord, set())
-                is_solved = bool(cell_slot_ids & solved_slots)
+        number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)))
+        letter_font = _load_font(max(18, math.floor(CELL_SIZE * 0.6)), bold=True)
 
-                background = COLOR_SOLVED if is_solved else COLOR_BACKGROUND
-                if coord in hinted_cells and not is_solved:
-                    background = COLOR_HINT
+        image = Image.new("RGB", (width, height), COLOR_BACKGROUND)
+        draw = ImageDraw.Draw(image)
 
-                draw.rectangle((x0, y0, x1, y1), fill=background, outline=COLOR_GRID, width=GRID_WIDTH)
+        try:
+            for row in range(rows):
+                for col in range(cols):
+                    x0 = PADDING + col * CELL_SIZE
+                    y0 = PADDING + row * CELL_SIZE
+                    x1 = x0 + CELL_SIZE
+                    y1 = y0 + CELL_SIZE
 
-                number = cell_numbers.get(coord)
-                if number:
-                    draw.text((x0 + 4, y0 + 2), number, font=number_font, fill=COLOR_NUMBER)
+                    cell = puzzle.cell(row, col)
+                    if cell.is_block:
+                        draw.rectangle((x0, y0, x1, y1), fill=COLOR_BLOCK)
+                        continue
 
-                letter = filled_cells.get(coord, "")
-                _draw_centered_text(draw, (x0, y0, x1, y1), letter, letter_font, COLOR_TEXT)
+                    coord = (row, col)
+                    cell_slot_ids = cell_slots.get(coord, set())
+                    is_solved = bool(cell_slot_ids & solved_slots)
 
-    except Exception as exc:  # noqa: BLE001 - log any rendering failure
-        logger.exception("Failed to render puzzle %s", puzzle.id)
-        raise exc
+                    background = COLOR_SOLVED if is_solved else COLOR_BACKGROUND
+                    if coord in hinted_cells and not is_solved:
+                        background = COLOR_HINT
 
-    try:
-        image.save(output_path, format="PNG")
-    except Exception as exc:  # noqa: BLE001 - log saving issues separately
-        logger.exception("Failed to save rendered puzzle %s to %s", puzzle.id, output_path)
-        raise exc
+                    draw.rectangle((x0, y0, x1, y1), fill=background, outline=COLOR_GRID, width=GRID_WIDTH)
 
-    duration = perf_counter() - start_time
-    logger.info("Rendered puzzle %s in %.3f seconds -> %s", puzzle.id, duration, output_path)
-    return output_path
+                    number = cell_numbers.get(coord)
+                    if number:
+                        draw.text((x0 + 4, y0 + 2), number, font=number_font, fill=COLOR_NUMBER)
+
+                    letter = filled_cells.get(coord, "")
+                    _draw_centered_text(draw, (x0, y0, x1, y1), letter, letter_font, COLOR_TEXT)
+
+        except Exception as exc:  # noqa: BLE001 - log any rendering failure
+            logger.exception("Failed to render puzzle %s", puzzle.id)
+            raise exc
+
+        try:
+            image.save(output_path, format="PNG")
+        except Exception as exc:  # noqa: BLE001 - log saving issues separately
+            logger.exception("Failed to save rendered puzzle %s to %s", puzzle.id, output_path)
+            raise exc
+
+        duration = perf_counter() - start_time
+        logger.info("Rendered puzzle %s in %.3f seconds -> %s", puzzle.id, duration, output_path)
+        return output_path
 

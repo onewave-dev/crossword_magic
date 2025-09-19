@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import dataclass
 from typing import Iterable
@@ -13,9 +12,10 @@ from langchain_core.pydantic_v1 import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
+from utils.logging_config import get_logger
 from utils.validators import validate_word_list
 
-logger = logging.getLogger(__name__)
+logger = get_logger("generator")
 
 
 @dataclass(slots=True)
@@ -155,7 +155,7 @@ def generate_clues(theme: str, language: str) -> list[WordClue]:
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             messages = _PROMPT.format_messages(theme=theme, language=language)
-            logger.debug("Requesting clues from LLM (attempt %s)", attempt)
+            logger.info("Requesting clues from LLM (attempt %s)", attempt)
             response = llm.invoke(messages)
             raw_content = response.content if hasattr(response, "content") else str(response)
             parsed = _parse_response(raw_content)

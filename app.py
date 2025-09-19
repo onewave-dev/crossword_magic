@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 from uuid import uuid4
 from contextlib import suppress
+from functools import wraps
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -29,6 +29,8 @@ from telegram.request import HTTPXRequest
 from utils.storage import (
     STATE_CLEANUP_INTERVAL,
     GameState,
+    delete_puzzle,
+    delete_state,
     load_puzzle,
     load_all_states,
     load_state,
@@ -48,12 +50,14 @@ from utils.llm_generator import WordClue, generate_clues
 from utils.render import render_puzzle
 from utils.validators import WordValidationError, validate_word_list
 
+from utils.logging_config import configure_logging, get_logger, logging_context
+
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+logger = get_logger("app")
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,49 @@ def get_telegram_application() -> Application:
     return state.telegram_app
 
 
+def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
+    """Remove in-memory and persisted resources for the provided chat."""
+
+    with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
+        if chat_id in state.active_states:
+            del state.active_states[chat_id]
+        delete_state(chat_id)
+        if puzzle_id:
+            delete_puzzle(puzzle_id)
+        logger.info("Cleaned up resources for chat %s", chat_id)
+
+
+def _cleanup_game_state(game_state: GameState | None) -> None:
+    if game_state is None:
+        return
+    _cleanup_chat_resources(game_state.chat_id, game_state.puzzle_id)
+
+
+def command_entrypoint(fallback=None):
+    """Decorator for command handlers providing logging context and error handling."""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            chat = update.effective_chat if update else None
+            chat_id = chat.id if chat else None
+            with logging_context(chat_id=chat_id):
+                try:
+                    return await func(update, context, *args, **kwargs)
+                except Exception:  # noqa: BLE001 - ensure all exceptions are logged
+                    logger.exception("Unhandled error in command %s", getattr(func, "__name__", "<unknown>"))
+                    message = update.effective_message if update else None
+                    if message is not None:
+                        await message.reply_text(
+                            "Произошла временная ошибка. Пожалуйста, попробуйте позже."
+                        )
+                    return fallback
+
+        return wrapper
+
+    return decorator
+
+
 def register_webhook_route(path: str) -> None:
     """Register the webhook endpoint for the configured path."""
 
@@ -240,28 +287,32 @@ def _ensure_hint_set(game_state: GameState) -> set[str]:
 
 
 def _store_state(game_state: GameState) -> None:
-    state.active_states[game_state.chat_id] = game_state
-    save_state(game_state)
-    logger.debug("Game state for chat %s persisted", game_state.chat_id)
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        state.active_states[game_state.chat_id] = game_state
+        save_state(game_state)
+        logger.info("Game state persisted for chat %s", game_state.chat_id)
 
 
 def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
-    if chat_id in state.active_states:
-        return state.active_states[chat_id]
-    restored = load_state(chat_id)
-    if restored is None:
-        return None
-    state.active_states[chat_id] = restored
-    logger.debug("Restored state for chat %s from disk during command handling", chat_id)
-    return restored
+    with logging_context(chat_id=chat_id):
+        if chat_id in state.active_states:
+            return state.active_states[chat_id]
+        restored = load_state(chat_id)
+        if restored is None:
+            return None
+        state.active_states[chat_id] = restored
+        logger.info("Restored state from disk during command handling")
+        return restored
 
 
 def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle]:
-    payload = load_puzzle(game_state.puzzle_id)
-    if payload is None:
-        logger.error("Puzzle %s referenced by chat %s is missing", game_state.puzzle_id, game_state.chat_id)
-        return None
-    return puzzle_from_dict(dict(payload))
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        payload = load_puzzle(game_state.puzzle_id)
+        if payload is None:
+            logger.error("Puzzle referenced by chat is missing")
+            return None
+        logger.debug("Loaded puzzle definition for rendering or clues")
+        return puzzle_from_dict(dict(payload))
 
 
 def _format_clue_section(slots: Iterable[Slot]) -> str:
@@ -299,19 +350,20 @@ async def _reject_group_chat(update: Update) -> bool:
 
 
 def _apply_answer_to_state(game_state: GameState, slot: Slot, answer: str) -> None:
-    logger.debug("Applying answer for slot %s in chat %s", slot.slot_id, game_state.chat_id)
-    keys: list[str] = []
-    for index, (row, col) in enumerate(slot.coordinates()):
-        key = _coord_key(row, col)
-        keys.append(key)
-        if index < len(answer):
-            game_state.filled_cells[key] = answer[index]
-    hint_set = _ensure_hint_set(game_state)
-    for key in keys:
-        hint_set.discard(key)
-    game_state.solved_slots.add(slot.slot_id)
-    game_state.last_update = time.time()
-    _store_state(game_state)
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        logger.debug("Applying answer for slot %s", slot.slot_id)
+        keys: list[str] = []
+        for index, (row, col) in enumerate(slot.coordinates()):
+            key = _coord_key(row, col)
+            keys.append(key)
+            if index < len(answer):
+                game_state.filled_cells[key] = answer[index]
+        hint_set = _ensure_hint_set(game_state)
+        for key in keys:
+            hint_set.discard(key)
+        game_state.solved_slots.add(slot.slot_id)
+        game_state.last_update = time.time()
+        _store_state(game_state)
 
 
 def _reveal_letter(game_state: GameState, slot: Slot, answer: str) -> Optional[tuple[int, str]]:
@@ -372,14 +424,15 @@ async def _reminder_job(context: CallbackContext) -> None:
     if job is None:
         return
     chat_id = job.chat_id
-    logger.debug("Sending reminder for chat %s", chat_id)
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Не забывайте про /hint, если нужна подсказка!",
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to deliver reminder message to chat %s", chat_id)
+    with logging_context(chat_id=chat_id):
+        logger.debug("Sending reminder for chat %s", chat_id)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Не забывайте про /hint, если нужна подсказка!",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to deliver reminder message to chat %s", chat_id)
 
 
 def _assign_clues_to_slots(puzzle: Puzzle, clues: Sequence[WordClue]) -> None:
@@ -395,56 +448,59 @@ def _assign_clues_to_slots(puzzle: Puzzle, clues: Sequence[WordClue]) -> None:
 
 
 def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, GameState]:
-    logger.debug(
-        "Starting puzzle generation for chat %s (language=%s, theme=%s)",
-        chat_id,
-        language,
-        theme,
-    )
-    clues = generate_clues(theme=theme, language=language)
-    logger.debug("Generated %s raw clues from LLM", len(clues))
-    validated_clues = validate_word_list(language, clues, deduplicate=True)
-    if not validated_clues:
-        raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
-
-    max_attempt_words = min(len(validated_clues), 80)
-    min_attempt_words = max(10, min(30, max_attempt_words))
-
-    rows = len(DEFAULT_PUZZLE_TEMPLATE)
-    cols = len(DEFAULT_PUZZLE_TEMPLATE[0]) if rows else 11
-
-    for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-        candidate_words = [clue.word for clue in validated_clues[:limit]]
-        puzzle_id = uuid4().hex
-        puzzle = Puzzle.from_size(
-            puzzle_id=puzzle_id,
-            theme=theme,
-            language=language,
-            rows=rows,
-            cols=cols,
-            block_positions=DEFAULT_BLOCK_POSITIONS,
+    with logging_context(chat_id=chat_id):
+        logger.info(
+            "Starting puzzle generation (language=%s, theme=%s)",
+            language,
+            theme,
         )
-        if fill_puzzle_with_words(puzzle, candidate_words):
-            _assign_clues_to_slots(puzzle, validated_clues)
-            save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
-            now = time.time()
-            game_state = GameState(
-                chat_id=chat_id,
-                puzzle_id=puzzle.id,
-                filled_cells={},
-                solved_slots=set(),
-                score=0,
-                hints_used=0,
-                started_at=now,
-                last_update=now,
-                hinted_cells=set(),
-            )
-            _store_state(game_state)
-            logger.info("Generated puzzle %s for chat %s", puzzle.id, chat_id)
-            return puzzle, game_state
-        logger.debug("Attempt with %s words failed to fill puzzle", limit)
+        clues = generate_clues(theme=theme, language=language)
+        logger.info("Received %s raw clues from LLM", len(clues))
+        validated_clues = validate_word_list(language, clues, deduplicate=True)
+        logger.info("Validated %s clues for placement", len(validated_clues))
+        if not validated_clues:
+            raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
 
-    raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
+        max_attempt_words = min(len(validated_clues), 80)
+        min_attempt_words = max(10, min(30, max_attempt_words))
+
+        rows = len(DEFAULT_PUZZLE_TEMPLATE)
+        cols = len(DEFAULT_PUZZLE_TEMPLATE[0]) if rows else 11
+
+        for limit in range(max_attempt_words, min_attempt_words - 1, -1):
+            candidate_words = [clue.word for clue in validated_clues[:limit]]
+            puzzle_id = uuid4().hex
+            puzzle = Puzzle.from_size(
+                puzzle_id=puzzle_id,
+                theme=theme,
+                language=language,
+                rows=rows,
+                cols=cols,
+                block_positions=DEFAULT_BLOCK_POSITIONS,
+            )
+            with logging_context(chat_id=chat_id, puzzle_id=puzzle.id):
+                if fill_puzzle_with_words(puzzle, candidate_words):
+                    logger.info("Filled puzzle grid using %s candidate words", limit)
+                    _assign_clues_to_slots(puzzle, validated_clues)
+                    save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
+                    now = time.time()
+                    game_state = GameState(
+                        chat_id=chat_id,
+                        puzzle_id=puzzle.id,
+                        filled_cells={},
+                        solved_slots=set(),
+                        score=0,
+                        hints_used=0,
+                        started_at=now,
+                        last_update=now,
+                        hinted_cells=set(),
+                    )
+                    _store_state(game_state)
+                    logger.info("Generated puzzle ready for delivery")
+                    return puzzle, game_state
+                logger.debug("Attempt with %s words failed to fill puzzle", limit)
+
+        raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +508,7 @@ def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, G
 # ---------------------------------------------------------------------------
 
 
+@command_entrypoint(fallback=ConversationHandler.END)
 async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -465,6 +522,7 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return LANGUAGE_STATE
 
 
+@command_entrypoint(fallback=ConversationHandler.END)
 async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -482,6 +540,7 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return THEME_STATE
 
 
+@command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -502,33 +561,51 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if chat is None:
         return ConversationHandler.END
 
-    logger.debug("Chat %s requested theme '%s'", chat.id, theme)
+    logger.info("Chat %s requested theme '%s'", chat.id, theme)
     await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
     loop = asyncio.get_running_loop()
     try:
         puzzle, game_state = await loop.run_in_executor(
             None, _generate_puzzle, chat.id, language, theme
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("Failed to generate puzzle for chat %s", chat.id)
-        await message.reply_text(f"Не удалось создать кроссворд: {exc}")
+        _cleanup_chat_resources(chat.id)
+        await message.reply_text(
+            "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
+        )
         context.user_data.pop("new_game_language", None)
         return ConversationHandler.END
 
     context.user_data.pop("new_game_language", None)
     _cancel_reminder(context)
 
-    image_path = render_puzzle(puzzle, game_state)
-    await context.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    with open(image_path, "rb") as photo:
-        await message.reply_photo(
-            photo=photo,
-            caption=(
-                f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
-            ),
+    image_path = None
+    try:
+        with logging_context(puzzle_id=puzzle.id):
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(
+                    photo=photo,
+                    caption=(
+                        f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
+                    ),
+                )
+            await message.reply_text(_format_clues_message(puzzle))
+            logger.info("Delivered freshly generated puzzle to chat")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to deliver puzzle to chat %s", chat.id)
+        _cleanup_game_state(game_state)
+        if image_path is not None:
+            with suppress(OSError):
+                image_path.unlink(missing_ok=True)
+        await message.reply_text(
+            "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
         )
-
-    await message.reply_text(_format_clues_message(puzzle))
+        return ConversationHandler.END
 
     if context.job_queue:
         job = context.job_queue.run_once(
@@ -542,6 +619,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
+@command_entrypoint(fallback=ConversationHandler.END)
 async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     context.user_data.pop("new_game_language", None)
@@ -550,6 +628,7 @@ async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+@command_entrypoint()
 async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -567,9 +646,12 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if puzzle is None:
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать новую игру.")
         return
-    await message.reply_text(_format_clues_message(puzzle))
+    with logging_context(puzzle_id=puzzle.id):
+        logger.info("Sending clues to chat")
+        await message.reply_text(_format_clues_message(puzzle))
 
 
+@command_entrypoint()
 async def send_state_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -587,12 +669,21 @@ async def send_state_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if puzzle is None:
         await message.reply_text("Кроссворд не найден. Попробуйте начать новую игру.")
         return
-    image_path = render_puzzle(puzzle, game_state)
-    await context.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    with open(image_path, "rb") as photo:
-        await message.reply_photo(photo=photo)
+    try:
+        with logging_context(puzzle_id=puzzle.id):
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(photo=photo)
+            logger.info("Sent current puzzle state image")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to render state image for chat %s", chat.id)
+        await message.reply_text("Не удалось подготовить изображение. Попробуйте позже.")
 
 
+@command_entrypoint()
 async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -617,54 +708,68 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if puzzle is None:
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать заново.")
         return
-    slot = _find_slot(puzzle, slot_id)
-    if slot is None:
-        await message.reply_text(f"Слот {slot_id} не найден.")
-        return
-    if slot.slot_id in game_state.solved_slots:
-        await message.reply_text("Этот слот уже решён.")
-        return
-    if not slot.answer:
-        await message.reply_text("Для этого слота не задан ответ.")
-        return
+    with logging_context(puzzle_id=puzzle.id):
+        slot = _find_slot(puzzle, slot_id)
+        if slot is None:
+            logger.warning("Answer received for missing slot %s", slot_id)
+            await message.reply_text(f"Слот {slot_id} не найден.")
+            return
+        if slot.slot_id in game_state.solved_slots:
+            await message.reply_text("Этот слот уже решён.")
+            return
+        if not slot.answer:
+            await message.reply_text("Для этого слота не задан ответ.")
+            return
 
-    try:
-        validated = validate_word_list(
-            puzzle.language,
-            [WordClue(word=raw_answer, clue="")],
-            deduplicate=False,
-        )
-    except WordValidationError as exc:
-        logger.debug("Validation error for chat %s: %s", chat.id, exc)
-        await message.reply_text(f"Слово не прошло проверку: {exc}")
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error validating answer for chat %s", chat.id)
-        await message.reply_text(f"Не удалось проверить слово: {exc}")
-        return
+        try:
+            validated = validate_word_list(
+                puzzle.language,
+                [WordClue(word=raw_answer, clue="")],
+                deduplicate=False,
+            )
+        except WordValidationError as exc:
+            logger.warning("Rejected answer for slot %s due to validation: %s", slot.slot_id, exc)
+            await message.reply_text(f"Слово не прошло проверку: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Unexpected error validating answer for slot %s", slot.slot_id)
+            await message.reply_text("Не удалось проверить слово. Попробуйте позже.")
+            return
 
-    if not validated:
-        await message.reply_text("Слово не соответствует правилам языка.")
-        return
+        if not validated:
+            logger.info("Answer for slot %s failed language rules", slot.slot_id)
+            await message.reply_text("Слово не соответствует правилам языка.")
+            return
 
-    candidate = validated[0].word
-    if _canonical_answer(candidate, puzzle.language) != _canonical_answer(slot.answer, puzzle.language):
-        await message.reply_text("Ответ неверный, попробуйте ещё раз.")
-        return
+        candidate = validated[0].word
+        if _canonical_answer(candidate, puzzle.language) != _canonical_answer(slot.answer, puzzle.language):
+            logger.info("Incorrect answer for slot %s", slot.slot_id)
+            await message.reply_text("Ответ неверный, попробуйте ещё раз.")
+            return
 
-    game_state.score += slot.length
-    _apply_answer_to_state(game_state, slot, candidate)
+        game_state.score += slot.length
+        _apply_answer_to_state(game_state, slot, candidate)
+        logger.info("Accepted answer for slot %s", slot.slot_id)
 
-    image_path = render_puzzle(puzzle, game_state)
-    await context.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    with open(image_path, "rb") as photo:
-        await message.reply_photo(photo=photo, caption=f"Верно! {slot.slot_id}")
+        try:
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(photo=photo, caption=f"Верно! {slot.slot_id}")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to render updated grid after correct answer")
+            await message.reply_text(
+                "Ответ принят, но не удалось обновить изображение. Попробуйте команду /state позже."
+            )
 
-    if _all_slots_solved(puzzle, game_state):
-        _cancel_reminder(context)
-        await message.reply_text("Поздравляем! Все слова разгаданы.")
+        if _all_slots_solved(puzzle, game_state):
+            _cancel_reminder(context)
+            await message.reply_text("Поздравляем! Все слова разгаданы.")
 
 
+@command_entrypoint()
 async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -684,49 +789,61 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Не удалось загрузить кроссворд.")
         return
 
-    slot: Optional[Slot] = None
-    if context.args:
-        slot = _find_slot(puzzle, context.args[0])
-        if slot is None:
-            await message.reply_text(f"Слот {context.args[0]} не найден.")
+    with logging_context(puzzle_id=puzzle.id):
+        slot: Optional[Slot] = None
+        if context.args:
+            slot = _find_slot(puzzle, context.args[0])
+            if slot is None:
+                await message.reply_text(f"Слот {context.args[0]} не найден.")
+                return
+        else:
+            for candidate in puzzle.slots:
+                if candidate.slot_id in game_state.solved_slots:
+                    continue
+                if not candidate.answer:
+                    continue
+                slot = candidate
+                break
+            if slot is None:
+                await message.reply_text("Нет слотов для подсказки.")
+                return
+
+        if not slot.answer:
+            await message.reply_text("Для этого слота нет ответа.")
             return
-    else:
-        for candidate in puzzle.slots:
-            if candidate.slot_id in game_state.solved_slots:
-                continue
-            if not candidate.answer:
-                continue
-            slot = candidate
-            break
-        if slot is None:
-            await message.reply_text("Нет слотов для подсказки.")
-            return
 
-    if not slot.answer:
-        await message.reply_text("Для этого слота нет ответа.")
-        return
+        result = _reveal_letter(game_state, slot, slot.answer)
+        if result is None:
+            game_state.hints_used += 1
+            game_state.last_update = time.time()
+            _store_state(game_state)
+            reply_text = (
+                f"Все буквы в {slot.slot_id} уже открыты. Подсказка: {slot.clue or 'нет'}"
+            )
+            logger.info("Hint requested for already revealed slot %s", slot.slot_id)
+        else:
+            position, letter = result
+            reply_text = (
+                f"Открыта буква №{position + 1} в {slot.slot_id}: {letter}\n"
+                f"Подсказка: {slot.clue or 'нет'}"
+            )
+            logger.info("Revealed letter %s at position %s for slot %s", letter, position + 1, slot.slot_id)
 
-    result = _reveal_letter(game_state, slot, slot.answer)
-    if result is None:
-        game_state.hints_used += 1
-        game_state.last_update = time.time()
-        _store_state(game_state)
-        reply_text = (
-            f"Все буквы в {slot.slot_id} уже открыты. Подсказка: {slot.clue or 'нет'}"
-        )
-    else:
-        position, letter = result
-        reply_text = (
-            f"Открыта буква №{position + 1} в {slot.slot_id}: {letter}\n"
-            f"Подсказка: {slot.clue or 'нет'}"
-        )
-
-    image_path = render_puzzle(puzzle, game_state)
-    await context.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    with open(image_path, "rb") as photo:
-        await message.reply_photo(photo=photo, caption=reply_text)
+        try:
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(photo=photo, caption=reply_text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to render grid after hint for slot %s", slot.slot_id)
+            await message.reply_text(
+                "Подсказка сохранена, но не удалось обновить изображение. Попробуйте /state позже."
+            )
 
 
+@command_entrypoint()
 async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -746,20 +863,31 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("Кроссворд не найден. Запустите /new.")
         return
 
-    solved_now = _solve_remaining_slots(game_state, puzzle)
-    if not solved_now:
-        await message.reply_text("Все ответы уже открыты.")
-        return
+    with logging_context(puzzle_id=puzzle.id):
+        solved_now = _solve_remaining_slots(game_state, puzzle)
+        if not solved_now:
+            await message.reply_text("Все ответы уже открыты.")
+            return
 
-    _cancel_reminder(context)
+        _cancel_reminder(context)
 
-    image_path = render_puzzle(puzzle, game_state)
-    await context.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    with open(image_path, "rb") as photo:
-        await message.reply_photo(photo=photo, caption="Кроссворд раскрыт полностью.")
+        try:
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(photo=photo, caption="Кроссворд раскрыт полностью.")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to render puzzle after solve command")
+            await message.reply_text(
+                "Кроссворд решён, но не удалось подготовить изображение. Попробуйте /state позже."
+            )
+            return
 
-    solved_lines = "\n".join(f"{slot_id}: {answer}" for slot_id, answer in solved_now)
-    await message.reply_text(f"Оставшиеся ответы:\n{solved_lines}")
+        solved_lines = "\n".join(f"{slot_id}: {answer}" for slot_id, answer in solved_now)
+        await message.reply_text(f"Оставшиеся ответы:\n{solved_lines}")
+        logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
 
 
 def configure_telegram_handlers(telegram_application: Application) -> None:

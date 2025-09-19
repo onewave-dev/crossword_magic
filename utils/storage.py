@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import tempfile
 import time
@@ -13,7 +12,9 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 import orjson
 
-logger = logging.getLogger(__name__)
+from utils.logging_config import get_logger
+
+logger = get_logger("storage")
 
 DATA_ROOT = Path("/var/data")
 PUZZLES_DIR = DATA_ROOT / "puzzles"
@@ -131,6 +132,15 @@ def save_puzzle(puzzle_id: str, payload: Mapping[str, Any]) -> None:
     data = _dump_json(payload)
     _write_atomic(path, data)
     logger.debug("Saved puzzle %s to %s", puzzle_id, path)
+
+
+def delete_puzzle(puzzle_id: str) -> None:
+    """Delete a stored puzzle definition if present."""
+
+    path = PUZZLES_DIR / f"{puzzle_id}{STATE_FILE_SUFFIX}"
+    with suppress(FileNotFoundError):
+        path.unlink()
+        logger.debug("Deleted puzzle file %s", path)
 
 
 def load_state(chat_id: int) -> Optional[GameState]:
