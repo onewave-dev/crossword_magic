@@ -13,7 +13,7 @@ from langchain_core.pydantic_v1 import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from utils.validators import validate_word_clues
+from utils.validators import validate_word_list
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def generate_clues(theme: str, language: str) -> list[WordClue]:
             raw_content = response.content if hasattr(response, "content") else str(response)
             parsed = _parse_response(raw_content)
             normalised = _normalise_payload(parsed.clues)
-            validated = validate_word_clues(normalised, language)
+            validated = validate_word_list(language, normalised)
 
             if len(validated) >= 60:
                 logger.info("Generated %s validated clues", len(validated))
