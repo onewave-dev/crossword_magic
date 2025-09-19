@@ -36,6 +36,7 @@ class GameState:
     hints_used: int
     started_at: float
     last_update: float
+    hinted_cells: set[str] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the state into a JSON-compatible dictionary."""
@@ -49,6 +50,7 @@ class GameState:
             "hints_used": self.hints_used,
             "started_at": self.started_at,
             "last_update": self.last_update,
+            "hinted_cells": sorted(self.hinted_cells or ()),
         }
 
     @classmethod
@@ -71,6 +73,7 @@ class GameState:
             hints_used=int(payload.get("hints_used", 0)),
             started_at=float(payload.get("started_at", time.time())),
             last_update=float(payload.get("last_update", time.time())),
+            hinted_cells={str(item) for item in payload.get("hinted_cells", [])},
         )
 
 
