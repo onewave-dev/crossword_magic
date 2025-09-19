@@ -43,7 +43,10 @@
 - Render Persistent Disk (`/var/data/`), JSON-файлы для хранения:  
   - `puzzles/{puzzle_id}.json` — структура кроссворда;  
   - `states/{chat_id}.json` — текущее состояние игрока.  
-- JSON включает: `grid`, `slots`, `filled_cells`, `solved_slots`, `score`, `created_at`.  
+- JSON включает: `grid`, `slots`, `filled_cells`, `solved_slots`, `score`, `created_at`.
+
+### debut логи
+-логируй ключевые шаги: LangChain-вызов, валидация слов, шаги backtracking, рендер PNG, приём ответа, обновление состояния.
 
 ---
 
