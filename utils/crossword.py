@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import json
-import logging
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
+from utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("crossword")
 
 
 class Direction(str, Enum):
