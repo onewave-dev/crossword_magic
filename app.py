@@ -979,9 +979,10 @@ async def on_startup() -> None:
     state.settings = settings
 
     logger.debug("Building Telegram application")
-    httpx_request = HTTPXRequest(
-        additional_headers={"Authorization": f"Bearer {settings.telegram_bot_token}"}
-    )
+    # python-telegram-bot handles authentication via the provided bot token, so we do not
+    # need to inject custom authorization headers. Creating the request without extra
+    # kwargs keeps compatibility with future library versions.
+    httpx_request = HTTPXRequest()
     telegram_application = (
         Application.builder()
         .token(settings.telegram_bot_token)
