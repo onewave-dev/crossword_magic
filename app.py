@@ -892,7 +892,7 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def configure_telegram_handlers(telegram_application: Application) -> None:
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("new", start_new_game)],
+        entry_points=[CommandHandler(["new", "start"], start_new_game)],
         states={
             LANGUAGE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_language)],
             THEME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_theme)],
@@ -1035,7 +1035,7 @@ async def on_shutdown() -> None:
     if state.telegram_app:
         logger.debug("Shutting down Telegram application")
 
-        if state.telegram_app.is_running:
+        if getattr(state.telegram_app, "running", False):   
             logger.debug("Stopping Telegram application")
             await state.telegram_app.stop()
 
