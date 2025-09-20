@@ -57,7 +57,7 @@ _PROMPT = ChatPromptTemplate.from_messages(
             "Theme: {theme}\n"
             "Language: {language}\n"
             "Generate at least 60 unique single-word crossword answers that fit the theme. "
-            "Each answer must be between 3 and 12 characters long, consist only of letters of the target language, "
+            "Each answer must be between 3 and 15 characters long, consist only of letters of the target language, "
             "and must not contain spaces, hyphens or digits. Provide a concise clue for every word and an optional "
             "direction preference (across, down, any).",
         ),

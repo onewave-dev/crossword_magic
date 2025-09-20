@@ -75,7 +75,7 @@ _LANGUAGE_PATTERNS: dict[str, re.Pattern[str]] = {
 _GENERIC_LETTERS = re.compile(r"^[^\W\d_]+$", re.UNICODE)
 
 _MIN_WORD_LENGTH = 3
-_MAX_WORD_LENGTH = 12
+_MAX_WORD_LENGTH = 15
 
 _LAST_VALIDATION_ISSUES: list[WordValidationIssue] = []
 
