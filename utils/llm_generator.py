@@ -7,7 +7,8 @@ import os
 from dataclasses import dataclass
 from typing import Iterable
 
-from langchain_core.output_parsers import OutputParserException, PydanticOutputParser
+from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.pydantic_v1 import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
