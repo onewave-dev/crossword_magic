@@ -9,9 +9,9 @@ from typing import Iterable
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.pydantic_v1 import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 from utils.logging_config import get_logger
 from utils.validators import validate_word_list
@@ -56,8 +56,8 @@ _PROMPT = ChatPromptTemplate.from_messages(
             "human",
             "Theme: {theme}\n"
             "Language: {language}\n"
-            "Generate at least 60 unique single-word crossword answers that fit the theme. "
-            "Each answer must be between 3 and 15 characters long, consist only of letters of the target language, "
+            "Generate between 10 and 40 unique single-word crossword answers that fit the theme. "
+            "Each answer must be between 3 and 15 letters long, consist only of letters of the target language, "
             "and must not contain spaces, hyphens or digits. Provide a concise clue for every word and an optional "
             "direction preference (across, down, any).",
         ),
@@ -145,7 +145,7 @@ def _normalise_payload(clues: Iterable[_WordClueSchema]) -> list[WordClue]:
 
 
 def generate_clues(theme: str, language: str) -> list[WordClue]:
-    """Generate crossword clues for the provided theme and language."""
+    """Generate 10–40 crossword clues for the provided theme and language."""
 
     if not theme or not language:
         raise ValueError("Theme and language must be provided")
@@ -162,15 +162,21 @@ def generate_clues(theme: str, language: str) -> list[WordClue]:
             parsed = _parse_response(raw_content)
             normalised = _normalise_payload(parsed.clues)
             validated = validate_word_list(language, normalised)
+            usable = validated[:40]
 
-            if len(validated) >= 60:
-                logger.info("Generated %s validated clues", len(validated))
-                return validated
+            if len(validated) >= 10:
+                if len(validated) > 40:
+                    logger.info(
+                        "Generated %s validated clues, using first %s entries", len(validated), len(usable)
+                    )
+                else:
+                    logger.info("Generated %s validated clues", len(validated))
+                return usable
 
-            if len(validated) > len(best_partial):
-                best_partial = validated
+            if len(usable) > len(best_partial):
+                best_partial = usable
             logger.warning(
-                "Received only %s valid clues on attempt %s (expected >= 60)",
+                "Received only %s valid clues on attempt %s (expected >= 10)",
                 len(validated),
                 attempt,
             )
