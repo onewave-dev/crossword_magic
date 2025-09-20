@@ -923,7 +923,8 @@ async def monitor_webhook(application: Application, settings: Settings) -> None:
         try:
             info = await application.bot.get_webhook_info()
             logger.debug("Current webhook info: url=%s, pending=%s", info.url, info.pending_update_count)
-            if info.url != expected_url or info.secret_token != settings.webhook_secret:
+            current_secret = getattr(info, "secret_token", None)
+            if info.url != expected_url or current_secret != settings.webhook_secret:
                 logger.warning("Webhook mismatch detected. Expected url=%s secret token=%s", expected_url, settings.webhook_secret)
                 await application.bot.set_webhook(
                     url=expected_url,
