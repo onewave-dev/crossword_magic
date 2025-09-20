@@ -1034,8 +1034,12 @@ async def on_shutdown() -> None:
 
     if state.telegram_app:
         logger.debug("Shutting down Telegram application")
+
+        if state.telegram_app.is_running:
+            logger.debug("Stopping Telegram application")
+            await state.telegram_app.stop()
+
         await state.telegram_app.shutdown()
-        await state.telegram_app.stop()
         state.telegram_app = None
         logger.info("Telegram application shut down")
 
