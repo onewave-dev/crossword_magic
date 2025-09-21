@@ -42,10 +42,10 @@ from utils.crossword import (
     Direction,
     Puzzle,
     Slot,
-    fill_puzzle_with_words,
     puzzle_from_dict,
     puzzle_to_dict,
 )
+from utils.fill_in_generator import FillInGenerationError, generate_fill_in_puzzle
 from utils.llm_generator import WordClue, generate_clues
 from utils.render import render_puzzle
 from utils.validators import WordValidationError, validate_word_list
@@ -217,31 +217,7 @@ LANGUAGE_STATE, THEME_STATE = range(2)
 
 REMINDER_DELAY_SECONDS = 10 * 60
 
-DEFAULT_PUZZLE_TEMPLATE = (
-    "##.#...#.##",
-    "#..##.##..#",
-    "..#..#..#..",
-    ".#...#...#.",
-    "..##...##..",
-    "###.....###",
-    "..##...##..",
-    ".#...#...#.",
-    "..#..#..#..",
-    "#..##.##..#",
-    "##.#...#.##",
-)
-
-
-def _parse_block_template(template: Sequence[str]) -> set[tuple[int, int]]:
-    positions: set[tuple[int, int]] = set()
-    for row, row_value in enumerate(template):
-        for col, char in enumerate(row_value):
-            if char == "#":
-                positions.add((row, col))
-    return positions
-
-
-DEFAULT_BLOCK_POSITIONS = _parse_block_template(DEFAULT_PUZZLE_TEMPLATE)
+MAX_PUZZLE_SIZE = 15
 
 
 def _normalise_thread_id(update: Update) -> int:
@@ -464,41 +440,45 @@ def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, G
         max_attempt_words = min(len(validated_clues), 80)
         min_attempt_words = max(10, min(30, max_attempt_words))
 
-        rows = len(DEFAULT_PUZZLE_TEMPLATE)
-        cols = len(DEFAULT_PUZZLE_TEMPLATE[0]) if rows else 11
-
         for limit in range(max_attempt_words, min_attempt_words - 1, -1):
             candidate_words = [clue.word for clue in validated_clues[:limit]]
             puzzle_id = uuid4().hex
-            puzzle = Puzzle.from_size(
-                puzzle_id=puzzle_id,
-                theme=theme,
-                language=language,
-                rows=rows,
-                cols=cols,
-                block_positions=DEFAULT_BLOCK_POSITIONS,
-            )
-            with logging_context(chat_id=chat_id, puzzle_id=puzzle.id):
-                if fill_puzzle_with_words(puzzle, candidate_words):
-                    logger.info("Filled puzzle grid using %s candidate words", limit)
-                    _assign_clues_to_slots(puzzle, validated_clues)
-                    save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
-                    now = time.time()
-                    game_state = GameState(
-                        chat_id=chat_id,
-                        puzzle_id=puzzle.id,
-                        filled_cells={},
-                        solved_slots=set(),
-                        score=0,
-                        hints_used=0,
-                        started_at=now,
-                        last_update=now,
-                        hinted_cells=set(),
+            with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
+                try:
+                    puzzle = generate_fill_in_puzzle(
+                        puzzle_id=puzzle_id,
+                        theme=theme,
+                        language=language,
+                        words=candidate_words,
+                        max_size=MAX_PUZZLE_SIZE,
                     )
-                    _store_state(game_state)
-                    logger.info("Generated puzzle ready for delivery")
-                    return puzzle, game_state
-                logger.debug("Attempt with %s words failed to fill puzzle", limit)
+                except FillInGenerationError as error:
+                    logger.debug(
+                        "Attempt with %s words failed to build grid: %s",
+                        limit,
+                        error,
+                    )
+                    continue
+                logger.info(
+                    "Constructed dynamic puzzle grid using %s candidate words", limit
+                )
+                _assign_clues_to_slots(puzzle, validated_clues)
+                save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
+                now = time.time()
+                game_state = GameState(
+                    chat_id=chat_id,
+                    puzzle_id=puzzle.id,
+                    filled_cells={},
+                    solved_slots=set(),
+                    score=0,
+                    hints_used=0,
+                    started_at=now,
+                    last_update=now,
+                    hinted_cells=set(),
+                )
+                _store_state(game_state)
+                logger.info("Generated puzzle ready for delivery")
+                return puzzle, game_state
 
         raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
