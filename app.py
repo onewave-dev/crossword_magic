@@ -304,6 +304,12 @@ def _canonical_answer(word: str, language: str) -> str:
     return transformed
 
 
+def _canonical_letter_set(word: str, language: str) -> set[str]:
+    """Return a canonicalised set of letters used for intersection checks."""
+
+    return {char for char in _canonical_answer(word, language) if char.isalpha()}
+
+
 def _ensure_hint_set(game_state: GameState) -> set[str]:
     if game_state.hinted_cells is None:
         game_state.hinted_cells = set()
@@ -624,10 +630,17 @@ def _generate_puzzle(
         }
         replacement_requests = 0
 
-        def request_replacement(word: str) -> WordClue | None:
+        def request_replacement(
+            word: str, attempt_clues: Sequence[WordClue]
+        ) -> WordClue | None:
             nonlocal replacement_requests
             canonical = _canonical_answer(word, language)
             replacement_prompt_words.add(canonical)
+            other_letters: set[str] = set()
+            for clue in attempt_clues:
+                if _canonical_answer(clue.word, language) == canonical:
+                    continue
+                other_letters.update(_canonical_letter_set(clue.word, language))
             while replacement_requests < MAX_REPLACEMENT_REQUESTS:
                 replacement_requests += 1
                 prompt_suffix = ", ".join(sorted(replacement_prompt_words))
@@ -647,6 +660,13 @@ def _generate_puzzle(
                 for candidate in new_validated:
                     candidate_canonical = _canonical_answer(candidate.word, language)
                     if candidate_canonical in used_canonical_words:
+                        continue
+                    candidate_letters = _canonical_letter_set(candidate.word, language)
+                    if other_letters and not (candidate_letters & other_letters):
+                        logger.debug(
+                            "Skipping replacement %s: no shared letters with current attempt",
+                            candidate.word,
+                        )
                         continue
                     used_canonical_words.add(candidate_canonical)
                     return candidate
@@ -679,7 +699,9 @@ def _generate_puzzle(
                             "Word %s could not be connected, requesting replacement",
                             disconnected.word,
                         )
-                        replacement = request_replacement(disconnected.word)
+                        replacement = request_replacement(
+                            disconnected.word, attempt_clues
+                        )
                         if replacement is None:
                             logger.debug(
                                 "No replacement available for %s, abandoning attempt",
