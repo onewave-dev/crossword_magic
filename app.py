@@ -39,9 +39,15 @@ from utils.storage import (
     save_state,
 )
 from utils.crossword import (
+    CompositeComponent,
+    CompositePuzzle,
     Direction,
     Puzzle,
-    Slot,
+    SlotRef,
+    composite_to_dict,
+    find_slot_ref,
+    iter_slot_refs,
+    parse_slot_public_id,
     puzzle_from_dict,
     puzzle_to_dict,
 )
@@ -233,20 +239,37 @@ def _normalise_thread_id(update: Update) -> int:
     return thread_id
 
 
-def _coord_key(row: int, col: int) -> str:
-    return f"{row},{col}"
+def _coord_key(row: int, col: int, component: int | None = None) -> str:
+    base = f"{row},{col}"
+    if component is None:
+        return base
+    return f"{component}:{base}"
 
 
 def _normalise_slot_id(slot_id: str) -> str:
     return slot_id.strip().upper()
 
 
-def _find_slot(puzzle: Puzzle, slot_id: str) -> Optional[Slot]:
-    normalised = _normalise_slot_id(slot_id)
-    for slot in puzzle.slots:
-        if slot.slot_id.upper() == normalised:
-            return slot
-    return None
+def _resolve_slot(puzzle: Puzzle | CompositePuzzle, slot_id: str) -> tuple[Optional[SlotRef], Optional[str]]:
+    """Return slot reference for the provided identifier with ambiguity notice."""
+
+    base_id, component_index = parse_slot_public_id(slot_id)
+    if isinstance(puzzle, CompositePuzzle):
+        if component_index is None:
+            matches = [
+                ref
+                for ref in iter_slot_refs(puzzle)
+                if ref.slot.slot_id.upper() == base_id
+            ]
+            if len(matches) > 1:
+                options = ", ".join(ref.public_id for ref in matches)
+                return None, f"Уточните компоненту: {options}"
+            if matches:
+                return matches[0], None
+            return None, None
+        return find_slot_ref(puzzle, slot_id), None
+    # single puzzle
+    return find_slot_ref(puzzle, slot_id), None
 
 
 def _canonical_answer(word: str, language: str) -> str:
@@ -281,7 +304,7 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
         return restored
 
 
-def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle]:
+def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle | CompositePuzzle]:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         payload = load_puzzle(game_state.puzzle_id)
         if payload is None:
@@ -291,17 +314,40 @@ def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle]:
         return puzzle_from_dict(dict(payload))
 
 
-def _format_clue_section(slots: Iterable[Slot]) -> str:
+def _format_clue_section(slot_refs: Iterable[SlotRef]) -> str:
     lines = []
-    for slot in slots:
+    for slot_ref in slot_refs:
+        slot = slot_ref.slot
         clue_text = slot.clue or "(нет подсказки)"
-        lines.append(f"{slot.slot_id} ({slot.length}): {clue_text}")
+        lines.append(f"{slot_ref.public_id} ({slot.length}): {clue_text}")
     return "\n".join(lines) if lines else "(подсказок нет)"
 
 
-def _format_clues_message(puzzle: Puzzle) -> str:
-    across = [slot for slot in puzzle.slots if slot.direction is Direction.ACROSS]
-    down = [slot for slot in puzzle.slots if slot.direction is Direction.DOWN]
+def _format_clues_message(puzzle: Puzzle | CompositePuzzle) -> str:
+    if isinstance(puzzle, CompositePuzzle):
+        sections: list[str] = []
+        for component in sorted(puzzle.components, key=lambda comp: comp.index):
+            refs = [
+                ref
+                for ref in iter_slot_refs(puzzle)
+                if ref.component_index == component.index
+            ]
+            across = [ref for ref in refs if ref.slot.direction is Direction.ACROSS]
+            down = [ref for ref in refs if ref.slot.direction is Direction.DOWN]
+            section = (
+                f"Сетка {component.index}:\n"
+                f"Across:\n{_format_clue_section(across)}\n\n"
+                f"Down:\n{_format_clue_section(down)}"
+            )
+            sections.append(section)
+        return "\n\n".join(sections)
+
+    across = [
+        ref for ref in iter_slot_refs(puzzle) if ref.slot.direction is Direction.ACROSS
+    ]
+    down = [
+        ref for ref in iter_slot_refs(puzzle) if ref.slot.direction is Direction.DOWN
+    ]
     across_text = _format_clue_section(across)
     down_text = _format_clue_section(down)
     return f"Across:\n{across_text}\n\nDown:\n{down_text}"
@@ -325,27 +371,33 @@ async def _reject_group_chat(update: Update) -> bool:
     return False
 
 
-def _apply_answer_to_state(game_state: GameState, slot: Slot, answer: str) -> None:
+def _apply_answer_to_state(game_state: GameState, slot_ref: SlotRef, answer: str) -> None:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
-        logger.debug("Applying answer for slot %s", slot.slot_id)
+        slot = slot_ref.slot
+        component = slot_ref.component_index
+        logger.debug("Applying answer for slot %s", slot_ref.public_id)
         keys: list[str] = []
         for index, (row, col) in enumerate(slot.coordinates()):
-            key = _coord_key(row, col)
+            key = _coord_key(row, col, component)
             keys.append(key)
             if index < len(answer):
                 game_state.filled_cells[key] = answer[index]
         hint_set = _ensure_hint_set(game_state)
         for key in keys:
             hint_set.discard(key)
-        game_state.solved_slots.add(slot.slot_id)
+        game_state.solved_slots.add(_normalise_slot_id(slot_ref.public_id))
         game_state.last_update = time.time()
         _store_state(game_state)
 
 
-def _reveal_letter(game_state: GameState, slot: Slot, answer: str) -> Optional[tuple[int, str]]:
+def _reveal_letter(
+    game_state: GameState, slot_ref: SlotRef, answer: str
+) -> Optional[tuple[int, str]]:
     hint_set = _ensure_hint_set(game_state)
+    slot = slot_ref.slot
+    component = slot_ref.component_index
     for index, (row, col) in enumerate(slot.coordinates()):
-        key = _coord_key(row, col)
+        key = _coord_key(row, col, component)
         if key in game_state.filled_cells:
             continue
         if index >= len(answer):
@@ -360,28 +412,37 @@ def _reveal_letter(game_state: GameState, slot: Slot, answer: str) -> Optional[t
     return None
 
 
-def _all_slots_solved(puzzle: Puzzle, game_state: GameState) -> bool:
-    solved = set(game_state.solved_slots)
-    return all(slot.slot_id in solved for slot in puzzle.slots if slot.answer)
+def _all_slots_solved(puzzle: Puzzle | CompositePuzzle, game_state: GameState) -> bool:
+    solved = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+    for slot_ref in iter_slot_refs(puzzle):
+        if slot_ref.slot.answer and _normalise_slot_id(slot_ref.public_id) not in solved:
+            return False
+    return True
 
 
-def _solve_remaining_slots(game_state: GameState, puzzle: Puzzle) -> list[tuple[str, str]]:
+def _solve_remaining_slots(
+    game_state: GameState, puzzle: Puzzle | CompositePuzzle
+) -> list[tuple[str, str]]:
     solved_now: list[tuple[str, str]] = []
     hint_set = _ensure_hint_set(game_state)
-    for slot in puzzle.slots:
+    solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+    for slot_ref in iter_slot_refs(puzzle):
+        slot = slot_ref.slot
+        public_id = _normalise_slot_id(slot_ref.public_id)
         if not slot.answer:
             continue
-        if slot.slot_id in game_state.solved_slots:
+        if public_id in solved_ids:
             continue
         answer = slot.answer
         for index, (row, col) in enumerate(slot.coordinates()):
             if index >= len(answer):
                 break
-            key = _coord_key(row, col)
+            key = _coord_key(row, col, slot_ref.component_index)
             game_state.filled_cells[key] = answer[index]
             hint_set.discard(key)
-        game_state.solved_slots.add(slot.slot_id)
-        solved_now.append((slot.slot_id, answer))
+        game_state.solved_slots.add(public_id)
+        solved_ids.add(public_id)
+        solved_now.append((slot_ref.public_id, answer))
     if solved_now:
         game_state.last_update = time.time()
         _store_state(game_state)
@@ -411,11 +472,15 @@ async def _reminder_job(context: CallbackContext) -> None:
             logger.exception("Failed to deliver reminder message to chat %s", chat_id)
 
 
-def _assign_clues_to_slots(puzzle: Puzzle, clues: Sequence[WordClue]) -> None:
+def _assign_clues_to_slots(puzzle: Puzzle | CompositePuzzle, clues: Sequence[WordClue]) -> None:
     language = puzzle.language
     clue_map: dict[str, str] = {}
     for clue in clues:
         clue_map[_canonical_answer(clue.word, language)] = clue.clue
+    if isinstance(puzzle, CompositePuzzle):
+        for component in puzzle.components:
+            _assign_clues_to_slots(component.puzzle, clues)
+        return
     for slot in puzzle.slots:
         if not slot.answer:
             continue
@@ -423,7 +488,94 @@ def _assign_clues_to_slots(puzzle: Puzzle, clues: Sequence[WordClue]) -> None:
         slot.clue = clue_map.get(canonical, f"Слово из {slot.length} букв")
 
 
-def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, GameState]:
+def _build_word_components(clues: Sequence[WordClue], language: str) -> list[list[WordClue]]:
+    """Split clues into connected components by shared letters."""
+
+    canonical_forms = [_canonical_answer(clue.word, language) for clue in clues]
+    graph: dict[int, set[int]] = {idx: set() for idx in range(len(clues))}
+    for i in range(len(clues)):
+        for j in range(i + 1, len(clues)):
+            if set(canonical_forms[i]) & set(canonical_forms[j]):
+                graph[i].add(j)
+                graph[j].add(i)
+
+    visited: set[int] = set()
+    components: list[list[WordClue]] = []
+
+    for idx in range(len(clues)):
+        if idx in visited:
+            continue
+        stack = [idx]
+        component_indices: list[int] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component_indices.append(current)
+            stack.extend(graph[current])
+        if component_indices:
+            components.append([clues[i] for i in component_indices])
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def _generate_composite(
+    chat_id: int,
+    language: str,
+    theme: str,
+    components: Sequence[Sequence[WordClue]],
+) -> tuple[CompositePuzzle, GameState]:
+    composite_id = uuid4().hex
+    composite_components: list[CompositeComponent] = []
+    row_offset = 0
+    for index, component_clues in enumerate(components, start=1):
+        words = [clue.word for clue in component_clues]
+        puzzle = generate_fill_in_puzzle(
+            puzzle_id=f"{composite_id}-c{index}",
+            theme=theme,
+            language=language,
+            words=words,
+            max_size=MAX_PUZZLE_SIZE,
+        )
+        _assign_clues_to_slots(puzzle, component_clues)
+        composite_components.append(
+            CompositeComponent(
+                index=index,
+                puzzle=puzzle,
+                row_offset=row_offset,
+                col_offset=0,
+            )
+        )
+        row_offset += puzzle.size_rows + 1
+
+    composite = CompositePuzzle(
+        id=composite_id,
+        theme=theme,
+        language=language,
+        components=composite_components,
+        gap_cells=1,
+    )
+    save_puzzle(composite.id, composite_to_dict(composite))
+    now = time.time()
+    game_state = GameState(
+        chat_id=chat_id,
+        puzzle_id=composite.id,
+        puzzle_ids=[component.puzzle.id for component in composite_components],
+        filled_cells={},
+        solved_slots=set(),
+        score=0,
+        hints_used=0,
+        started_at=now,
+        last_update=now,
+        hinted_cells=set(),
+    )
+    return composite, game_state
+
+
+def _generate_puzzle(
+    chat_id: int, language: str, theme: str
+) -> tuple[Puzzle | CompositePuzzle, GameState]:
     with logging_context(chat_id=chat_id):
         logger.info(
             "Starting puzzle generation (language=%s, theme=%s)",
@@ -440,6 +592,7 @@ def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, G
         max_attempt_words = min(len(validated_clues), 80)
         min_attempt_words = max(10, min(30, max_attempt_words))
 
+        attempted_component_split = False
         for limit in range(max_attempt_words, min_attempt_words - 1, -1):
             candidate_words = [clue.word for clue in validated_clues[:limit]]
             puzzle_id = uuid4().hex
@@ -458,6 +611,33 @@ def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, G
                         limit,
                         error,
                     )
+                    if (
+                        not attempted_component_split
+                        and limit == max_attempt_words
+                        and len(validated_clues[:limit]) > 1
+                    ):
+                        components = _build_word_components(validated_clues[:limit], language)
+                        attempted_component_split = True
+                        if len(components) > 1:
+                            logger.info(
+                                "Detected %s disconnected word clusters, generating composite puzzle",
+                                len(components),
+                            )
+                            try:
+                                composite, game_state = _generate_composite(
+                                    chat_id, language, theme, components
+                                )
+                            except FillInGenerationError as composite_error:
+                                logger.debug(
+                                    "Composite generation failed: %s", composite_error
+                                )
+                            else:
+                                logger.info(
+                                    "Generated composite puzzle with %s components",
+                                    len(components),
+                                )
+                                _store_state(game_state)
+                                return composite, game_state
                     continue
                 logger.info(
                     "Constructed dynamic puzzle grid using %s candidate words", limit
@@ -468,6 +648,7 @@ def _generate_puzzle(chat_id: int, language: str, theme: str) -> tuple[Puzzle, G
                 game_state = GameState(
                     chat_id=chat_id,
                     puzzle_id=puzzle.id,
+                    puzzle_ids=None,
                     filled_cells={},
                     solved_slots=set(),
                     score=0,
@@ -689,12 +870,18 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать заново.")
         return
     with logging_context(puzzle_id=puzzle.id):
-        slot = _find_slot(puzzle, slot_id)
-        if slot is None:
+        slot_ref, ambiguity = _resolve_slot(puzzle, slot_id)
+        if ambiguity:
+            await message.reply_text(ambiguity)
+            return
+        if slot_ref is None:
             logger.warning("Answer received for missing slot %s", slot_id)
             await message.reply_text(f"Слот {slot_id} не найден.")
             return
-        if slot.slot_id in game_state.solved_slots:
+        slot = slot_ref.slot
+        public_id = _normalise_slot_id(slot_ref.public_id)
+        solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+        if public_id in solved_ids:
             await message.reply_text("Этот слот уже решён.")
             return
         if not slot.answer:
@@ -723,13 +910,13 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         candidate = validated[0].word
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(slot.answer, puzzle.language):
-            logger.info("Incorrect answer for slot %s", slot.slot_id)
+            logger.info("Incorrect answer for slot %s", slot_ref.public_id)
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
             return
 
         game_state.score += slot.length
-        _apply_answer_to_state(game_state, slot, candidate)
-        logger.info("Accepted answer for slot %s", slot.slot_id)
+        _apply_answer_to_state(game_state, slot_ref, candidate)
+        logger.info("Accepted answer for slot %s", slot_ref.public_id)
 
         try:
             image_path = render_puzzle(puzzle, game_state)
@@ -737,7 +924,7 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
             )
             with open(image_path, "rb") as photo:
-                await message.reply_photo(photo=photo, caption=f"Верно! {slot.slot_id}")
+                await message.reply_photo(photo=photo, caption=f"Верно! {slot_ref.public_id}")
         except Exception:  # noqa: BLE001
             logger.exception("Failed to render updated grid after correct answer")
             await message.reply_text(
@@ -770,44 +957,60 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     with logging_context(puzzle_id=puzzle.id):
-        slot: Optional[Slot] = None
+        slot_ref: Optional[SlotRef] = None
         if context.args:
-            slot = _find_slot(puzzle, context.args[0])
-            if slot is None:
+            slot_ref, ambiguity = _resolve_slot(puzzle, context.args[0])
+            if ambiguity:
+                await message.reply_text(ambiguity)
+                return
+            if slot_ref is None:
                 await message.reply_text(f"Слот {context.args[0]} не найден.")
                 return
         else:
-            for candidate in puzzle.slots:
-                if candidate.slot_id in game_state.solved_slots:
+            for candidate in sorted(
+                iter_slot_refs(puzzle),
+                key=lambda ref: (
+                    ref.component_index or 0,
+                    ref.slot.direction.value,
+                    ref.slot.number,
+                ),
+            ):
+                public_id = _normalise_slot_id(candidate.public_id)
+                if public_id in {_normalise_slot_id(entry) for entry in game_state.solved_slots}:
                     continue
-                if not candidate.answer:
+                if not candidate.slot.answer:
                     continue
-                slot = candidate
+                slot_ref = candidate
                 break
-            if slot is None:
+            if slot_ref is None:
                 await message.reply_text("Нет слотов для подсказки.")
                 return
 
-        if not slot.answer:
+        if not slot_ref.slot.answer:
             await message.reply_text("Для этого слота нет ответа.")
             return
 
-        result = _reveal_letter(game_state, slot, slot.answer)
+        result = _reveal_letter(game_state, slot_ref, slot_ref.slot.answer)
         if result is None:
             game_state.hints_used += 1
             game_state.last_update = time.time()
             _store_state(game_state)
             reply_text = (
-                f"Все буквы в {slot.slot_id} уже открыты. Подсказка: {slot.clue or 'нет'}"
+                f"Все буквы в {slot_ref.public_id} уже открыты. Подсказка: {slot_ref.slot.clue or 'нет'}"
             )
-            logger.info("Hint requested for already revealed slot %s", slot.slot_id)
+            logger.info("Hint requested for already revealed slot %s", slot_ref.public_id)
         else:
             position, letter = result
             reply_text = (
-                f"Открыта буква №{position + 1} в {slot.slot_id}: {letter}\n"
-                f"Подсказка: {slot.clue or 'нет'}"
+                f"Открыта буква №{position + 1} в {slot_ref.public_id}: {letter}\n"
+                f"Подсказка: {slot_ref.slot.clue or 'нет'}"
             )
-            logger.info("Revealed letter %s at position %s for slot %s", letter, position + 1, slot.slot_id)
+            logger.info(
+                "Revealed letter %s at position %s for slot %s",
+                letter,
+                position + 1,
+                slot_ref.public_id,
+            )
 
         try:
             image_path = render_puzzle(puzzle, game_state)
