@@ -19,6 +19,16 @@ class FillInGenerationError(RuntimeError):
     """Raised when the fill-in generator cannot place the provided words."""
 
 
+class DisconnectedWordError(FillInGenerationError):
+    """Raised when a word cannot be connected to the existing crossword graph."""
+
+    def __init__(self, word: str) -> None:
+        self.word = word
+        super().__init__(
+            f"Unable to place word '{word}' with an intersection; replacement candidates required"
+        )
+
+
 def _normalise_word(word: str, language: str) -> str:
     normalised = word.strip().upper()
     if language.lower() == "ru":
@@ -167,26 +177,6 @@ def generate_fill_in_puzzle(
                         continue
                     place_word(word, start_row, start_col, direction)
                     return True
-
-        if not bounds_initialised:
-            return False
-
-        row_margin = max_size
-        col_margin = max_size
-        row_start = min_row - row_margin
-        row_end = max_row + row_margin
-        col_start = min_col - col_margin
-        col_end = max_col + col_margin
-
-        for direction in (Direction.ACROSS, Direction.DOWN):
-            for row in range(row_start, row_end + 1):
-                for col in range(col_start, col_end + 1):
-                    start_row = row
-                    start_col = col
-                    if not can_place(word, start_row, start_col, direction, False):
-                        continue
-                    place_word(word, start_row, start_col, direction)
-                    return True
         return False
 
     first_word = normalised_words[0]
@@ -195,7 +185,7 @@ def generate_fill_in_puzzle(
 
     for word in normalised_words[1:]:
         if not try_place_word(word):
-            raise FillInGenerationError(f"Failed to place word: {word}")
+            raise DisconnectedWordError(word)
 
     rows = max_row - min_row + 1
     cols = max_col - min_col + 1

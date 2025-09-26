@@ -52,7 +52,11 @@ from utils.crossword import (
     puzzle_from_dict,
     puzzle_to_dict,
 )
-from utils.fill_in_generator import FillInGenerationError, generate_fill_in_puzzle
+from utils.fill_in_generator import (
+    DisconnectedWordError,
+    FillInGenerationError,
+    generate_fill_in_puzzle,
+)
 from utils.llm_generator import WordClue, generate_clues
 from utils.render import render_puzzle
 from utils.validators import WordValidationError, validate_word_list
@@ -225,6 +229,7 @@ LANGUAGE_STATE, THEME_STATE = range(2)
 REMINDER_DELAY_SECONDS = 10 * 60
 
 MAX_PUZZLE_SIZE = 15
+MAX_REPLACEMENT_REQUESTS = 3
 
 
 def _normalise_thread_id(update: Update) -> int:
@@ -610,73 +615,146 @@ def _generate_puzzle(
         min_attempt_words = max(10, min(30, max_attempt_words))
 
         attempted_component_split = False
+        replacement_prompt_words: set[str] = set()
+        used_canonical_words: set[str] = {
+            _canonical_answer(clue.word, language) for clue in validated_clues
+        }
+        replacement_requests = 0
+
+        def request_replacement(word: str) -> WordClue | None:
+            nonlocal replacement_requests
+            canonical = _canonical_answer(word, language)
+            replacement_prompt_words.add(canonical)
+            while replacement_requests < MAX_REPLACEMENT_REQUESTS:
+                replacement_requests += 1
+                prompt_suffix = ", ".join(sorted(replacement_prompt_words))
+                replacement_theme = (
+                    f"{theme}. Подбери альтернативные слова для кроссворда вместо: {prompt_suffix}."
+                )
+                logger.info(
+                    "Requesting replacement clues (attempt %s) for: %s",
+                    replacement_requests,
+                    prompt_suffix,
+                )
+                new_clues = generate_clues(theme=replacement_theme, language=language)
+                new_validated = validate_word_list(language, new_clues, deduplicate=True)
+                logger.info(
+                    "Validated %s replacement candidates", len(new_validated)
+                )
+                for candidate in new_validated:
+                    candidate_canonical = _canonical_answer(candidate.word, language)
+                    if candidate_canonical in used_canonical_words:
+                        continue
+                    used_canonical_words.add(candidate_canonical)
+                    return candidate
+                logger.warning(
+                    "Replacement attempt %s did not provide new unique words",
+                    replacement_requests,
+                )
+            logger.warning(
+                "Exhausted replacement attempts while trying to replace %s",
+                word,
+            )
+            return None
+
         for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-            candidate_words = [clue.word for clue in validated_clues[:limit]]
+            candidate_clues = list(validated_clues[:limit])
             puzzle_id = uuid4().hex
             with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
-                try:
-                    puzzle = generate_fill_in_puzzle(
-                        puzzle_id=puzzle_id,
-                        theme=theme,
-                        language=language,
-                        words=candidate_words,
-                        max_size=MAX_PUZZLE_SIZE,
-                    )
-                except FillInGenerationError as error:
-                    logger.debug(
-                        "Attempt with %s words failed to build grid: %s",
-                        limit,
-                        error,
-                    )
-                    if (
-                        not attempted_component_split
-                        and limit == max_attempt_words
-                        and len(validated_clues[:limit]) > 1
-                    ):
-                        components = _build_word_components(validated_clues[:limit], language)
-                        attempted_component_split = True
-                        if len(components) > 1:
-                            logger.info(
-                                "Detected %s disconnected word clusters, generating composite puzzle",
-                                len(components),
+                attempt_clues = list(candidate_clues)
+                while True:
+                    try:
+                        puzzle = generate_fill_in_puzzle(
+                            puzzle_id=puzzle_id,
+                            theme=theme,
+                            language=language,
+                            words=[clue.word for clue in attempt_clues],
+                            max_size=MAX_PUZZLE_SIZE,
+                        )
+                    except DisconnectedWordError as disconnected:
+                        logger.info(
+                            "Word %s could not be connected, requesting replacement",
+                            disconnected.word,
+                        )
+                        replacement = request_replacement(disconnected.word)
+                        if replacement is None:
+                            logger.debug(
+                                "No replacement available for %s, abandoning attempt",
+                                disconnected.word,
                             )
-                            try:
-                                composite, game_state = _generate_composite(
-                                    chat_id, language, theme, components
-                                )
-                            except FillInGenerationError as composite_error:
-                                logger.debug(
-                                    "Composite generation failed: %s", composite_error
-                                )
-                            else:
+                            break
+                        target_canonical = _canonical_answer(
+                            disconnected.word, language
+                        )
+                        for idx, clue in enumerate(attempt_clues):
+                            if (
+                                _canonical_answer(clue.word, language)
+                                == target_canonical
+                            ):
+                                attempt_clues[idx] = replacement
+                                break
+                        else:
+                            attempt_clues.append(replacement)
+                        continue
+                    except FillInGenerationError as error:
+                        logger.debug(
+                            "Attempt with %s words failed to build grid: %s",
+                            limit,
+                            error,
+                        )
+                        if (
+                            not attempted_component_split
+                            and limit == max_attempt_words
+                            and len(validated_clues[:limit]) > 1
+                        ):
+                            components = _build_word_components(
+                                validated_clues[:limit], language
+                            )
+                            attempted_component_split = True
+                            if len(components) > 1:
                                 logger.info(
-                                    "Generated composite puzzle with %s components",
+                                    "Detected %s disconnected word clusters, generating composite puzzle",
                                     len(components),
                                 )
-                                _store_state(game_state)
-                                return composite, game_state
-                    continue
-                logger.info(
-                    "Constructed dynamic puzzle grid using %s candidate words", limit
-                )
-                _assign_clues_to_slots(puzzle, validated_clues)
-                save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
-                now = time.time()
-                game_state = GameState(
-                    chat_id=chat_id,
-                    puzzle_id=puzzle.id,
-                    puzzle_ids=None,
-                    filled_cells={},
-                    solved_slots=set(),
-                    score=0,
-                    hints_used=0,
-                    started_at=now,
-                    last_update=now,
-                    hinted_cells=set(),
-                )
-                _store_state(game_state)
-                logger.info("Generated puzzle ready for delivery")
-                return puzzle, game_state
+                                try:
+                                    composite, game_state = _generate_composite(
+                                        chat_id, language, theme, components
+                                    )
+                                except FillInGenerationError as composite_error:
+                                    logger.debug(
+                                        "Composite generation failed: %s", composite_error
+                                    )
+                                else:
+                                    logger.info(
+                                        "Generated composite puzzle with %s components",
+                                        len(components),
+                                    )
+                                    _store_state(game_state)
+                                    return composite, game_state
+                        break
+                    else:
+                        logger.info(
+                            "Constructed dynamic puzzle grid using %s candidate words",
+                            len(attempt_clues),
+                        )
+                        _assign_clues_to_slots(puzzle, attempt_clues)
+                        save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
+                        now = time.time()
+                        game_state = GameState(
+                            chat_id=chat_id,
+                            puzzle_id=puzzle.id,
+                            puzzle_ids=None,
+                            filled_cells={},
+                            solved_slots=set(),
+                            score=0,
+                            hints_used=0,
+                            started_at=now,
+                            last_update=now,
+                            hinted_cells=set(),
+                        )
+                        _store_state(game_state)
+                        logger.info("Generated puzzle ready for delivery")
+                        return puzzle, game_state
 
         raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
