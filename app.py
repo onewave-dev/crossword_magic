@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import os
 import time
 from uuid import uuid4
@@ -13,7 +14,7 @@ from typing import Iterable, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import Update, constants
+from telegram import Chat, Message, Update, constants
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -248,6 +249,22 @@ def _coord_key(row: int, col: int, component: int | None = None) -> str:
 
 def _normalise_slot_id(slot_id: str) -> str:
     return slot_id.strip().upper()
+
+
+INLINE_ANSWER_PATTERN = re.compile(r"^\s*([A-Za-z]+[0-9]+)\s*[-–:]\s*(.+)$")
+
+
+def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
+    if not text:
+        return None
+    match = INLINE_ANSWER_PATTERN.match(text)
+    if not match:
+        return None
+    slot_id, answer = match.groups()
+    cleaned_answer = answer.strip()
+    if not cleaned_answer:
+        return None
+    return _normalise_slot_id(slot_id), cleaned_answer
 
 
 def _resolve_slot(puzzle: Puzzle | CompositePuzzle, slot_id: str) -> tuple[Optional[SlotRef], Optional[str]]:
@@ -756,6 +773,9 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     ),
                 )
             await message.reply_text(_format_clues_message(puzzle))
+            await message.reply_text(
+                "Отправляйте ответы прямо в чат в формате «A1 - ответ». Если удобнее, можно пользоваться и командой /answer."
+            )
             logger.info("Delivered freshly generated puzzle to chat")
     except Exception:  # noqa: BLE001
         logger.exception("Failed to deliver puzzle to chat %s", chat.id)
@@ -844,23 +864,20 @@ async def send_state_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text("Не удалось подготовить изображение. Попробуйте позже.")
 
 
-@command_entrypoint()
-async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        return
-    chat = update.effective_chat
-    message = update.effective_message
-    if chat is None or message is None:
-        return
-    if not context.args or len(context.args) < 2:
-        await message.reply_text("Использование: /answer <слот> <слово>")
+async def _handle_answer_submission(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Chat,
+    message: Message,
+    slot_id: str,
+    raw_answer: str,
+) -> None:
+    normalised_slot_id = _normalise_slot_id(slot_id)
+    answer_text = raw_answer.strip()
+    if not answer_text:
+        await message.reply_text("Введите ответ после слота.")
         return
 
-    slot_id = context.args[0]
-    logger.debug("Chat %s answering slot %s", chat.id, slot_id)
-    raw_answer = " ".join(context.args[1:])
-
+    logger.debug("Chat %s answering slot %s", chat.id, normalised_slot_id)
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
         await message.reply_text("Нет активного кроссворда. Используйте /new.")
@@ -869,15 +886,17 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if puzzle is None:
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать заново.")
         return
+
     with logging_context(puzzle_id=puzzle.id):
-        slot_ref, ambiguity = _resolve_slot(puzzle, slot_id)
+        slot_ref, ambiguity = _resolve_slot(puzzle, normalised_slot_id)
         if ambiguity:
             await message.reply_text(ambiguity)
             return
         if slot_ref is None:
-            logger.warning("Answer received for missing slot %s", slot_id)
-            await message.reply_text(f"Слот {slot_id} не найден.")
+            logger.warning("Answer received for missing slot %s", normalised_slot_id)
+            await message.reply_text(f"Слот {normalised_slot_id} не найден.")
             return
+
         slot = slot_ref.slot
         public_id = _normalise_slot_id(slot_ref.public_id)
         solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
@@ -891,14 +910,18 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             validated = validate_word_list(
                 puzzle.language,
-                [WordClue(word=raw_answer, clue="")],
+                [WordClue(word=answer_text, clue="")],
                 deduplicate=False,
             )
         except WordValidationError as exc:
-            logger.warning("Rejected answer for slot %s due to validation: %s", slot.slot_id, exc)
+            logger.warning(
+                "Rejected answer for slot %s due to validation: %s",
+                slot.slot_id,
+                exc,
+            )
             await message.reply_text(f"Слово не прошло проверку: {exc}")
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             logger.exception("Unexpected error validating answer for slot %s", slot.slot_id)
             await message.reply_text("Не удалось проверить слово. Попробуйте позже.")
             return
@@ -909,7 +932,10 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         candidate = validated[0].word
-        if _canonical_answer(candidate, puzzle.language) != _canonical_answer(slot.answer, puzzle.language):
+        if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
+            slot.answer,
+            puzzle.language,
+        ):
             logger.info("Incorrect answer for slot %s", slot_ref.public_id)
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
             return
@@ -924,7 +950,9 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
             )
             with open(image_path, "rb") as photo:
-                await message.reply_photo(photo=photo, caption=f"Верно! {slot_ref.public_id}")
+                await message.reply_photo(
+                    photo=photo, caption=f"Верно! {slot_ref.public_id}"
+                )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to render updated grid after correct answer")
             await message.reply_text(
@@ -934,6 +962,46 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if _all_slots_solved(puzzle, game_state):
             _cancel_reminder(context)
             await message.reply_text("Поздравляем! Все слова разгаданы.")
+
+
+@command_entrypoint()
+async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    if not context.args or len(context.args) < 2:
+        await message.reply_text("Использование: /answer <слот> <слово>")
+        return
+
+    slot_id = context.args[0]
+    raw_answer = " ".join(context.args[1:])
+    await _handle_answer_submission(context, chat, message, slot_id, raw_answer)
+
+
+@command_entrypoint()
+async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    if "new_game_language" in context.user_data:
+        logger.debug("Skipping inline answer while /new conversation is active")
+        return
+
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None or not message.text:
+        return
+
+    parsed = _parse_inline_answer(message.text)
+    if not parsed:
+        return
+
+    slot_id, answer_text = parsed
+    await _handle_answer_submission(context, chat, message, slot_id, answer_text)
 
 
 @command_entrypoint()
@@ -1090,6 +1158,9 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
+    telegram_application.add_handler(
+        MessageHandler(filters.Regex(INLINE_ANSWER_PATTERN), inline_answer_handler)
+    )
 
 
 # ---------------------------------------------------------------------------
