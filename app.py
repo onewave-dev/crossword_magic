@@ -319,7 +319,7 @@ def _format_clue_section(slot_refs: Iterable[SlotRef]) -> str:
     for slot_ref in slot_refs:
         slot = slot_ref.slot
         clue_text = slot.clue or "(нет подсказки)"
-        lines.append(f"{slot_ref.public_id} ({slot.length}): {clue_text}")
+        lines.append(f"{slot_ref.public_id}: {clue_text}")
     return "\n".join(lines) if lines else "(подсказок нет)"
 
 
