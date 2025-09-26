@@ -256,7 +256,10 @@ def _normalise_slot_id(slot_id: str) -> str:
     return slot_id.strip().upper()
 
 
-INLINE_ANSWER_PATTERN = re.compile(r"^\s*([A-Za-z]+[0-9]+)\s*[-–:]\s*(.+)$")
+INLINE_ANSWER_PATTERN = re.compile(
+    r"^\s*([^\W\d_]+[0-9]+(?:-[0-9]+)?)\s*[-–:]\s*(.+)$",
+    flags=re.UNICODE,
+)
 
 
 def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
