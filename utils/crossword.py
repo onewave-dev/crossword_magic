@@ -114,6 +114,67 @@ class Puzzle:
         return self.grid[row][col]
 
 
+@dataclass(slots=True)
+class CompositeComponent:
+    """Single connected component within a composite crossword."""
+
+    index: int
+    puzzle: Puzzle
+    row_offset: int = 0
+    col_offset: int = 0
+
+
+@dataclass
+class CompositePuzzle:
+    """Container holding several disjoint crossword components."""
+
+    id: str
+    theme: str
+    language: str
+    components: List[CompositeComponent]
+    gap_cells: int = 1
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def size_rows(self) -> int:
+        if not self.components:
+            return 0
+        max_offset = 0
+        for component in self.components:
+            bottom = component.row_offset + component.puzzle.size_rows
+            if bottom > max_offset:
+                max_offset = bottom
+        if self.components:
+            max_offset += self.gap_cells
+        return max_offset
+
+    @property
+    def size_cols(self) -> int:
+        if not self.components:
+            return 0
+        max_offset = 0
+        for component in self.components:
+            right = component.col_offset + component.puzzle.size_cols
+            if right > max_offset:
+                max_offset = right
+        if self.components:
+            max_offset += self.gap_cells
+        return max_offset
+
+
+@dataclass(slots=True)
+class SlotRef:
+    """Reference to a slot optionally bound to a composite component."""
+
+    slot: Slot
+    component_index: Optional[int] = None
+
+    @property
+    def public_id(self) -> str:
+        if self.component_index is None:
+            return self.slot.slot_id
+        return f"{self.slot.slot_id}-{self.component_index}"
+
 DEFAULT_FILLER_WORDS: Dict[str, Sequence[str]] = {
     "en": (
         "AREA",
@@ -333,6 +394,58 @@ def fill_puzzle_with_words(
     return success
 
 
+def is_composite_puzzle(obj: object) -> bool:
+    """Return ``True`` if the provided object is a ``CompositePuzzle``."""
+
+    return isinstance(obj, CompositePuzzle)
+
+
+def parse_slot_public_id(slot_id: str) -> Tuple[str, Optional[int]]:
+    """Split a public slot identifier into base id and component index."""
+
+    text = slot_id.strip()
+    if "-" not in text:
+        return text.upper(), None
+    base, suffix = text.rsplit("-", 1)
+    try:
+        component_index = int(suffix)
+    except ValueError:
+        return text.upper(), None
+    return base.strip().upper(), component_index
+
+
+def iter_slot_refs(puzzle: Puzzle | CompositePuzzle) -> Iterator[SlotRef]:
+    """Iterate over slot references for a puzzle or composite puzzle."""
+
+    if isinstance(puzzle, CompositePuzzle):
+        for component in puzzle.components:
+            for slot in component.puzzle.slots:
+                yield SlotRef(slot=slot, component_index=component.index)
+    else:
+        for slot in puzzle.slots:
+            yield SlotRef(slot=slot, component_index=None)
+
+
+def find_slot_ref(puzzle: Puzzle | CompositePuzzle, slot_id: str) -> Optional[SlotRef]:
+    """Locate a slot reference by its public identifier."""
+
+    base_id, component_index = parse_slot_public_id(slot_id)
+    if isinstance(puzzle, CompositePuzzle):
+        for component in puzzle.components:
+            if component_index is not None and component.index != component_index:
+                continue
+            for slot in component.puzzle.slots:
+                if slot.slot_id.upper() == base_id:
+                    return SlotRef(slot=slot, component_index=component.index)
+    else:
+        if component_index is not None:
+            return None
+        for slot in puzzle.slots:
+            if slot.slot_id.upper() == base_id:
+                return SlotRef(slot=slot, component_index=None)
+    return None
+
+
 def puzzle_to_dict(puzzle: Puzzle) -> Dict[str, object]:
     """Convert a ``Puzzle`` instance into a serialisable dictionary."""
 
@@ -366,6 +479,7 @@ def puzzle_to_dict(puzzle: Puzzle) -> Dict[str, object]:
         )
 
     return {
+        "kind": "puzzle",
         "id": puzzle.id,
         "theme": puzzle.theme,
         "language": puzzle.language,
@@ -377,8 +491,34 @@ def puzzle_to_dict(puzzle: Puzzle) -> Dict[str, object]:
     }
 
 
-def puzzle_from_dict(payload: Dict[str, object]) -> Puzzle:
-    """Reconstruct a ``Puzzle`` instance from a dictionary."""
+def composite_to_dict(puzzle: CompositePuzzle) -> Dict[str, object]:
+    """Serialise a ``CompositePuzzle`` into JSON compatible dictionary."""
+
+    return {
+        "kind": "composite",
+        "id": puzzle.id,
+        "theme": puzzle.theme,
+        "language": puzzle.language,
+        "gap_cells": puzzle.gap_cells,
+        "created_at": puzzle.created_at.isoformat(),
+        "components": [
+            {
+                "index": component.index,
+                "row_offset": component.row_offset,
+                "col_offset": component.col_offset,
+                "puzzle": puzzle_to_dict(component.puzzle),
+            }
+            for component in puzzle.components
+        ],
+    }
+
+
+def puzzle_from_dict(payload: Dict[str, object]) -> Puzzle | CompositePuzzle:
+    """Reconstruct a ``Puzzle`` or ``CompositePuzzle`` from a dictionary."""
+
+    kind = payload.get("kind", "puzzle")
+    if kind == "composite":
+        return composite_from_dict(payload)
 
     rows = payload["size_rows"]
     cols = payload["size_cols"]
@@ -438,6 +578,42 @@ def puzzle_from_dict(payload: Dict[str, object]) -> Puzzle:
     return puzzle
 
 
+def composite_from_dict(payload: Dict[str, object]) -> CompositePuzzle:
+    """Deserialize a ``CompositePuzzle`` from a dictionary."""
+
+    components_payload = payload.get("components", [])
+    components: List[CompositeComponent] = []
+    for component_data in components_payload:
+        nested_payload = dict(component_data.get("puzzle", {}))
+        nested = puzzle_from_dict(nested_payload)
+        if not isinstance(nested, Puzzle):
+            raise ValueError("Nested composite puzzles are not supported")
+        components.append(
+            CompositeComponent(
+                index=int(component_data["index"]),
+                puzzle=nested,
+                row_offset=int(component_data.get("row_offset", 0)),
+                col_offset=int(component_data.get("col_offset", 0)),
+            )
+        )
+
+    created_at_raw = payload.get("created_at")
+    created_at = (
+        datetime.fromisoformat(created_at_raw)
+        if isinstance(created_at_raw, str)
+        else datetime.utcnow()
+    )
+
+    return CompositePuzzle(
+        id=payload["id"],
+        theme=payload["theme"],
+        language=payload["language"],
+        components=components,
+        gap_cells=int(payload.get("gap_cells", 1)),
+        created_at=created_at,
+    )
+
+
 def puzzle_to_json(puzzle: Puzzle, *, ensure_ascii: bool = False) -> str:
     """Serialise the puzzle to a JSON string."""
 
@@ -454,11 +630,20 @@ def puzzle_from_json(data: str) -> Puzzle:
 
 __all__ = [
     "Cell",
+    "CompositeComponent",
+    "CompositePuzzle",
     "Direction",
     "Puzzle",
     "Slot",
+    "SlotRef",
     "calculate_slots",
+    "composite_from_dict",
+    "composite_to_dict",
     "fill_puzzle_with_words",
+    "find_slot_ref",
+    "is_composite_puzzle",
+    "iter_slot_refs",
+    "parse_slot_public_id",
     "puzzle_from_dict",
     "puzzle_from_json",
     "puzzle_to_dict",

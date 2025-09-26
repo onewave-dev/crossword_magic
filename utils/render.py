@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .crossword import Puzzle
+from .crossword import CompositePuzzle, Puzzle, parse_slot_public_id
 from utils.logging_config import get_logger, logging_context
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,33 @@ def _parse_coord(value: Any) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _normalise_coord_collection(source: Any) -> Sequence[Tuple[int, int]]:
+def _parse_extended_coord(value: Any) -> Optional[Tuple[Optional[int], Tuple[int, int]]]:
+    """Parse coordinates that may include a component prefix."""
+
+    component: Optional[int] = None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if ":" in stripped:
+            prefix, rest = stripped.split(":", 1)
+            if prefix.strip().isdigit():
+                component = int(prefix.strip())
+                candidate = _parse_coord(rest)
+                if candidate is not None:
+                    return component, candidate
+        candidate = _parse_coord(stripped)
+        if candidate is not None:
+            return None, candidate
+        return None
+
+    coord = _parse_coord(value)
+    if coord is None:
+        return None
+    return component, coord
+
+
+def _normalise_coord_collection(
+    source: Any, *, component_filter: Optional[int] = None
+) -> Sequence[Tuple[int, int]]:
     """Extract a sequence of coordinates from arbitrary representations."""
 
     coords: list[Tuple[int, int]] = []
@@ -101,14 +128,22 @@ def _normalise_coord_collection(source: Any) -> Sequence[Tuple[int, int]]:
         iterable = [source]
 
     for item in iterable:
-        coord = _parse_coord(item)
-        if coord is not None:
-            coords.append(coord)
+        parsed = _parse_extended_coord(item)
+        if parsed is None:
+            continue
+        component, coord = parsed
+        if component_filter is not None and component != component_filter:
+            continue
+        if component_filter is None and component is not None:
+            continue
+        coords.append(coord)
 
     return coords
 
 
-def _normalise_filled_cells(source: Any) -> Dict[Tuple[int, int], str]:
+def _normalise_filled_cells(
+    source: Any, *, component_filter: Optional[int] = None
+) -> Dict[Tuple[int, int], str]:
     """Convert ``state.filled_cells`` into a coordinate-to-letter mapping."""
 
     filled: Dict[Tuple[int, int], str] = {}
@@ -133,8 +168,13 @@ def _normalise_filled_cells(source: Any) -> Dict[Tuple[int, int], str]:
         items = []
 
     for key, value in items:
-        coord = _parse_coord(key)
-        if coord is None:
+        parsed = _parse_extended_coord(key)
+        if parsed is None:
+            continue
+        component, coord = parsed
+        if component_filter is not None and component != component_filter:
+            continue
+        if component_filter is None and component is not None:
             continue
         if value is None:
             continue
@@ -144,6 +184,55 @@ def _normalise_filled_cells(source: Any) -> Dict[Tuple[int, int], str]:
         filled[coord] = letter.upper()
 
     return filled
+
+
+def _group_solved_slots(state: GameState) -> Dict[Optional[int], set[str]]:
+    """Group solved slot identifiers by component index."""
+
+    solved_lookup: Dict[Optional[int], set[str]] = defaultdict(set)
+    solved_raw = getattr(state, "solved_slots", set()) or []
+
+    if isinstance(solved_raw, Mapping):
+        entries = [str(key) for key, value in solved_raw.items() if value]
+    elif isinstance(solved_raw, (list, tuple, set)):
+        entries = [str(item) for item in solved_raw]
+    elif solved_raw:
+        entries = [str(solved_raw)]
+    else:
+        entries = []
+
+    for entry in entries:
+        base_id, component = parse_slot_public_id(entry)
+        solved_lookup[component].add(base_id)
+    return solved_lookup
+
+
+def _group_hinted_cells(state: GameState) -> Dict[Optional[int], set[Tuple[int, int]]]:
+    """Group hinted cell coordinates by component index."""
+
+    hinted_lookup: Dict[Optional[int], set[Tuple[int, int]]] = defaultdict(set)
+    source = (
+        getattr(state, "hinted_cells", None)
+        or getattr(state, "revealed_cells", None)
+        or getattr(state, "revealed_letters", None)
+    )
+    if not source:
+        return hinted_lookup
+
+    if isinstance(source, Mapping):
+        iterable: Iterable[Any] = source.keys()
+    elif isinstance(source, (list, tuple, set)):
+        iterable = source
+    else:
+        iterable = [source]
+
+    for item in iterable:
+        parsed = _parse_extended_coord(item)
+        if parsed is None:
+            continue
+        component, coord = parsed
+        hinted_lookup[component].add(coord)
+    return hinted_lookup
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -236,7 +325,76 @@ def _draw_centered_text(
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def render_puzzle(puzzle: Puzzle, state: GameState) -> Path:
+def _render_single_grid_image(
+    puzzle: Puzzle,
+    solved_slots: set[str],
+    hinted_cells: set[Tuple[int, int]],
+    filled_cells: Dict[Tuple[int, int], str],
+) -> Image.Image:
+    """Render a single crossword grid into an image object."""
+
+    rows = puzzle.size_rows
+    cols = puzzle.size_cols
+    width = cols * CELL_SIZE + PADDING * 2
+    height = rows * CELL_SIZE + PADDING * 2
+
+    number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)))
+    letter_font = _load_font(max(18, math.floor(CELL_SIZE * 0.6)), bold=True)
+
+    cell_slots = _cell_slot_mapping(puzzle)
+    cell_numbers = _cell_numbers(puzzle)
+
+    working_filled = dict(filled_cells)
+    for slot in puzzle.slots:
+        if slot.slot_id not in solved_slots:
+            continue
+        answer = slot.answer
+        if not answer:
+            letters = [puzzle.cell(r, c).letter for r, c in slot.coordinates()]
+            answer = "".join(letters)
+        if not answer:
+            continue
+        for index, coord in enumerate(slot.coordinates()):
+            if index >= len(answer):
+                break
+            working_filled[coord] = answer[index].upper()
+
+    image = Image.new("RGB", (width, height), COLOR_BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for row in range(rows):
+        for col in range(cols):
+            x0 = PADDING + col * CELL_SIZE
+            y0 = PADDING + row * CELL_SIZE
+            x1 = x0 + CELL_SIZE
+            y1 = y0 + CELL_SIZE
+
+            cell = puzzle.cell(row, col)
+            if cell.is_block:
+                draw.rectangle((x0, y0, x1, y1), fill=COLOR_BLOCK)
+                continue
+
+            coord = (row, col)
+            cell_slot_ids = cell_slots.get(coord, set())
+            is_solved = any(slot_id in solved_slots for slot_id in cell_slot_ids)
+
+            background = COLOR_SOLVED if is_solved else COLOR_BACKGROUND
+            if coord in hinted_cells and not is_solved:
+                background = COLOR_HINT
+
+            draw.rectangle((x0, y0, x1, y1), fill=background, outline=COLOR_GRID, width=GRID_WIDTH)
+
+            number = cell_numbers.get(coord)
+            if number:
+                draw.text((x0 + 4, y0 + 2), number, font=number_font, fill=COLOR_NUMBER)
+
+            letter = working_filled.get(coord, "")
+            _draw_centered_text(draw, (x0, y0, x1, y1), letter, letter_font, COLOR_TEXT)
+
+    return image
+
+
+def render_puzzle(puzzle: Puzzle | CompositePuzzle, state: GameState) -> Path:
     """Render the crossword puzzle state into a PNG image and return its path."""
 
     with logging_context(puzzle_id=puzzle.id):
@@ -249,90 +407,71 @@ def render_puzzle(puzzle: Puzzle, state: GameState) -> Path:
             logger.debug("Using cached render for puzzle %s at %s", puzzle.id, output_path)
             return output_path
 
-        rows = puzzle.size_rows
-        cols = puzzle.size_cols
-        width = cols * CELL_SIZE + PADDING * 2
-        height = rows * CELL_SIZE + PADDING * 2
+        solved_lookup = _group_solved_slots(state)
+        hinted_lookup = _group_hinted_cells(state)
+        filled_source = getattr(state, "filled_cells", {})
 
-        solved_slots_raw = getattr(state, "solved_slots", set()) or []
-        if isinstance(solved_slots_raw, (list, tuple, set)):
-            solved_slots = {str(slot_id) for slot_id in solved_slots_raw}
-        elif isinstance(solved_slots_raw, Mapping):
-            solved_slots = {str(key) for key, value in solved_slots_raw.items() if value}
+        component_keys: set[Optional[int]] = set(solved_lookup.keys()) | set(hinted_lookup.keys())
+        if isinstance(puzzle, CompositePuzzle):
+            component_keys.update(component.index for component in puzzle.components)
         else:
-            solved_slots = {str(solved_slots_raw)}
+            component_keys.add(None)
 
-        hinted_cells_source = (
-            getattr(state, "hinted_cells", None)
-            or getattr(state, "revealed_cells", None)
-            or getattr(state, "revealed_letters", None)
-        )
-        hinted_cells = set(_normalise_coord_collection(hinted_cells_source))
+        filled_lookup: Dict[Optional[int], Dict[Tuple[int, int], str]] = {
+            component: _normalise_filled_cells(filled_source, component_filter=component)
+            for component in component_keys
+        }
 
-        filled_cells = _normalise_filled_cells(getattr(state, "filled_cells", {}))
+        try:
+            if isinstance(puzzle, CompositePuzzle):
+                if not puzzle.components:
+                    raise ValueError("Composite puzzle does not contain components")
+                component_images: list[tuple[int, Image.Image]] = []
+                ordered_components = sorted(
+                    puzzle.components, key=lambda comp: (comp.row_offset, comp.index)
+                )
+                for component in ordered_components:
+                    component_index = component.index
+                    image = _render_single_grid_image(
+                        component.puzzle,
+                        solved_lookup.get(component_index, set()),
+                        hinted_lookup.get(component_index, set()),
+                        filled_lookup.get(component_index, {}),
+                    )
+                    component_images.append((component_index, image))
 
-        cell_slots = _cell_slot_mapping(puzzle)
-        cell_numbers = _cell_numbers(puzzle)
+                gap = max(PADDING, CELL_SIZE // 2)
+                width = max(image.width for _, image in component_images)
+                height = sum(image.height for _, image in component_images)
+                if len(component_images) > 1:
+                    height += gap * (len(component_images) - 1)
 
-        for slot in puzzle.slots:
-            if slot.slot_id not in solved_slots:
-                continue
-            if slot.answer:
-                answer = slot.answer
+                composite_image = Image.new("RGB", (width, height), COLOR_BACKGROUND)
+                current_y = 0
+                for idx, (component_index, image) in enumerate(component_images):
+                    x = (width - image.width) // 2
+                    composite_image.paste(image, (x, current_y))
+                    logger.debug(
+                        "Placed component %s at position (%s, %s) within composite image",
+                        component_index,
+                        x,
+                        current_y,
+                    )
+                    current_y += image.height
+                    if idx < len(component_images) - 1:
+                        current_y += gap
+
+                composite_image.save(output_path, format="PNG")
             else:
-                letters = [puzzle.cell(r, c).letter for r, c in slot.coordinates()]
-                answer = "".join(letters)
-            for index, coord in enumerate(slot.coordinates()):
-                if not answer:
-                    continue
-                if index >= len(answer):
-                    break
-                filled_cells[coord] = answer[index].upper()
-
-        number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)))
-        letter_font = _load_font(max(18, math.floor(CELL_SIZE * 0.6)), bold=True)
-
-        image = Image.new("RGB", (width, height), COLOR_BACKGROUND)
-        draw = ImageDraw.Draw(image)
-
-        try:
-            for row in range(rows):
-                for col in range(cols):
-                    x0 = PADDING + col * CELL_SIZE
-                    y0 = PADDING + row * CELL_SIZE
-                    x1 = x0 + CELL_SIZE
-                    y1 = y0 + CELL_SIZE
-
-                    cell = puzzle.cell(row, col)
-                    if cell.is_block:
-                        draw.rectangle((x0, y0, x1, y1), fill=COLOR_BLOCK)
-                        continue
-
-                    coord = (row, col)
-                    cell_slot_ids = cell_slots.get(coord, set())
-                    is_solved = bool(cell_slot_ids & solved_slots)
-
-                    background = COLOR_SOLVED if is_solved else COLOR_BACKGROUND
-                    if coord in hinted_cells and not is_solved:
-                        background = COLOR_HINT
-
-                    draw.rectangle((x0, y0, x1, y1), fill=background, outline=COLOR_GRID, width=GRID_WIDTH)
-
-                    number = cell_numbers.get(coord)
-                    if number:
-                        draw.text((x0 + 4, y0 + 2), number, font=number_font, fill=COLOR_NUMBER)
-
-                    letter = filled_cells.get(coord, "")
-                    _draw_centered_text(draw, (x0, y0, x1, y1), letter, letter_font, COLOR_TEXT)
-
-        except Exception as exc:  # noqa: BLE001 - log any rendering failure
+                image = _render_single_grid_image(
+                    puzzle,
+                    solved_lookup.get(None, set()),
+                    hinted_lookup.get(None, set()),
+                    filled_lookup.get(None, {}),
+                )
+                image.save(output_path, format="PNG")
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to render puzzle %s", puzzle.id)
-            raise exc
-
-        try:
-            image.save(output_path, format="PNG")
-        except Exception as exc:  # noqa: BLE001 - log saving issues separately
-            logger.exception("Failed to save rendered puzzle %s to %s", puzzle.id, output_path)
             raise exc
 
         duration = perf_counter() - start_time

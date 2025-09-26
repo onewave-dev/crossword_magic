@@ -38,6 +38,7 @@ class GameState:
     started_at: float
     last_update: float
     hinted_cells: set[str] | None = None
+    puzzle_ids: list[str] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the state into a JSON-compatible dictionary."""
@@ -45,6 +46,7 @@ class GameState:
         return {
             "chat_id": self.chat_id,
             "puzzle_id": self.puzzle_id,
+            "puzzle_ids": list(self.puzzle_ids) if self.puzzle_ids else None,
             "filled_cells": self.filled_cells,
             "solved_slots": sorted(self.solved_slots),
             "score": self.score,
@@ -65,9 +67,19 @@ class GameState:
         else:
             solved_slots = set()
 
+        puzzle_ids_raw = payload.get("puzzle_ids")
+        puzzle_ids: list[str] | None
+        if isinstance(puzzle_ids_raw, Iterable) and not isinstance(puzzle_ids_raw, (str, bytes)):
+            puzzle_ids = [str(item) for item in puzzle_ids_raw]
+        elif puzzle_ids_raw:
+            puzzle_ids = [str(puzzle_ids_raw)]
+        else:
+            puzzle_ids = None
+
         return cls(
             chat_id=int(payload["chat_id"]),
             puzzle_id=str(payload["puzzle_id"]),
+            puzzle_ids=puzzle_ids,
             filled_cells=dict(payload.get("filled_cells", {})),
             solved_slots=solved_slots,
             score=int(payload.get("score", 0)),
