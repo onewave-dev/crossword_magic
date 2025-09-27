@@ -377,7 +377,7 @@ def _format_clue_section(
         public_id = html.escape(slot_ref.public_id)
         line_text = f"{public_id}: {clue_text}"
         if _normalise_slot_id(slot_ref.public_id) in solved_lookup:
-            line_text = f"✅ <b>{line_text}</b>"
+            line_text = f"<b>{line_text}</b> ✅"
         lines.append(line_text)
     return "\n".join(lines) if lines else "(подсказок нет)"
 
