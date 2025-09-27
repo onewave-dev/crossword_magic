@@ -86,6 +86,7 @@ class Settings:
     webhook_secret: str
     webhook_path: str = "/webhook"
     webhook_check_interval: int = 300
+    admin_id: Optional[int] = None
 
 
 def load_settings() -> Settings:
@@ -113,12 +114,22 @@ def load_settings() -> Settings:
         logger.debug("WEBHOOK_CHECK_INTERVAL is not a digit, defaulting to 300 seconds")
         check_interval = 300
 
+    admin_id_raw = os.getenv("ADMIN_ID")
+    admin_id: Optional[int] = None
+    if admin_id_raw:
+        try:
+            admin_id = int(admin_id_raw)
+        except ValueError:
+            logger.warning("Invalid ADMIN_ID provided, ignoring value: %s", admin_id_raw)
+            admin_id = None
+
     return Settings(
         telegram_bot_token=required_vars["TELEGRAM_BOT_TOKEN"],
         public_url=required_vars["PUBLIC_URL"].rstrip("/"),
         webhook_secret=required_vars["WEBHOOK_SECRET"],
         webhook_path=required_vars["WEBHOOK_PATH"] if required_vars["WEBHOOK_PATH"].startswith("/") else f"/{required_vars['WEBHOOK_PATH']}",
         webhook_check_interval=check_interval,
+        admin_id=admin_id,
     )
 
 
@@ -267,6 +278,10 @@ INLINE_ANSWER_PATTERN = re.compile(
     flags=re.UNICODE,
 )
 
+ADMIN_COMMAND_PATTERN = re.compile(r"(?i)^\s*adm key")
+ADMIN_KEYS_ONLY_PATTERN = re.compile(r"(?i)^\s*adm keys\s*$")
+ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
+
 
 def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
     if not text:
@@ -402,6 +417,42 @@ def _format_clues_message(
     across_text = _format_clue_section(across, solved_ids)
     down_text = _format_clue_section(down, solved_ids)
     return f"Across:\n{across_text}\n\nDown:\n{down_text}"
+
+
+def _sorted_slot_refs(puzzle: Puzzle | CompositePuzzle) -> list[SlotRef]:
+    return sorted(
+        iter_slot_refs(puzzle),
+        key=lambda ref: (
+            ref.component_index if ref.component_index is not None else -1,
+            ref.slot.direction.value,
+            ref.slot.number,
+            ref.slot.slot_id,
+        ),
+    )
+
+
+def _format_admin_answers(puzzle: Puzzle | CompositePuzzle) -> str:
+    lines: list[str] = []
+    previous_component: Optional[int] = None
+    is_composite = isinstance(puzzle, CompositePuzzle)
+    for ref in _sorted_slot_refs(puzzle):
+        component_index = ref.component_index
+        if is_composite and component_index != previous_component:
+            lines.append(f"[Компонента {component_index + 1}]")
+            previous_component = component_index
+        answer = ref.slot.answer or "(нет ответа)"
+        lines.append(f"{ref.public_id}: {answer}")
+    return "\n".join(lines) if lines else "Ответы отсутствуют."
+
+
+def _format_slot_answers(slot_refs: Sequence[SlotRef]) -> str:
+    if not slot_refs:
+        return "Ответ не найден."
+    lines = []
+    for ref in slot_refs:
+        answer = ref.slot.answer or "(нет ответа)"
+        lines.append(f"{ref.public_id}: {answer}")
+    return "\n".join(lines)
 
 
 async def _send_clues_update(
@@ -1166,6 +1217,78 @@ async def _handle_answer_submission(
 
 
 @command_entrypoint()
+async def admin_answer_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or message is None or user is None or not message.text:
+        return
+
+    settings = state.settings
+    if settings is None or settings.admin_id is None:
+        return
+    if user.id != settings.admin_id:
+        logger.debug("Ignoring admin request from non-admin user %s", user.id)
+        return
+
+    text = message.text.strip()
+    if not text:
+        return
+
+    game_state = _load_state_for_chat(chat.id)
+    if not game_state:
+        await message.reply_text("Нет активной игры для выдачи ответов.")
+        return
+
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        await message.reply_text("Не удалось загрузить кроссворд для ответов.")
+        return
+
+    if ADMIN_KEYS_ONLY_PATTERN.match(text):
+        logger.info("Admin requested all answers for chat %s", chat.id)
+        await message.reply_text(_format_admin_answers(puzzle))
+        return
+
+    single_match = ADMIN_SINGLE_KEY_PATTERN.match(text)
+    if not single_match:
+        return
+
+    query = single_match.group(1).strip()
+    if not query:
+        await message.reply_text("Укажите номер вопроса после команды.")
+        return
+
+    slot_ref, ambiguity = _resolve_slot(puzzle, query)
+    if slot_ref:
+        logger.info("Admin requested answer for slot %s", slot_ref.public_id)
+        await message.reply_text(_format_slot_answers([slot_ref]))
+        return
+
+    if ambiguity:
+        await message.reply_text(ambiguity)
+        return
+
+    if query.isdigit():
+        number = int(query)
+        matches = [ref for ref in _sorted_slot_refs(puzzle) if ref.slot.number == number]
+        if matches:
+            logger.info(
+                "Admin requested answers for number %s (matches: %s)",
+                number,
+                ", ".join(ref.public_id for ref in matches),
+            )
+            await message.reply_text(_format_slot_answers(matches))
+            return
+
+    await message.reply_text("Вопрос с таким номером не найден.")
+
+
+@command_entrypoint()
 async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -1361,6 +1484,9 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(
         MessageHandler(filters.Regex(INLINE_ANSWER_PATTERN), inline_answer_handler)
+    )
+    telegram_application.add_handler(
+        MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
     )
 
 
