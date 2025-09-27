@@ -282,7 +282,8 @@ def _normalise_slot_id(slot_id: str) -> str:
 
 
 INLINE_ANSWER_PATTERN = re.compile(
-    r"^\s*([^\W\d_]+[0-9]+(?:-[0-9]+)?)\s*[-–:]\s*(.+)$",
+    # Accept common dash-like separators (hyphen, en/em dash, figure dash, minus) and colon
+    r"^\s*([^\W\d_]+[0-9]+(?:-[0-9]+)?)\s*[-–—‒−:]\s*(.+)$",
     flags=re.UNICODE,
 )
 

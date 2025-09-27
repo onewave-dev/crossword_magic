@@ -20,6 +20,7 @@ from app import _parse_inline_answer, inline_answer_handler
         ("я5 - Ответ", ("Я5", "Ответ")),
         ("β12-3:Αθήνα", ("Β12-3", "Αθήνα")),
         (" z9-2 :  respuesta ", ("Z9-2", "respuesta")),
+        ("A2 — мопс", ("A2", "мопс")),
     ],
 )
 def test_parse_inline_answer_valid(text, expected):
