@@ -15,11 +15,19 @@ from typing import Iterable, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import Chat, Message, Update, constants
+from telegram import (
+    Chat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+    constants,
+)
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CallbackContext,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     ContextTypes,
@@ -278,6 +286,16 @@ INLINE_ANSWER_PATTERN = re.compile(
     flags=re.UNICODE,
 )
 
+COMPLETION_CALLBACK_PREFIX = "complete:"
+SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
+NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
+
+BUTTON_NEW_GAME_KEY = "button_new_game_flow"
+BUTTON_STEP_KEY = "step"
+BUTTON_LANGUAGE_KEY = "language"
+BUTTON_STEP_LANGUAGE = "language"
+BUTTON_STEP_THEME = "theme"
+
 ADMIN_COMMAND_PATTERN = re.compile(r"(?i)^\s*adm key")
 ADMIN_KEYS_ONLY_PATTERN = re.compile(r"(?i)^\s*adm keys\s*$")
 ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
@@ -466,6 +484,84 @@ async def _send_clues_update(
         _format_clues_message(puzzle, game_state),
         parse_mode=constants.ParseMode.HTML,
     )
+
+
+def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboardMarkup:
+    same_topic_data = f"{SAME_TOPIC_CALLBACK_PREFIX}{puzzle.id}"
+    new_puzzle_data = f"{NEW_PUZZLE_CALLBACK_PREFIX}{puzzle.id}"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Еще один кроссворд на эту же тему",
+                    callback_data=same_topic_data,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Новый кроссворд",
+                    callback_data=new_puzzle_data,
+                )
+            ],
+        ]
+    )
+
+
+async def _send_completion_options(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message: Message | None,
+    puzzle: Puzzle | CompositePuzzle,
+) -> None:
+    keyboard = _build_completion_keyboard(puzzle)
+    text = "Продолжить?"
+    if message is not None:
+        await message.reply_text(text, reply_markup=keyboard)
+        return
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+async def _deliver_puzzle_via_bot(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    puzzle: Puzzle | CompositePuzzle,
+    game_state: GameState,
+) -> bool:
+    image_path = None
+    try:
+        with logging_context(puzzle_id=puzzle.id):
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=(
+                        f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
+                    ),
+                )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=_format_clues_message(puzzle, game_state),
+                parse_mode=constants.ParseMode.HTML,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
+                    "Если удобнее, можно пользоваться и командой /answer."
+                ),
+            )
+            logger.info("Delivered freshly generated puzzle to chat %s", chat_id)
+            return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to deliver puzzle to chat %s", chat_id)
+        if image_path is not None:
+            with suppress(OSError):
+                image_path.unlink(missing_ok=True)
+    return False
 
 
 def _ensure_private_chat(update: Update) -> bool:
@@ -951,6 +1047,31 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return THEME_STATE
 
 
+@command_entrypoint()
+async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not state or state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
+        return
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    language = message.text.strip().lower()
+    if not language or not language.isalpha():
+        await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
+        return
+    state[BUTTON_LANGUAGE_KEY] = language
+    state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
+    logger.debug(
+        "Chat %s selected language %s via button flow",
+        update.effective_chat.id if update.effective_chat else "<unknown>",
+        language,
+    )
+    await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+
+
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
@@ -1034,6 +1155,61 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         context.chat_data["reminder_job"] = job
 
     return ConversationHandler.END
+
+
+@command_entrypoint()
+async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not state or state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
+        return
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or not message.text or chat is None:
+        return
+    language = state.get(BUTTON_LANGUAGE_KEY)
+    if not language:
+        await message.reply_text("Сначала выберите язык через команду /new.")
+        state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
+        return
+    theme = message.text.strip()
+    if not theme:
+        await message.reply_text("Введите тему, например: Древний Рим.")
+        return
+    logger.info("Chat %s requested theme '%s' via button flow", chat.id, theme)
+    _cancel_reminder(context)
+    await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
+    loop = asyncio.get_running_loop()
+    try:
+        puzzle, game_state = await loop.run_in_executor(
+            None, _generate_puzzle, chat.id, language, theme
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to generate puzzle for chat %s via button flow", chat.id)
+        _cleanup_chat_resources(chat.id)
+        context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+        await message.reply_text(
+            "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
+        )
+        return
+    context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+    delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
+    if not delivered:
+        _cleanup_game_state(game_state)
+        await message.reply_text(
+            "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
+        )
+        return
+    if context.job_queue:
+        job = context.job_queue.run_once(
+            _reminder_job,
+            REMINDER_DELAY_SECONDS,
+            chat_id=chat.id,
+            name=f"hint-reminder-{chat.id}",
+        )
+        context.chat_data["reminder_job"] = job
 
 
 @command_entrypoint(fallback=ConversationHandler.END)
@@ -1215,6 +1391,7 @@ async def _handle_answer_submission(
                 "🎉 <b>Поздравляем!</b>\nВсе слова разгаданы! ✨",
                 parse_mode=constants.ParseMode.HTML,
             )
+            await _send_completion_options(context, chat.id, message, puzzle)
         else:
             await refresh_clues_if_needed()
 
@@ -1465,7 +1642,115 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         solved_lines = "\n".join(f"{slot_id}: {answer}" for slot_id, answer in solved_now)
         await message.reply_text(f"Оставшиеся ответы:\n{solved_lines}")
+        await _send_completion_options(context, chat.id, message, puzzle)
         logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
+
+
+@command_entrypoint()
+async def completion_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    if not await _reject_group_chat(update):
+        return
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    data = (query.data or "").strip()
+    message = query.message
+    if message is not None:
+        with suppress(Exception):
+            await message.edit_reply_markup(reply_markup=None)
+
+    if data.startswith(SAME_TOPIC_CALLBACK_PREFIX):
+        puzzle_id = data[len(SAME_TOPIC_CALLBACK_PREFIX) :]
+        if not puzzle_id:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Не удалось определить предыдущую игру. Используйте /new для начала нового кроссворда.",
+            )
+            return
+        game_state = _load_state_for_chat(chat.id)
+        if not game_state or game_state.puzzle_id != puzzle_id:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Похоже, уже начата другая игра. Используйте /new, чтобы начать новый кроссворд.",
+            )
+            return
+        puzzle = _load_puzzle_for_state(game_state)
+        if puzzle is None:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Не удалось загрузить предыдущий кроссворд. Попробуйте начать новую игру командой /new.",
+            )
+            _cleanup_game_state(game_state)
+            return
+        language = puzzle.language
+        theme = puzzle.theme
+        logger.info(
+            "Chat %s requested another puzzle for same theme (%s, %s)",
+            chat.id,
+            language,
+            theme,
+        )
+        _cancel_reminder(context)
+        _cleanup_game_state(game_state)
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"Готовлю новый кроссворд на тему «{theme}» на языке {language.upper()}...",
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            new_puzzle, new_state = await loop.run_in_executor(
+                None, _generate_puzzle, chat.id, language, theme
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to regenerate puzzle for chat %s on same theme", chat.id
+            )
+            _cleanup_chat_resources(chat.id)
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже.",
+            )
+            return
+        delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
+        if not delivered:
+            _cleanup_game_state(new_state)
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new.",
+            )
+            return
+        if context.job_queue:
+            job = context.job_queue.run_once(
+                _reminder_job,
+                REMINDER_DELAY_SECONDS,
+                chat_id=chat.id,
+                name=f"hint-reminder-{chat.id}",
+            )
+            context.chat_data["reminder_job"] = job
+        return
+
+    if data.startswith(NEW_PUZZLE_CALLBACK_PREFIX):
+        puzzle_id = data[len(NEW_PUZZLE_CALLBACK_PREFIX) :]
+        game_state = _load_state_for_chat(chat.id)
+        if game_state and (not puzzle_id or game_state.puzzle_id == puzzle_id):
+            _cleanup_game_state(game_state)
+        _cancel_reminder(context)
+        context.user_data.pop("new_game_language", None)
+        context.chat_data[BUTTON_NEW_GAME_KEY] = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Выберите язык кроссворда (например: ru, en, it, es).",
+        )
+        logger.info("Prompted chat %s to start new puzzle flow", chat.id)
+        return
+
+    logger.debug("Unhandled completion callback payload: %s", data)
 
 
 def configure_telegram_handlers(telegram_application: Application) -> None:
@@ -1479,6 +1764,20 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         name="new_game_conversation",
     )
     telegram_application.add_handler(conversation)
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            button_language_handler,
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            button_theme_handler,
+            block=False,
+        )
+    )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
     telegram_application.add_handler(CommandHandler("state", send_state_image))
     telegram_application.add_handler(CommandHandler("answer", answer_command))
@@ -1490,6 +1789,12 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            completion_callback_handler,
+            pattern=fr"^{COMPLETION_CALLBACK_PREFIX}",
+        )
     )
 
 
