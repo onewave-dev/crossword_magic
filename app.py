@@ -1211,7 +1211,10 @@ async def _handle_answer_submission(
 
         if _all_slots_solved(puzzle, game_state):
             _cancel_reminder(context)
-            await message.reply_text("Поздравляем! Все слова разгаданы.")
+            await message.reply_text(
+                "🎉 <b>Поздравляем!</b>\nВсе слова разгаданы! ✨",
+                parse_mode=constants.ParseMode.HTML,
+            )
         else:
             await refresh_clues_if_needed()
 
