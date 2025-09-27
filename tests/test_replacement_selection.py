@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app import _generate_puzzle
+import pytest
+
+from app import MAX_REPLACEMENT_REQUESTS, _generate_puzzle
 from utils.fill_in_generator import DisconnectedWordError
 from utils.llm_generator import WordClue
 
@@ -67,3 +69,49 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
     assert len(call_state["words"]) == len(base_clues)
     assert puzzle.language == "en"
     assert game_state.chat_id == 1
+
+
+def test_replacement_attempt_cap(monkeypatch) -> None:
+    """Abort replacement requests after hitting the configured cap."""
+
+    base_clues = [
+        WordClue(word="AAAA", clue="first"),
+        WordClue(word="BBBB", clue="second"),
+        WordClue(word="CCCCC", clue="third"),
+        WordClue(word="DDDDD", clue="fourth"),
+        WordClue(word="EEEEE", clue="fifth"),
+        WordClue(word="FFFFF", clue="sixth"),
+        WordClue(word="GGGGG", clue="seventh"),
+        WordClue(word="HHHHH", clue="eighth"),
+        WordClue(word="IIIII", clue="ninth"),
+        WordClue(word="JJJJJ", clue="tenth"),
+    ]
+
+    call_counts = {"base": 0, "replacement": 0}
+
+    def fake_generate_clues(theme: str, language: str):
+        if "вместо" in theme:
+            call_counts["replacement"] += 1
+            return [WordClue(word="AAAA", clue="duplicate")]
+        call_counts["base"] += 1
+        return base_clues
+
+    def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
+        return list(clues)
+
+    def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
+        raise DisconnectedWordError("AAAA")
+
+    monkeypatch.setattr("app.generate_clues", fake_generate_clues)
+    monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
+    monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
+    monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError):
+        _generate_puzzle(chat_id=1, language="en", theme="Space")
+
+    assert call_counts["base"] == 1
+    assert call_counts["replacement"] == MAX_REPLACEMENT_REQUESTS
