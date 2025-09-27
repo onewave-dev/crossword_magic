@@ -229,7 +229,7 @@ LANGUAGE_STATE, THEME_STATE = range(2)
 REMINDER_DELAY_SECONDS = 10 * 60
 
 MAX_PUZZLE_SIZE = 15
-MAX_REPLACEMENT_REQUESTS = 3
+MAX_REPLACEMENT_REQUESTS = 30
 
 
 def _normalise_thread_id(update: Update) -> int:
@@ -641,7 +641,14 @@ def _generate_puzzle(
                 if _canonical_answer(clue.word, language) == canonical:
                     continue
                 other_letters.update(_canonical_letter_set(clue.word, language))
-            while replacement_requests < MAX_REPLACEMENT_REQUESTS:
+            while True:
+                if replacement_requests >= MAX_REPLACEMENT_REQUESTS:
+                    logger.warning(
+                        "Reached maximum replacement requests (%s) while trying to replace %s",
+                        MAX_REPLACEMENT_REQUESTS,
+                        word,
+                    )
+                    return None
                 replacement_requests += 1
                 prompt_suffix = ", ".join(sorted(replacement_prompt_words))
                 replacement_theme = (
@@ -674,11 +681,7 @@ def _generate_puzzle(
                     "Replacement attempt %s did not provide new unique words",
                     replacement_requests,
                 )
-            logger.warning(
-                "Exhausted replacement attempts while trying to replace %s",
-                word,
-            )
-            return None
+
 
         for limit in range(max_attempt_words, min_attempt_words - 1, -1):
             candidate_clues = list(validated_clues[:limit])
