@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 import os
 import time
@@ -350,16 +351,30 @@ def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle | Composite
         return puzzle_from_dict(dict(payload))
 
 
-def _format_clue_section(slot_refs: Iterable[SlotRef]) -> str:
-    lines = []
+def _format_clue_section(
+    slot_refs: Iterable[SlotRef], solved_ids: set[str] | None = None
+) -> str:
+    solved_lookup = solved_ids if solved_ids is not None else set()
+    lines: list[str] = []
     for slot_ref in slot_refs:
         slot = slot_ref.slot
-        clue_text = slot.clue or "(нет подсказки)"
-        lines.append(f"{slot_ref.public_id}: {clue_text}")
+        clue_text = html.escape(slot.clue or "(нет подсказки)")
+        public_id = html.escape(slot_ref.public_id)
+        line_text = f"{public_id}: {clue_text}"
+        if _normalise_slot_id(slot_ref.public_id) in solved_lookup:
+            line_text = f"✅ <b>{line_text}</b>"
+        lines.append(line_text)
     return "\n".join(lines) if lines else "(подсказок нет)"
 
 
-def _format_clues_message(puzzle: Puzzle | CompositePuzzle) -> str:
+def _format_clues_message(
+    puzzle: Puzzle | CompositePuzzle, game_state: GameState | None = None
+) -> str:
+    solved_ids: set[str] = (
+        {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+        if game_state
+        else set()
+    )
     if isinstance(puzzle, CompositePuzzle):
         sections: list[str] = []
         for component in sorted(puzzle.components, key=lambda comp: comp.index):
@@ -372,8 +387,8 @@ def _format_clues_message(puzzle: Puzzle | CompositePuzzle) -> str:
             down = [ref for ref in refs if ref.slot.direction is Direction.DOWN]
             section = (
                 f"Сетка {component.index}:\n"
-                f"Across:\n{_format_clue_section(across)}\n\n"
-                f"Down:\n{_format_clue_section(down)}"
+                f"Across:\n{_format_clue_section(across, solved_ids)}\n\n"
+                f"Down:\n{_format_clue_section(down, solved_ids)}"
             )
             sections.append(section)
         return "\n\n".join(sections)
@@ -384,9 +399,22 @@ def _format_clues_message(puzzle: Puzzle | CompositePuzzle) -> str:
     down = [
         ref for ref in iter_slot_refs(puzzle) if ref.slot.direction is Direction.DOWN
     ]
-    across_text = _format_clue_section(across)
-    down_text = _format_clue_section(down)
+    across_text = _format_clue_section(across, solved_ids)
+    down_text = _format_clue_section(down, solved_ids)
     return f"Across:\n{across_text}\n\nDown:\n{down_text}"
+
+
+async def _send_clues_update(
+    message: Message,
+    puzzle: Puzzle | CompositePuzzle,
+    game_state: GameState,
+) -> None:
+    if _all_slots_solved(puzzle, game_state):
+        return
+    await message.reply_text(
+        _format_clues_message(puzzle, game_state),
+        parse_mode=constants.ParseMode.HTML,
+    )
 
 
 def _ensure_private_chat(update: Update) -> bool:
@@ -834,7 +862,10 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     with open(image_path, "rb") as photo:
                         await message.reply_photo(photo=photo)
                 if message:
-                    await message.reply_text(_format_clues_message(puzzle))
+                    await message.reply_text(
+                        _format_clues_message(puzzle, game_state),
+                        parse_mode=constants.ParseMode.HTML,
+                    )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to resend active puzzle to chat %s", chat_id)
             if message:
@@ -923,7 +954,10 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                         f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
                     ),
                 )
-            await message.reply_text(_format_clues_message(puzzle))
+            await message.reply_text(
+                _format_clues_message(puzzle, game_state),
+                parse_mode=constants.ParseMode.HTML,
+            )
             await message.reply_text(
                 "Отправляйте ответы прямо в чат в формате «A1 - ответ». Если удобнее, можно пользоваться и командой /answer."
             )
@@ -980,7 +1014,10 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     with logging_context(puzzle_id=puzzle.id):
         logger.info("Sending clues to chat")
-        await message.reply_text(_format_clues_message(puzzle))
+        await message.reply_text(
+            _format_clues_message(puzzle, game_state),
+            parse_mode=constants.ParseMode.HTML,
+        )
 
 
 @command_entrypoint()
@@ -1039,13 +1076,18 @@ async def _handle_answer_submission(
         return
 
     with logging_context(puzzle_id=puzzle.id):
+        async def refresh_clues_if_needed() -> None:
+            await _send_clues_update(message, puzzle, game_state)
+
         slot_ref, ambiguity = _resolve_slot(puzzle, normalised_slot_id)
         if ambiguity:
             await message.reply_text(ambiguity)
+            await refresh_clues_if_needed()
             return
         if slot_ref is None:
             logger.warning("Answer received for missing slot %s", normalised_slot_id)
             await message.reply_text(f"Слот {normalised_slot_id} не найден.")
+            await refresh_clues_if_needed()
             return
 
         slot = slot_ref.slot
@@ -1053,9 +1095,11 @@ async def _handle_answer_submission(
         solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
         if public_id in solved_ids:
             await message.reply_text("Этот слот уже решён.")
+            await refresh_clues_if_needed()
             return
         if not slot.answer:
             await message.reply_text("Для этого слота не задан ответ.")
+            await refresh_clues_if_needed()
             return
 
         try:
@@ -1071,15 +1115,18 @@ async def _handle_answer_submission(
                 exc,
             )
             await message.reply_text(f"Слово не прошло проверку: {exc}")
+            await refresh_clues_if_needed()
             return
         except Exception:  # noqa: BLE001
             logger.exception("Unexpected error validating answer for slot %s", slot.slot_id)
             await message.reply_text("Не удалось проверить слово. Попробуйте позже.")
+            await refresh_clues_if_needed()
             return
 
         if not validated:
             logger.info("Answer for slot %s failed language rules", slot.slot_id)
             await message.reply_text("Слово не соответствует правилам языка.")
+            await refresh_clues_if_needed()
             return
 
         candidate = validated[0].word
@@ -1089,6 +1136,7 @@ async def _handle_answer_submission(
         ):
             logger.info("Incorrect answer for slot %s", slot_ref.public_id)
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
+            await refresh_clues_if_needed()
             return
 
         game_state.score += slot.length
@@ -1113,6 +1161,8 @@ async def _handle_answer_submission(
         if _all_slots_solved(puzzle, game_state):
             _cancel_reminder(context)
             await message.reply_text("Поздравляем! Все слова разгаданы.")
+        else:
+            await refresh_clues_if_needed()
 
 
 @command_entrypoint()
