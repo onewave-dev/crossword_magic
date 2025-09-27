@@ -252,8 +252,13 @@ def _coord_key(row: int, col: int, component: int | None = None) -> str:
     return f"{component}:{base}"
 
 
+CYRILLIC_SLOT_LETTER_MAP = str.maketrans({"А": "A", "Д": "D"})
+
+
 def _normalise_slot_id(slot_id: str) -> str:
-    return slot_id.strip().upper()
+    """Normalise slot identifiers to a canonical ASCII form."""
+
+    return slot_id.strip().upper().translate(CYRILLIC_SLOT_LETTER_MAP)
 
 
 INLINE_ANSWER_PATTERN = re.compile(

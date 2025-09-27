@@ -15,6 +15,8 @@ from app import _parse_inline_answer, inline_answer_handler
         ("A1 - Tokyo", ("A1", "Tokyo")),
         (" b12 –  Kyoto ", ("B12", "Kyoto")),
         ("c3:Rio", ("C3", "Rio")),
+        ("А1 - ответ", ("A1", "ответ")),
+        ("д7 - слово", ("D7", "слово")),
         ("я5 - Ответ", ("Я5", "Ответ")),
         ("β12-3:Αθήνα", ("Β12-3", "Αθήνα")),
         (" z9-2 :  respuesta ", ("Z9-2", "respuesta")),
