@@ -802,10 +802,50 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
         return ConversationHandler.END
-    logger.debug("Chat %s initiated /new", update.effective_chat.id if update.effective_chat else "<unknown>")
+    chat = update.effective_chat
+    message = update.effective_message
+    chat_id = chat.id if chat else None
+    logger.debug("Chat %s initiated /new", chat_id if chat_id is not None else "<unknown>")
+
+    if chat_id is not None:
+        game_state = _load_state_for_chat(chat_id)
+    else:
+        game_state = None
+
+    puzzle: Puzzle | CompositePuzzle | None = None
+    if game_state is not None:
+        puzzle = _load_puzzle_for_state(game_state)
+
+    if game_state is not None and puzzle is not None and not _all_slots_solved(puzzle, game_state):
+        context.user_data.pop("new_game_language", None)
+        reminder_text = (
+            "У вас уже есть активный кроссворд. Давайте продолжим текущую игру!"
+        )
+        if message:
+            await message.reply_text(reminder_text)
+        try:
+            with logging_context(puzzle_id=puzzle.id):
+                image_path = render_puzzle(puzzle, game_state)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=constants.ChatAction.UPLOAD_PHOTO,
+                )
+                if message:
+                    with open(image_path, "rb") as photo:
+                        await message.reply_photo(photo=photo)
+                if message:
+                    await message.reply_text(_format_clues_message(puzzle))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to resend active puzzle to chat %s", chat_id)
+            if message:
+                await message.reply_text(
+                    "Не удалось показать текущее состояние, но игра продолжается."
+                )
+        return ConversationHandler.END
+
     context.user_data["new_game_language"] = None
-    if update.effective_message:
-        await update.effective_message.reply_text(
+    if message:
+        await message.reply_text(
             "Выберите язык кроссворда (например: ru, en, it, es).",
         )
     return LANGUAGE_STATE
