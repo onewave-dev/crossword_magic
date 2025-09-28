@@ -1646,6 +1646,28 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_completion_options(context, chat.id, message, puzzle)
         logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
 
+@command_entrypoint()
+async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+
+    logger.info("Chat %s requested /quit", chat.id)
+    game_state = _load_state_for_chat(chat.id)
+
+    _cancel_reminder(context)
+
+    if game_state is not None:
+        _cleanup_game_state(game_state)
+    else:
+        _cleanup_chat_resources(chat.id)
+
+    await message.reply_text("Сессия завершена. Нажмите /start, чтобы начать заново")
+
 
 @command_entrypoint()
 async def completion_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
