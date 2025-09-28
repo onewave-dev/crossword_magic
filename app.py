@@ -1391,18 +1391,36 @@ async def _handle_answer_submission(
 ) -> None:
     normalised_slot_id = _normalise_slot_id(slot_id)
     answer_text = raw_answer.strip()
+
+    def log_abort(
+        reason: str,
+        *,
+        slot_identifier: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        logger.debug(
+            "Answer submission aborted (chat=%s, slot=%s, reason=%s, detail=%s)",
+            chat.id,
+            slot_identifier or normalised_slot_id,
+            reason,
+            detail or "-",
+        )
+
     if not answer_text:
         await message.reply_text("Введите ответ после слота.")
+        log_abort("empty_answer_text")
         return
 
     logger.debug("Chat %s answering slot %s", chat.id, normalised_slot_id)
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
         await message.reply_text("Нет активного кроссворда. Используйте /new.")
+        log_abort("missing_game_state")
         return
     puzzle = _load_puzzle_for_state(game_state)
     if puzzle is None:
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать заново.")
+        log_abort("missing_puzzle")
         return
 
     with logging_context(puzzle_id=puzzle.id):
@@ -1413,11 +1431,13 @@ async def _handle_answer_submission(
         if ambiguity:
             await message.reply_text(ambiguity)
             await refresh_clues_if_needed()
+            log_abort("slot_reference_ambiguous", detail=ambiguity)
             return
         if slot_ref is None:
             logger.warning("Answer received for missing slot %s", normalised_slot_id)
             await message.reply_text(f"Слот {normalised_slot_id} не найден.")
             await refresh_clues_if_needed()
+            log_abort("slot_not_found")
             return
 
         slot = slot_ref.slot
@@ -1426,10 +1446,12 @@ async def _handle_answer_submission(
         if public_id in solved_ids:
             await message.reply_text("Этот слот уже решён.")
             await refresh_clues_if_needed()
+            log_abort("slot_already_solved", slot_identifier=public_id)
             return
         if not slot.answer:
             await message.reply_text("Для этого слота не задан ответ.")
             await refresh_clues_if_needed()
+            log_abort("slot_has_no_answer", slot_identifier=public_id)
             return
 
         try:
@@ -1446,17 +1468,28 @@ async def _handle_answer_submission(
             )
             await message.reply_text(f"Слово не прошло проверку: {exc}")
             await refresh_clues_if_needed()
+            log_abort(
+                "answer_validation_failed",
+                slot_identifier=public_id,
+                detail=str(exc),
+            )
             return
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error validating answer for slot %s", slot.slot_id)
             await message.reply_text("Не удалось проверить слово. Попробуйте позже.")
             await refresh_clues_if_needed()
+            log_abort(
+                "answer_validation_error",
+                slot_identifier=public_id,
+                detail=str(exc),
+            )
             return
 
         if not validated:
             logger.info("Answer for slot %s failed language rules", slot.slot_id)
             await message.reply_text("Слово не соответствует правилам языка.")
             await refresh_clues_if_needed()
+            log_abort("answer_not_validated", slot_identifier=public_id)
             return
 
         candidate = validated[0].word
@@ -1467,6 +1500,7 @@ async def _handle_answer_submission(
             logger.info("Incorrect answer for slot %s", slot_ref.public_id)
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
             await refresh_clues_if_needed()
+            log_abort("answer_incorrect", slot_identifier=public_id)
             return
 
         game_state.score += slot.length
