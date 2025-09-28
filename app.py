@@ -299,6 +299,8 @@ BUTTON_LANGUAGE_KEY = "language"
 BUTTON_STEP_LANGUAGE = "language"
 BUTTON_STEP_THEME = "theme"
 
+GENERATION_NOTICE_KEY = "puzzle_generation_notice"
+
 ADMIN_COMMAND_PATTERN = re.compile(r"(?i)^\s*adm key")
 ADMIN_KEYS_ONLY_PATTERN = re.compile(r"(?i)^\s*adm keys\s*$")
 ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
@@ -508,6 +510,43 @@ def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboa
             ],
         ]
     )
+
+
+async def _send_generation_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    message: Message | None = None,
+) -> None:
+    """Send a single informational message about puzzle generation per chat."""
+
+    notice = context.chat_data.get(GENERATION_NOTICE_KEY)
+    if notice and notice.get("active") and notice.get("text") == text:
+        logger.debug(
+            "Skipping duplicate generation notice for chat %s", chat_id
+        )
+        return
+
+    context.chat_data[GENERATION_NOTICE_KEY] = {
+        "active": True,
+        "text": text,
+        "started_at": time.monotonic(),
+    }
+
+    if message is not None:
+        await message.reply_text(text)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+def _clear_generation_notice(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+) -> None:
+    """Clear generation notice tracking for the chat."""
+
+    if context.chat_data.pop(GENERATION_NOTICE_KEY, None) is not None and chat_id is not None:
+        logger.debug("Cleared generation notice flag for chat %s", chat_id)
 
 
 async def _send_completion_options(
@@ -1110,7 +1149,12 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     logger.info("Chat %s requested theme '%s'", chat.id, theme)
-    await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
+    await _send_generation_notice(
+        context,
+        chat.id,
+        "Готовлю кроссворд, это может занять немного времени...",
+        message=message,
+    )
     loop = asyncio.get_running_loop()
     puzzle: Puzzle | CompositePuzzle | None = None
     game_state: GameState | None = None
@@ -1122,6 +1166,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except Exception:  # noqa: BLE001
         logger.exception("Failed to generate puzzle for chat %s", chat.id)
         _cleanup_chat_resources(chat.id)
+        _clear_generation_notice(context, chat.id)
         await message.reply_text(
             "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
         )
@@ -1164,6 +1209,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await message.reply_text(
             "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
         )
+        _clear_generation_notice(context, chat.id)
         return ConversationHandler.END
 
     if context.job_queue:
@@ -1175,6 +1221,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         context.chat_data["reminder_job"] = job
 
+    _clear_generation_notice(context, chat.id)
     return ConversationHandler.END
 
 
@@ -1206,7 +1253,12 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     logger.info("Chat %s requested theme '%s' via button flow", chat.id, theme)
     _cancel_reminder(context)
-    await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
+    await _send_generation_notice(
+        context,
+        chat.id,
+        "Готовлю кроссворд, это может занять немного времени...",
+        message=message,
+    )
     loop = asyncio.get_running_loop()
     puzzle: Puzzle | CompositePuzzle | None = None
     game_state: GameState | None = None
@@ -1219,6 +1271,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("Failed to generate puzzle for chat %s via button flow", chat.id)
         _cleanup_chat_resources(chat.id)
         context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+        _clear_generation_notice(context, chat.id)
         await message.reply_text(
             "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
         )
@@ -1229,6 +1282,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
     if not delivered:
         _cleanup_game_state(game_state)
+        _clear_generation_notice(context, chat.id)
         await message.reply_text(
             "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
         )
@@ -1242,11 +1296,16 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         context.chat_data["reminder_job"] = job
 
+    _clear_generation_notice(context, chat.id)
+
 
 @command_entrypoint(fallback=ConversationHandler.END)
 async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     context.user_data.pop("new_game_language", None)
+    chat = update.effective_chat
+    if chat is not None:
+        _clear_generation_notice(context, chat.id)
     if update.effective_message:
         await update.effective_message.reply_text("Создание кроссворда отменено.")
     return ConversationHandler.END
@@ -1757,9 +1816,10 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             return
         _cancel_reminder(context)
         _cleanup_game_state(game_state)
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"Готовлю новый кроссворд на тему «{theme}» на языке {language.upper()}...",
+        await _send_generation_notice(
+            context,
+            chat.id,
+            f"Готовлю новый кроссворд на тему «{theme}» на языке {language.upper()}...",
         )
         loop = asyncio.get_running_loop()
         new_puzzle: Puzzle | CompositePuzzle | None = None
@@ -1774,6 +1834,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
                 "Failed to regenerate puzzle for chat %s on same theme", chat.id
             )
             _cleanup_chat_resources(chat.id)
+            _clear_generation_notice(context, chat.id)
             await context.bot.send_message(
                 chat_id=chat.id,
                 text="Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже.",
@@ -1784,6 +1845,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
         if not delivered:
             _cleanup_game_state(new_state)
+            _clear_generation_notice(context, chat.id)
             await context.bot.send_message(
                 chat_id=chat.id,
                 text="Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new.",
@@ -1797,6 +1859,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
                 name=f"hint-reminder-{chat.id}",
             )
             context.chat_data["reminder_job"] = job
+        _clear_generation_notice(context, chat.id)
         return
 
     if data.startswith(NEW_PUZZLE_CALLBACK_PREFIX):
