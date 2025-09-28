@@ -1123,106 +1123,119 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
 
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        return ConversationHandler.END
-    message = update.effective_message
-    if message is None or not message.text:
-        return THEME_STATE
-    language = context.user_data.get("new_game_language")
-    if not language:
-        await message.reply_text("Сначала выберите язык через команду /new.")
-        return ConversationHandler.END
-    theme = message.text.strip()
-    if not theme:
-        await message.reply_text("Введите тему, например: Древний Рим.")
-        return THEME_STATE
-
-    chat = update.effective_chat
-    if chat is None:
-        return ConversationHandler.END
-
-    if chat.id in state.generating_chats:
-        await message.reply_text(
-            "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
-        )
-        return ConversationHandler.END
-
-    logger.info("Chat %s requested theme '%s'", chat.id, theme)
-    await _send_generation_notice(
-        context,
-        chat.id,
-        "Готовлю кроссворд, это может занять немного времени...",
-        message=message,
-    )
-    loop = asyncio.get_running_loop()
-    puzzle: Puzzle | CompositePuzzle | None = None
-    game_state: GameState | None = None
-    state.generating_chats.add(chat.id)
+    should_clear_language = False
     try:
-        puzzle, game_state = await loop.run_in_executor(
-            None, _generate_puzzle, chat.id, language, theme
+        _normalise_thread_id(update)
+        if not await _reject_group_chat(update):
+            should_clear_language = True
+            return ConversationHandler.END
+
+        message = update.effective_message
+        if message is None or not message.text:
+            return THEME_STATE
+
+        language = context.user_data.get("new_game_language")
+        if not language:
+            await message.reply_text("Сначала выберите язык через команду /new.")
+            should_clear_language = True
+            return ConversationHandler.END
+
+        theme = message.text.strip()
+        if not theme:
+            await message.reply_text("Введите тему, например: Древний Рим.")
+            return THEME_STATE
+
+        chat = update.effective_chat
+        if chat is None:
+            should_clear_language = True
+            return ConversationHandler.END
+
+        if chat.id in state.generating_chats:
+            await message.reply_text(
+                "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
+            )
+            should_clear_language = True
+            return ConversationHandler.END
+
+        logger.info("Chat %s requested theme '%s'", chat.id, theme)
+        await _send_generation_notice(
+            context,
+            chat.id,
+            "Готовлю кроссворд, это может занять немного времени...",
+            message=message,
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to generate puzzle for chat %s", chat.id)
-        _cleanup_chat_resources(chat.id)
+
+        loop = asyncio.get_running_loop()
+        puzzle: Puzzle | CompositePuzzle | None = None
+        game_state: GameState | None = None
+        state.generating_chats.add(chat.id)
+        try:
+            puzzle, game_state = await loop.run_in_executor(
+                None, _generate_puzzle, chat.id, language, theme
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to generate puzzle for chat %s", chat.id)
+            _cleanup_chat_resources(chat.id)
+            _clear_generation_notice(context, chat.id)
+            await message.reply_text(
+                "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
+            )
+            should_clear_language = True
+            return ConversationHandler.END
+        finally:
+            state.generating_chats.discard(chat.id)
+
+        should_clear_language = True
+        _cancel_reminder(context)
+
+        image_path = None
+        try:
+            with logging_context(puzzle_id=puzzle.id):
+                image_path = render_puzzle(puzzle, game_state)
+                await context.bot.send_chat_action(
+                    chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+                )
+                with open(image_path, "rb") as photo:
+                    await message.reply_photo(
+                        photo=photo,
+                        caption=(
+                            f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
+                        ),
+                    )
+                await message.reply_text(
+                    _format_clues_message(puzzle, game_state),
+                    parse_mode=constants.ParseMode.HTML,
+                )
+                await message.reply_text(
+                    "Отправляйте ответы прямо в чат в формате «A1 - ответ». Если удобнее, можно пользоваться и командой /answer."
+                )
+                logger.info("Delivered freshly generated puzzle to chat")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to deliver puzzle to chat %s", chat.id)
+            _cleanup_game_state(game_state)
+            if image_path is not None:
+                with suppress(OSError):
+                    image_path.unlink(missing_ok=True)
+            await message.reply_text(
+                "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
+            )
+            _clear_generation_notice(context, chat.id)
+            return ConversationHandler.END
+
+        if context.job_queue:
+            job = context.job_queue.run_once(
+                _reminder_job,
+                REMINDER_DELAY_SECONDS,
+                chat_id=chat.id,
+                name=f"hint-reminder-{chat.id}",
+            )
+            context.chat_data["reminder_job"] = job
+
         _clear_generation_notice(context, chat.id)
-        await message.reply_text(
-            "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
-        )
-        context.user_data.pop("new_game_language", None)
         return ConversationHandler.END
     finally:
-        state.generating_chats.discard(chat.id)
-
-    context.user_data.pop("new_game_language", None)
-    _cancel_reminder(context)
-
-    image_path = None
-    try:
-        with logging_context(puzzle_id=puzzle.id):
-            image_path = render_puzzle(puzzle, game_state)
-            await context.bot.send_chat_action(
-                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
-            )
-            with open(image_path, "rb") as photo:
-                await message.reply_photo(
-                    photo=photo,
-                    caption=(
-                        f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
-                    ),
-                )
-            await message.reply_text(
-                _format_clues_message(puzzle, game_state),
-                parse_mode=constants.ParseMode.HTML,
-            )
-            await message.reply_text(
-                "Отправляйте ответы прямо в чат в формате «A1 - ответ». Если удобнее, можно пользоваться и командой /answer."
-            )
-            logger.info("Delivered freshly generated puzzle to chat")
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to deliver puzzle to chat %s", chat.id)
-        _cleanup_game_state(game_state)
-        if image_path is not None:
-            with suppress(OSError):
-                image_path.unlink(missing_ok=True)
-        await message.reply_text(
-            "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
-        )
-        _clear_generation_notice(context, chat.id)
-        return ConversationHandler.END
-
-    if context.job_queue:
-        job = context.job_queue.run_once(
-            _reminder_job,
-            REMINDER_DELAY_SECONDS,
-            chat_id=chat.id,
-            name=f"hint-reminder-{chat.id}",
-        )
-        context.chat_data["reminder_job"] = job
-
-    _clear_generation_notice(context, chat.id)
-    return ConversationHandler.END
+        if should_clear_language:
+            context.user_data.pop("new_game_language", None)
 
 
 @command_entrypoint()
