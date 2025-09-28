@@ -57,7 +57,12 @@ def anyio_backend():
 @pytest.mark.anyio
 async def test_inline_handler_passes_parsed_values_to_submission_handler():
     chat = SimpleNamespace(id=123, type=ChatType.PRIVATE)
-    message = SimpleNamespace(text="β12-3:Αθήνα", message_thread_id=None, reply_text=AsyncMock())
+    message = SimpleNamespace(
+        text="β12-3:Αθήνα",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=1,
+    )
     update = SimpleNamespace(effective_chat=chat, effective_message=message)
     context = SimpleNamespace(user_data={})
 
@@ -65,6 +70,28 @@ async def test_inline_handler_passes_parsed_values_to_submission_handler():
         await inline_answer_handler(update, context)
 
     handler_mock.assert_awaited_once_with(context, chat, message, "Β12-3", "Αθήνα")
+
+
+@pytest.mark.anyio
+async def test_inline_handler_replies_when_parse_fails():
+    chat = SimpleNamespace(id=124, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text="неверный формат",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=2,
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+    context = SimpleNamespace(user_data={})
+
+    with patch("app._handle_answer_submission", new_callable=AsyncMock) as handler_mock:
+        await inline_answer_handler(update, context)
+
+    handler_mock.assert_not_awaited()
+    message.reply_text.assert_awaited_once()
+    reply_call = message.reply_text.await_args
+    assert reply_call.args
+    assert "A1 - слово" in reply_call.args[0]
 
 
 @pytest.mark.anyio
