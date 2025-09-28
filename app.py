@@ -1644,12 +1644,43 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
             },
         )
         return
-    if "new_game_language" in context.user_data:
-        logger.debug("Skipping inline answer while /new conversation is active")
-        return
-
     chat = update.effective_chat
     message = update.effective_message
+
+    if "new_game_language" in context.user_data:
+        chat_id = chat.id if chat else None
+        if chat is None or message is None:
+            logger.info(
+                "Skipping inline answer: /new conversation active but no message available",
+                extra={"chat_id": chat_id, "has_message": message is not None},
+            )
+            return
+
+        if chat_id in state.generating_chats:
+            logger.info(
+                "Skipping inline answer: setup or generation is in progress",
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": message.message_id,
+                    "generating": True,
+                },
+            )
+        else:
+            logger.info(
+                "Skipping inline answer: language/theme selection is in progress",
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": message.message_id,
+                    "generating": False,
+                },
+            )
+
+        await message.reply_text(
+            "Сначала завершите выбор языка/темы или дождитесь подготовки кроссворда."
+            " Если хотите прервать, отправьте /cancel."
+        )
+        return
+
     if chat is None or message is None:
         logger.debug(
             "Inline answer handler aborted: missing chat or message",
