@@ -308,18 +308,19 @@ ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
 
 def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
     if not text:
-        logger.debug("Inline answer parsing skipped: no text provided")
+        logger.info("Inline answer parsing skipped: no text provided")
         return None
     match = INLINE_ANSWER_PATTERN.match(text)
     if not match:
-        logger.debug(
-            "Inline answer parsing skipped: pattern did not match", extra={"text": text}
+        logger.info(
+            "Inline answer parsing skipped: pattern did not match",
+            extra={"text": text},
         )
         return None
     slot_id, answer = match.groups()
     cleaned_answer = answer.strip()
     if not cleaned_answer:
-        logger.debug(
+        logger.warning(
             "Inline answer parsing skipped: answer part empty after stripping",
             extra={"text": text},
         )
@@ -1702,13 +1703,16 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     parsed = _parse_inline_answer(message.text)
     if not parsed:
-        logger.debug(
+        logger.info(
             "Inline answer handler aborted: failed to parse inline answer",
             extra={
                 "chat_id": chat.id,
                 "message_id": message.message_id,
                 "text": message.text,
             },
+        )
+        await message.reply_text(
+            "Не удалось распознать ответ. Используйте формат «A1 - слово»."
         )
         return
 
