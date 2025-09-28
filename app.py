@@ -308,13 +308,21 @@ ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
 
 def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
     if not text:
+        logger.debug("Inline answer parsing skipped: no text provided")
         return None
     match = INLINE_ANSWER_PATTERN.match(text)
     if not match:
+        logger.debug(
+            "Inline answer parsing skipped: pattern did not match", extra={"text": text}
+        )
         return None
     slot_id, answer = match.groups()
     cleaned_answer = answer.strip()
     if not cleaned_answer:
+        logger.debug(
+            "Inline answer parsing skipped: answer part empty after stripping",
+            extra={"text": text},
+        )
         return None
     return _normalise_slot_id(slot_id), cleaned_answer
 
@@ -1593,6 +1601,14 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
+        chat = update.effective_chat
+        logger.debug(
+            "Inline answer handler rejected non-private chat",
+            extra={
+                "chat_id": chat.id if chat else None,
+                "chat_type": chat.type if chat else None,
+            },
+        )
         return
     if "new_game_language" in context.user_data:
         logger.debug("Skipping inline answer while /new conversation is active")
@@ -1600,11 +1616,35 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat = update.effective_chat
     message = update.effective_message
-    if chat is None or message is None or not message.text:
+    if chat is None or message is None:
+        logger.debug(
+            "Inline answer handler aborted: missing chat or message",
+            extra={
+                "chat_id": chat.id if chat else None,
+                "has_message": message is not None,
+            },
+        )
+        return
+    if not message.text:
+        logger.debug(
+            "Inline answer handler aborted: message text missing",
+            extra={
+                "chat_id": chat.id,
+                "message_id": message.message_id,
+            },
+        )
         return
 
     parsed = _parse_inline_answer(message.text)
     if not parsed:
+        logger.debug(
+            "Inline answer handler aborted: failed to parse inline answer",
+            extra={
+                "chat_id": chat.id,
+                "message_id": message.message_id,
+                "text": message.text,
+            },
+        )
         return
 
     slot_id, answer_text = parsed
