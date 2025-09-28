@@ -1230,8 +1230,8 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
         return
-    state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
-    if not state or state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
+    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
         return
     message = update.effective_message
     chat = update.effective_chat
@@ -1242,10 +1242,10 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
         )
         return
-    language = state.get(BUTTON_LANGUAGE_KEY)
+    language = flow_state.get(BUTTON_LANGUAGE_KEY)
     if not language:
         await message.reply_text("Сначала выберите язык через команду /new.")
-        state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
+        flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
         return
     theme = message.text.strip()
     if not theme:
