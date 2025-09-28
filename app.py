@@ -1806,6 +1806,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("answer", answer_command))
     telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
+    telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(
         MessageHandler(filters.Regex(INLINE_ANSWER_PATTERN), inline_answer_handler)
