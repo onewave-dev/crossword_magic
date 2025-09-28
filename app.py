@@ -1887,6 +1887,9 @@ async def on_startup() -> None:
     await telegram_application.initialize()
     logger.info("Telegram application initialized")
 
+    await telegram_application.start()
+    logger.info("Telegram application started")
+
     state.telegram_app = telegram_application
 
     register_webhook_route(settings.webhook_path)
