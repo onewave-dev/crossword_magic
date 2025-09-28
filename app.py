@@ -171,6 +171,7 @@ class AppState:
         self.webhook_task: Optional[asyncio.Task[None]] = None
         self.cleanup_task: Optional[asyncio.Task[None]] = None
         self.active_states: dict[int, GameState] = {}
+        self.generating_chats: set[int] = set()
 
 
 state = AppState()
@@ -187,6 +188,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
     """Remove in-memory and persisted resources for the provided chat."""
 
     with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
+        state.generating_chats.discard(chat_id)
         if chat_id in state.active_states:
             del state.active_states[chat_id]
         delete_state(chat_id)
@@ -983,6 +985,13 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = chat.id if chat else None
     logger.debug("Chat %s initiated /new", chat_id if chat_id is not None else "<unknown>")
 
+    if chat_id is not None and chat_id in state.generating_chats:
+        if message:
+            await message.reply_text(
+                "Мы всё ещё готовим ваш кроссворд. Пожалуйста, подождите."
+            )
+        return ConversationHandler.END
+
     if chat_id is not None:
         game_state = _load_state_for_chat(chat_id)
     else:
@@ -1094,9 +1103,18 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if chat is None:
         return ConversationHandler.END
 
+    if chat.id in state.generating_chats:
+        await message.reply_text(
+            "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
+        )
+        return ConversationHandler.END
+
     logger.info("Chat %s requested theme '%s'", chat.id, theme)
     await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
     loop = asyncio.get_running_loop()
+    puzzle: Puzzle | CompositePuzzle | None = None
+    game_state: GameState | None = None
+    state.generating_chats.add(chat.id)
     try:
         puzzle, game_state = await loop.run_in_executor(
             None, _generate_puzzle, chat.id, language, theme
@@ -1109,6 +1127,8 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         context.user_data.pop("new_game_language", None)
         return ConversationHandler.END
+    finally:
+        state.generating_chats.discard(chat.id)
 
     context.user_data.pop("new_game_language", None)
     _cancel_reminder(context)
@@ -1170,6 +1190,11 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     chat = update.effective_chat
     if message is None or not message.text or chat is None:
         return
+    if chat.id in state.generating_chats:
+        await message.reply_text(
+            "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
+        )
+        return
     language = state.get(BUTTON_LANGUAGE_KEY)
     if not language:
         await message.reply_text("Сначала выберите язык через команду /new.")
@@ -1183,6 +1208,9 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     _cancel_reminder(context)
     await message.reply_text("Готовлю кроссворд, это может занять немного времени...")
     loop = asyncio.get_running_loop()
+    puzzle: Puzzle | CompositePuzzle | None = None
+    game_state: GameState | None = None
+    state.generating_chats.add(chat.id)
     try:
         puzzle, game_state = await loop.run_in_executor(
             None, _generate_puzzle, chat.id, language, theme
@@ -1195,6 +1223,8 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
         )
         return
+    finally:
+        state.generating_chats.discard(chat.id)
     context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
     delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
     if not delivered:
@@ -1719,6 +1749,12 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             language,
             theme,
         )
+        if chat.id in state.generating_chats:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите.",
+            )
+            return
         _cancel_reminder(context)
         _cleanup_game_state(game_state)
         await context.bot.send_message(
@@ -1726,6 +1762,9 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             text=f"Готовлю новый кроссворд на тему «{theme}» на языке {language.upper()}...",
         )
         loop = asyncio.get_running_loop()
+        new_puzzle: Puzzle | CompositePuzzle | None = None
+        new_state: GameState | None = None
+        state.generating_chats.add(chat.id)
         try:
             new_puzzle, new_state = await loop.run_in_executor(
                 None, _generate_puzzle, chat.id, language, theme
@@ -1740,6 +1779,8 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
                 text="Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже.",
             )
             return
+        finally:
+            state.generating_chats.discard(chat.id)
         delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
         if not delivered:
             _cleanup_game_state(new_state)
