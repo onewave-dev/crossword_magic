@@ -104,6 +104,10 @@ class GameState:
     hints_used: dict[str, dict[int, int]] = field(default_factory=dict)
     timer_job_id: str | None = None
     warn_job_id: str | None = None
+    turn_job_id: str | None = None
+    turn_warn_job_id: str | None = None
+    active_slot_id: str | None = None
+    turn_started_at: float | None = None
     join_codes: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     test_mode: bool = False
@@ -179,6 +183,12 @@ class GameState:
         self.hints_used = hints_normalised
         self.timer_job_id = str(self.timer_job_id) if self.timer_job_id else None
         self.warn_job_id = str(self.warn_job_id) if self.warn_job_id else None
+        self.turn_job_id = str(self.turn_job_id) if self.turn_job_id else None
+        self.turn_warn_job_id = str(self.turn_warn_job_id) if self.turn_warn_job_id else None
+        self.active_slot_id = str(self.active_slot_id) if self.active_slot_id else None
+        if self.turn_started_at is not None:
+            with suppress(TypeError, ValueError):
+                self.turn_started_at = float(self.turn_started_at)
         self.join_codes = {
             str(code): str(target)
             for code, target in dict(self.join_codes).items()
@@ -223,6 +233,10 @@ class GameState:
             "turn_index": self.turn_index,
             "timer_job_id": self.timer_job_id,
             "warn_job_id": self.warn_job_id,
+            "turn_job_id": self.turn_job_id,
+            "turn_warn_job_id": self.turn_warn_job_id,
+            "active_slot_id": self.active_slot_id,
+            "turn_started_at": self.turn_started_at,
             "join_codes": self.join_codes,
             "test_mode": self.test_mode,
             "dummy_user_id": self.dummy_user_id,
@@ -327,6 +341,15 @@ class GameState:
         warn_job_raw = payload.get("warn_job_id")
         warn_job_id = str(warn_job_raw) if warn_job_raw else None
 
+        turn_job_raw = payload.get("turn_job_id")
+        turn_job_id = str(turn_job_raw) if turn_job_raw else None
+
+        turn_warn_raw = payload.get("turn_warn_job_id")
+        turn_warn_job_id = str(turn_warn_raw) if turn_warn_raw else None
+
+        active_slot_raw = payload.get("active_slot_id")
+        active_slot_id = str(active_slot_raw) if active_slot_raw else None
+
         created_at_raw = payload.get("created_at")
         created_at = (
             float(created_at_raw)
@@ -351,6 +374,14 @@ class GameState:
             if not isinstance(item, Mapping)
         }
 
+        turn_started_raw = payload.get("turn_started_at")
+        turn_started_at = None
+        if isinstance(turn_started_raw, (int, float)):
+            turn_started_at = float(turn_started_raw)
+        else:
+            with suppress(TypeError, ValueError):
+                turn_started_at = float(turn_started_raw)
+
         return cls(
             game_id=game_id,
             chat_id=chat_id,
@@ -373,6 +404,10 @@ class GameState:
             turn_index=int(payload.get("turn_index", 0)),
             timer_job_id=timer_job_id,
             warn_job_id=warn_job_id,
+            turn_job_id=turn_job_id,
+            turn_warn_job_id=turn_warn_job_id,
+            active_slot_id=active_slot_id,
+            turn_started_at=turn_started_at,
             join_codes=join_codes,
             test_mode=bool(payload.get("test_mode", False)),
             dummy_user_id=dummy_user_id,

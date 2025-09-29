@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import random
 import re
 import os
 import time
@@ -39,6 +40,7 @@ from telegram.request import HTTPXRequest
 from utils.storage import (
     STATE_CLEANUP_INTERVAL,
     GameState,
+    Player,
     delete_puzzle,
     delete_state,
     load_puzzle,
@@ -294,6 +296,20 @@ REMINDER_DELAY_SECONDS = 10 * 60
 MAX_PUZZLE_SIZE = 15
 MAX_REPLACEMENT_REQUESTS = 30
 
+TURN_DURATION_SECONDS = 45
+TURN_WARNING_SECONDS = 15
+TOTAL_GAME_DURATION_SECONDS = 10 * 60
+GAME_WARNING_SECONDS = 60
+TURN_HINT_PENALTY = 1
+
+TURN_TIMEOUT_JOB_PREFIX = "turn-timeout"
+TURN_WARN_JOB_PREFIX = "turn-warn"
+GAME_TIMEOUT_JOB_PREFIX = "game-timeout"
+
+TURN_SELECT_CALLBACK = "turn:select"
+TURN_SLOT_CALLBACK_PREFIX = "turn:slot:"
+LOBBY_START_CALLBACK = "lobby:start"
+
 
 def get_chat_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Return the current chat mode stored in chat_data."""
@@ -455,6 +471,8 @@ def _record_score(game_state: GameState, delta: int, user_id: int | None = None)
     player_id = _resolve_player_id(game_state, user_id)
     if player_id is None:
         return
+    if player_id not in game_state.scoreboard:
+        game_state.scoreboard[player_id] = 0
     game_state.scoreboard[player_id] = game_state.scoreboard.get(player_id, 0) + delta
 
 
@@ -467,6 +485,330 @@ def _record_hint_usage(
     if player_id is None:
         player_id = 0
     usage[player_id] = usage.get(player_id, 0) + 1
+
+
+def _ensure_player_profile(
+    game_state: GameState,
+    user_id: int,
+    *,
+    name: str | None = None,
+    dm_chat_id: int | None = None,
+) -> Player:
+    player = game_state.players.get(user_id)
+    if player is None:
+        player = Player(user_id=user_id, name=name or f"Игрок {user_id}")
+        game_state.players[user_id] = player
+    if name and player.name != name:
+        player.name = name
+    if dm_chat_id and player.dm_chat_id != dm_chat_id:
+        player.dm_chat_id = dm_chat_id
+    if player.dm_chat_id:
+        state.player_chats[player.user_id] = player.dm_chat_id
+    if user_id not in game_state.scoreboard:
+        game_state.scoreboard[user_id] = 0
+    return player
+
+
+def _resolve_game_state_for_message(
+    chat: Chat | None, user_id: int | None
+) -> GameState | None:
+    if chat is None:
+        return None
+    primary = _load_state_for_chat(chat.id)
+    if primary is not None:
+        return primary
+    if chat.type == ChatType.PRIVATE and user_id is not None:
+        dm_chat_id = state.player_chats.get(user_id)
+        if dm_chat_id and dm_chat_id != chat.id:
+            mapped = _load_state_for_chat(dm_chat_id)
+            if mapped is not None:
+                return mapped
+        for game in state.active_games.values():
+            player = game.players.get(user_id)
+            if player and player.dm_chat_id == chat.id:
+                return game
+    return None
+
+
+def _cancel_jobs_by_name(job_queue, name: str | None) -> None:
+    if not name or job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+
+def _cancel_turn_jobs(context: ContextTypes.DEFAULT_TYPE, game_state: GameState) -> None:
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None:
+        return
+    _cancel_jobs_by_name(job_queue, game_state.turn_job_id)
+    _cancel_jobs_by_name(job_queue, game_state.turn_warn_job_id)
+    game_state.turn_job_id = None
+    game_state.turn_warn_job_id = None
+
+
+def _cancel_game_jobs(context: ContextTypes.DEFAULT_TYPE, game_state: GameState) -> None:
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None:
+        return
+    _cancel_jobs_by_name(job_queue, game_state.timer_job_id)
+    _cancel_jobs_by_name(job_queue, game_state.warn_job_id)
+    game_state.timer_job_id = None
+    game_state.warn_job_id = None
+
+
+def _schedule_turn_jobs(context: ContextTypes.DEFAULT_TYPE, game_state: GameState) -> None:
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None:
+        return
+    _cancel_turn_jobs(context, game_state)
+    if TURN_DURATION_SECONDS <= 0:
+        return
+    timeout_name = f"{TURN_TIMEOUT_JOB_PREFIX}-{game_state.game_id}"
+    job_queue.run_once(
+        _turn_timeout_job,
+        when=TURN_DURATION_SECONDS,
+        chat_id=game_state.chat_id,
+        name=timeout_name,
+    )
+    game_state.turn_job_id = timeout_name
+    if TURN_WARNING_SECONDS and TURN_WARNING_SECONDS < TURN_DURATION_SECONDS:
+        warn_name = f"{TURN_WARN_JOB_PREFIX}-{game_state.game_id}"
+        job_queue.run_once(
+            _turn_warning_job,
+            when=max(TURN_DURATION_SECONDS - TURN_WARNING_SECONDS, 1),
+            chat_id=game_state.chat_id,
+            name=warn_name,
+        )
+        game_state.turn_warn_job_id = warn_name
+
+
+def _schedule_game_jobs(context: ContextTypes.DEFAULT_TYPE, game_state: GameState) -> None:
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None:
+        return
+    _cancel_game_jobs(context, game_state)
+    if TOTAL_GAME_DURATION_SECONDS <= 0:
+        return
+    timeout_name = f"{GAME_TIMEOUT_JOB_PREFIX}-{game_state.game_id}"
+    job_queue.run_once(
+        _game_timeout_job,
+        when=TOTAL_GAME_DURATION_SECONDS,
+        chat_id=game_state.chat_id,
+        name=timeout_name,
+    )
+    game_state.timer_job_id = timeout_name
+    if GAME_WARNING_SECONDS and GAME_WARNING_SECONDS < TOTAL_GAME_DURATION_SECONDS:
+        warn_name = f"{GAME_TIMEOUT_JOB_PREFIX}-warn-{game_state.game_id}"
+        job_queue.run_once(
+            _game_warning_job,
+            when=max(TOTAL_GAME_DURATION_SECONDS - GAME_WARNING_SECONDS, 1),
+            chat_id=game_state.chat_id,
+            name=warn_name,
+        )
+        game_state.warn_job_id = warn_name
+
+
+async def _announce_current_turn(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    prefix: str | None = None,
+) -> None:
+    player = _current_player(game_state)
+    if player is None:
+        return
+    turn_text = prefix or f"Ход игрока {player.name}."
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Выбрать подсказку", callback_data=TURN_SELECT_CALLBACK)]]
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=turn_text,
+            reply_markup=keyboard,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to announce current turn in chat %s", game_state.chat_id)
+    if player.dm_chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=player.dm_chat_id,
+                text="Ваш ход! Выберите подсказку, чтобы ответить на вопрос.",
+                reply_markup=keyboard,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify player %s in DM about their turn", player.user_id)
+
+
+async def _complete_turn(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    reason: str,
+    advance: bool = True,
+    announce_next: bool = True,
+) -> None:
+    if game_state.mode != "turn_based":
+        return
+    _cancel_turn_jobs(context, game_state)
+    if advance and game_state.turn_order:
+        game_state.turn_index = (game_state.turn_index + 1) % len(game_state.turn_order)
+    game_state.active_slot_id = None
+    game_state.turn_started_at = time.time()
+    _store_state(game_state)
+    if announce_next and game_state.turn_order:
+        await _announce_current_turn(context, game_state)
+        _schedule_turn_jobs(context, game_state)
+
+
+def _initialise_turn_based_mode(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    randomise_order: bool = True,
+) -> None:
+    players = list(game_state.players.values())
+    if not players and game_state.host_id is not None:
+        player = Player(user_id=game_state.host_id, name=f"Игрок {game_state.host_id}")
+        players.append(player)
+        game_state.players[player.user_id] = player
+    if not players:
+        host_player = Player(user_id=game_state.chat_id, name=f"Игрок {game_state.chat_id}")
+        game_state.players[host_player.user_id] = host_player
+        players.append(host_player)
+    players.sort(key=lambda entry: entry.joined_at)
+    order = [player.user_id for player in players]
+    if randomise_order and len(order) > 1:
+        random.shuffle(order)
+    game_state.turn_order = order
+    game_state.turn_index = 0
+    game_state.status = "running"
+    game_state.active_slot_id = None
+    game_state.turn_started_at = time.time()
+    game_state.score = 0
+    for player in players:
+        game_state.scoreboard[player.user_id] = 0
+        player.answers_ok = 0
+        player.answers_fail = 0
+    _schedule_game_jobs(context, game_state)
+    _schedule_turn_jobs(context, game_state)
+    _store_state(game_state)
+
+
+def _collect_hint_usage_summary(game_state: GameState) -> dict[int, int]:
+    summary: dict[int, int] = {}
+    for usage in game_state.hints_used.values():
+        for user_id, count in usage.items():
+            summary[user_id] = summary.get(user_id, 0) + count
+    return summary
+
+
+def _build_turn_based_completion_keyboard(
+    puzzle: Puzzle | CompositePuzzle | None, fallback_id: str
+) -> InlineKeyboardMarkup:
+    puzzle_id = puzzle.id if puzzle else fallback_id
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Реванш",
+                    callback_data=f"{SAME_TOPIC_CALLBACK_PREFIX}{puzzle_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Новая игра",
+                    callback_data=f"{NEW_PUZZLE_CALLBACK_PREFIX}{puzzle_id}",
+                )
+            ],
+        ]
+    )
+
+
+async def _finish_game(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    reason: str,
+    puzzle: Puzzle | CompositePuzzle | None = None,
+) -> None:
+    _cancel_turn_jobs(context, game_state)
+    _cancel_game_jobs(context, game_state)
+    game_state.status = "finished"
+    game_state.active_slot_id = None
+    game_state.turn_job_id = None
+    game_state.turn_warn_job_id = None
+    game_state.timer_job_id = None
+    game_state.warn_job_id = None
+    game_state.turn_started_at = None
+    _store_state(game_state)
+
+    if puzzle is None:
+        puzzle = _load_puzzle_for_state(game_state)
+
+    hint_summary = _collect_hint_usage_summary(game_state)
+    leaderboard_lines: list[str] = []
+    for user_id, score in sorted(
+        game_state.scoreboard.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        player = game_state.players.get(user_id)
+        name = player.name if player else f"Игрок {user_id}"
+        solved = player.answers_ok if player else 0
+        hints_used = hint_summary.get(user_id, 0)
+        leaderboard_lines.append(
+            f"{name}: {score} очков • решено {solved} • подсказок {hints_used}"
+        )
+
+    leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "Нет данных."
+    reason_map = {
+        "completed": "Все слова разгаданы!",
+        "timeout": "Истекло время игры.",
+        "manual": "Игра остановлена хостом.",
+    }
+    reason_text = reason_map.get(reason, "Игра завершена.")
+    message_text = f"🏁 {reason_text}\n\nИтоги:\n{leaderboard_text}"
+    keyboard = _build_turn_based_completion_keyboard(puzzle, game_state.puzzle_id)
+    await context.bot.send_message(
+        chat_id=game_state.chat_id,
+        text=message_text,
+        reply_markup=keyboard,
+    )
+    for player in game_state.players.values():
+        if not player.dm_chat_id:
+            continue
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id=player.dm_chat_id,
+                text=message_text,
+                reply_markup=keyboard,
+            )
+
+
+def _current_player_id(game_state: GameState) -> int | None:
+    if not game_state.turn_order:
+        return None
+    index = game_state.turn_index % len(game_state.turn_order)
+    if index < 0:
+        index = 0
+    if index >= len(game_state.turn_order):
+        return None
+    return game_state.turn_order[index]
+
+
+def _current_player(game_state: GameState) -> Player | None:
+    user_id = _current_player_id(game_state)
+    if user_id is None:
+        return None
+    return game_state.players.get(user_id)
+
+
+def _is_current_player(game_state: GameState, user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    return user_id == _current_player_id(game_state)
 
 
 def _store_state(game_state: GameState) -> None:
@@ -610,8 +952,15 @@ async def _send_clues_update(
 ) -> None:
     if _all_slots_solved(puzzle, game_state):
         return
+    text = _format_clues_message(puzzle, game_state)
+    if game_state.mode == "turn_based" and game_state.status == "running":
+        current = _current_player(game_state)
+        if current:
+            text += f"\n\nХод игрока: {current.name}"
+        if game_state.active_slot_id:
+            text += f"\nВыбран слот: {game_state.active_slot_id}"
     await message.reply_text(
-        _format_clues_message(puzzle, game_state),
+        text,
         parse_mode=constants.ParseMode.HTML,
     )
 
@@ -747,6 +1096,11 @@ def _ensure_private_chat(update: Update) -> bool:
 
 
 async def _reject_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    if chat and chat.type != ChatType.PRIVATE:
+        game_state = _load_state_for_chat(chat.id)
+        if game_state and game_state.mode == "turn_based":
+            return True
     if _ensure_private_chat(update):
         return True
     if update.effective_message:
@@ -776,7 +1130,7 @@ def _apply_answer_to_state(game_state: GameState, slot_ref: SlotRef, answer: str
 
 
 def _reveal_letter(
-    game_state: GameState, slot_ref: SlotRef, answer: str
+    game_state: GameState, slot_ref: SlotRef, answer: str, user_id: int | None = None
 ) -> Optional[tuple[int, str]]:
     hint_set = _ensure_hint_set(game_state)
     slot = slot_ref.slot
@@ -790,7 +1144,7 @@ def _reveal_letter(
         letter = answer[index]
         game_state.filled_cells[key] = letter
         hint_set.add(key)
-        _record_hint_usage(game_state, slot_ref.public_id)
+        _record_hint_usage(game_state, slot_ref.public_id, user_id=user_id)
         game_state.last_update = time.time()
         _store_state(game_state)
         return index, letter
@@ -855,6 +1209,84 @@ async def _reminder_job(context: CallbackContext) -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to deliver reminder message to chat %s", chat_id)
+
+
+async def _turn_warning_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    game_state = _load_state_for_chat(job.chat_id)
+    if not game_state or game_state.mode != "turn_based" or game_state.status != "running":
+        return
+    player = _current_player(game_state)
+    if player is None:
+        return
+    warning_text = f"⏰ {player.name}, осталось {TURN_WARNING_SECONDS} секунд до окончания хода."
+    try:
+        await context.bot.send_message(chat_id=game_state.chat_id, text=warning_text)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send turn warning to chat %s", game_state.chat_id)
+    if player.dm_chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=player.dm_chat_id,
+                text="Осталось немного времени, завершите ход!",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send turn warning DM to %s", player.user_id)
+
+
+async def _turn_timeout_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    game_state = _load_state_for_chat(job.chat_id)
+    if not game_state or game_state.mode != "turn_based" or game_state.status != "running":
+        return
+    player = _current_player(game_state)
+    if player is not None:
+        player.answers_fail += 1
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=f"⏱ Ход игрока {player.name} завершён по таймауту.",
+        )
+        if player.dm_chat_id:
+            with suppress(Exception):
+                await context.bot.send_message(
+                    chat_id=player.dm_chat_id,
+                    text="Время вышло. Ход передан следующему игроку.",
+                )
+    await _complete_turn(context, game_state, reason="timeout")
+
+
+async def _game_warning_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    game_state = _load_state_for_chat(job.chat_id)
+    if not game_state or game_state.mode != "turn_based" or game_state.status != "running":
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text="⚠️ До завершения игры остаётся одна минута!",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send game warning for chat %s", game_state.chat_id)
+
+
+async def _game_timeout_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    game_state = _load_state_for_chat(job.chat_id)
+    if not game_state or game_state.mode != "turn_based" or game_state.status != "running":
+        return
+    await context.bot.send_message(
+        chat_id=game_state.chat_id,
+        text="⏳ Общее время истекло! Игра завершается.",
+    )
+    await _finish_game(context, game_state, reason="timeout")
 
 
 def _assign_clues_to_slots(puzzle: Puzzle | CompositePuzzle, clues: Sequence[WordClue]) -> None:
@@ -1535,6 +1967,7 @@ async def _handle_answer_submission(
 ) -> None:
     normalised_slot_id = _normalise_slot_id(slot_id)
     answer_text = raw_answer.strip()
+    user = getattr(message, "from_user", None)
 
     def log_abort(
         reason: str,
@@ -1562,7 +1995,7 @@ async def _handle_answer_submission(
         return
 
     logger.debug("Chat %s answering slot %s", chat.id, normalised_slot_id)
-    game_state = _load_state_for_chat(chat.id)
+    game_state = _resolve_game_state_for_message(chat, user.id if user else None)
     if not game_state:
         await message.reply_text("Нет активного кроссворда. Используйте /new.")
         log_abort("missing_game_state")
@@ -1572,6 +2005,33 @@ async def _handle_answer_submission(
         await message.reply_text("Не удалось загрузить кроссворд. Попробуйте начать заново.")
         log_abort("missing_puzzle")
         return
+
+    player: Player | None = None
+    if user is not None:
+        player = _ensure_player_profile(
+            game_state,
+            user.id,
+            name=user.full_name or user.username or str(user.id),
+            dm_chat_id=chat.id if chat.type == ChatType.PRIVATE else None,
+        )
+        _store_state(game_state)
+
+    is_turn_based = game_state.mode == "turn_based"
+    if is_turn_based:
+        if game_state.status != "running":
+            await message.reply_text("Игра ещё не запущена. Подождите старта.")
+            log_abort("turn_based_not_running")
+            return
+        if not _is_current_player(game_state, user.id if user else None):
+            current_player = _current_player(game_state)
+            notice = (
+                f"Сейчас ход {current_player.name}."
+                if current_player
+                else "Сейчас ход другого игрока."
+            )
+            await message.reply_text(notice)
+            log_abort("not_current_player")
+            return
 
     with logging_context(puzzle_id=puzzle.id):
         async def refresh_clues_if_needed() -> None:
@@ -1726,6 +2186,13 @@ async def _handle_answer_submission(
         slot = selected_slot_ref.slot
         public_id = _normalise_slot_id(selected_slot_ref.public_id)
 
+        if is_turn_based and game_state.active_slot_id and game_state.active_slot_id != public_id:
+            await message.reply_text(
+                f"Сначала ответьте на выбранный слот {game_state.active_slot_id}.",
+            )
+            log_abort("slot_mismatch", slot_identifier=public_id)
+            return
+
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
             slot.answer,
             puzzle.language,
@@ -1734,10 +2201,28 @@ async def _handle_answer_submission(
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
             await refresh_clues_if_needed()
             log_abort("answer_incorrect", slot_identifier=public_id)
+            if is_turn_based:
+                if player is not None:
+                    player.answers_fail += 1
+                _store_state(game_state)
+                try:
+                    await context.bot.send_message(
+                        chat_id=game_state.chat_id,
+                        text=(
+                            f"Ответ игрока {player.name if player else (user.full_name if user else 'игрок')}"
+                            f" на {public_id} неверный."
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to announce incorrect answer in chat %s", game_state.chat_id)
+                await _complete_turn(context, game_state, reason="incorrect")
             return
 
         game_state.score += slot.length
-        _record_score(game_state, slot.length)
+        _record_score(game_state, slot.length, user_id=user.id if user else None)
+        if player is not None:
+            player.answers_ok += 1
+        game_state.active_slot_id = None
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
         logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
@@ -1757,15 +2242,30 @@ async def _handle_answer_submission(
             )
 
         if _all_slots_solved(puzzle, game_state):
-            _cancel_reminder(context)
-            set_chat_mode(context, MODE_IDLE)
-            await message.reply_text(
-                "🎉 <b>Поздравляем!</b>\nВсе слова разгаданы! ✨",
-                parse_mode=constants.ParseMode.HTML,
-            )
-            await _send_completion_options(context, chat.id, message, puzzle)
+            if is_turn_based:
+                await _finish_game(context, game_state, reason="completed", puzzle=puzzle)
+            else:
+                _cancel_reminder(context)
+                set_chat_mode(context, MODE_IDLE)
+                await message.reply_text(
+                    "🎉 <b>Поздравляем!</b>\nВсе слова разгаданы! ✨",
+                    parse_mode=constants.ParseMode.HTML,
+                )
+                await _send_completion_options(context, chat.id, message, puzzle)
         else:
             await refresh_clues_if_needed()
+            if is_turn_based:
+                try:
+                    await context.bot.send_message(
+                        chat_id=game_state.chat_id,
+                        text=(
+                            f"{player.name if player else (user.full_name if user else 'Игрок')}"
+                            f" разгадал {selected_slot_ref.public_id}!"
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to announce correct answer in chat %s", game_state.chat_id)
+                await _complete_turn(context, game_state, reason="correct")
 
 
 @command_entrypoint()
@@ -1955,7 +2455,8 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     parsed = _parse_inline_answer(raw_text)
     if not parsed:
-        game_state = _load_state_for_chat(chat.id)
+        user = getattr(update, "effective_user", None)
+        game_state = _resolve_game_state_for_message(chat, user.id if user else None)
         if game_state:
             logger.info(
                 "Inline answer handler aborted: failed to parse inline answer",
@@ -1990,6 +2491,7 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     chat = update.effective_chat
     message = update.effective_message
+    user = update.effective_user
     if chat is None or message is None:
         return
     logger.debug("Chat %s requested /hint", chat.id)
@@ -1997,7 +2499,7 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Нет активной игры. Используйте /new.")
         return
 
-    game_state = _load_state_for_chat(chat.id)
+    game_state = _resolve_game_state_for_message(chat, user.id if user else None)
     if not game_state:
         await message.reply_text("Нет активной игры. Используйте /new.")
         return
@@ -2005,6 +2507,31 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if puzzle is None:
         await message.reply_text("Не удалось загрузить кроссворд.")
         return
+
+    player: Player | None = None
+    if user is not None:
+        player = _ensure_player_profile(
+            game_state,
+            user.id,
+            name=user.full_name or user.username or str(user.id),
+            dm_chat_id=chat.id if chat.type == ChatType.PRIVATE else None,
+        )
+        _store_state(game_state)
+
+    is_turn_based = game_state.mode == "turn_based"
+    if is_turn_based:
+        if game_state.status != "running":
+            await message.reply_text("Игра ещё не запущена. Подождите старта.")
+            return
+        if not _is_current_player(game_state, user.id if user else None):
+            current = _current_player(game_state)
+            notice = (
+                f"Сейчас ход {current.name}."
+                if current
+                else "Сейчас ход другого игрока."
+            )
+            await message.reply_text(notice)
+            return
 
     with logging_context(puzzle_id=puzzle.id):
         slot_ref: Optional[SlotRef] = None
@@ -2040,9 +2567,11 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text("Для этого слота нет ответа.")
             return
 
-        result = _reveal_letter(game_state, slot_ref, slot_ref.slot.answer)
+        user_id = user.id if user else None
+        penalty_applied = False
+        result = _reveal_letter(game_state, slot_ref, slot_ref.slot.answer, user_id=user_id)
         if result is None:
-            _record_hint_usage(game_state, slot_ref.public_id)
+            _record_hint_usage(game_state, slot_ref.public_id, user_id=user_id)
             game_state.last_update = time.time()
             _store_state(game_state)
             reply_text = (
@@ -2061,6 +2590,34 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 position + 1,
                 slot_ref.public_id,
             )
+        if is_turn_based and TURN_HINT_PENALTY:
+            _record_score(game_state, -TURN_HINT_PENALTY, user_id=user_id)
+            game_state.score = max(game_state.score - TURN_HINT_PENALTY, 0)
+            penalty_applied = True
+            _store_state(game_state)
+
+        if penalty_applied:
+            name = None
+            dm_target = None
+            if player is not None:
+                name = player.name
+                dm_target = player.dm_chat_id
+            elif user is not None:
+                name = user.full_name or user.username or str(user.id)
+                dm_target = chat.id if chat.type == ChatType.PRIVATE else None
+            if name is None:
+                name = "Игрок"
+            penalty_text = f"{name} использует подсказку: -{TURN_HINT_PENALTY} очков."
+            try:
+                await context.bot.send_message(chat_id=game_state.chat_id, text=penalty_text)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to announce hint penalty in chat %s", game_state.chat_id)
+            if dm_target:
+                with suppress(Exception):
+                    await context.bot.send_message(
+                        chat_id=dm_target,
+                        text=f"Штраф за подсказку: -{TURN_HINT_PENALTY} очков.",
+                    )
 
         try:
             image_path = render_puzzle(puzzle, game_state)
@@ -2127,6 +2684,52 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_completion_options(context, chat.id, message, puzzle)
         logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
 
+
+@command_entrypoint()
+async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    logger.debug("Chat %s requested /finish", chat.id)
+    game_state = _resolve_game_state_for_message(chat, user.id)
+    if not game_state:
+        await message.reply_text("Нет активной игры.")
+        return
+    puzzle = _load_puzzle_for_state(game_state)
+    if game_state.mode == "turn_based":
+        if game_state.host_id and user.id != game_state.host_id:
+            await message.reply_text("Завершить игру может только хост.")
+            return
+        await _finish_game(context, game_state, reason="manual", puzzle=puzzle)
+        return
+    if puzzle is None:
+        await message.reply_text("Не удалось загрузить кроссворд.")
+        return
+    solved_now = _solve_remaining_slots(game_state, puzzle)
+    if solved_now:
+        _cancel_reminder(context)
+        try:
+            image_path = render_puzzle(puzzle, game_state)
+            await context.bot.send_chat_action(
+                chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            with open(image_path, "rb") as photo:
+                await message.reply_photo(photo=photo, caption="Игра завершена по команде /finish.")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to render puzzle after finish command")
+            await message.reply_text("Игра завершена. Не удалось обновить изображение.")
+        solved_lines = "\n".join(f"{slot_id}: {answer}" for slot_id, answer in solved_now)
+        await message.reply_text(f"Ответы:\n{solved_lines}")
+    else:
+        await message.reply_text("Все ответы уже открыты.")
+    set_chat_mode(context, MODE_IDLE)
+    if puzzle is not None:
+        await _send_completion_options(context, chat.id, message, puzzle)
 @command_entrypoint()
 async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
@@ -2288,6 +2891,159 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
     logger.debug("Unhandled completion callback payload: %s", data)
 
 
+@command_entrypoint()
+async def lobby_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    chat = query.message.chat if query.message else update.effective_chat
+    user = query.from_user
+    if chat is None or user is None:
+        return
+    game_state = _resolve_game_state_for_message(chat, user.id)
+    if not game_state:
+        await context.bot.send_message(chat_id=chat.id, text="Игра не найдена.")
+        return
+    if game_state.mode != "turn_based":
+        await context.bot.send_message(chat_id=chat.id, text="Этот режим не поддерживает запуск из лобби.")
+        return
+    if game_state.status != "lobby":
+        await context.bot.send_message(chat_id=chat.id, text="Игра уже запущена.")
+        return
+    if game_state.host_id and user.id != game_state.host_id:
+        await context.bot.send_message(chat_id=chat.id, text="Только хост может запустить игру.")
+        return
+    _initialise_turn_based_mode(context, game_state)
+    await context.bot.send_message(chat_id=chat.id, text="Игра началась!")
+    await _announce_current_turn(context, game_state)
+
+
+@command_entrypoint()
+async def turn_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    message_chat = query.message.chat if query.message else update.effective_chat
+    user = query.from_user
+    if message_chat is None or user is None:
+        return
+    game_state = _resolve_game_state_for_message(message_chat, user.id)
+    if not game_state or game_state.mode != "turn_based":
+        await context.bot.send_message(chat_id=message_chat.id, text="Нет активной пошаговой игры.")
+        return
+    if game_state.status != "running":
+        await context.bot.send_message(chat_id=message_chat.id, text="Игра ещё не запущена.")
+        return
+    if not _is_current_player(game_state, user.id):
+        current = _current_player(game_state)
+        if current:
+            await query.answer(f"Сейчас ход {current.name}", show_alert=True)
+        return
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        await query.answer("Кроссворд не найден", show_alert=True)
+        return
+    unsolved: list[SlotRef] = []
+    solved_lookup = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+    for slot_ref in iter_slot_refs(puzzle):
+        if not slot_ref.slot.answer:
+            continue
+        public_id = _normalise_slot_id(slot_ref.public_id)
+        if public_id in solved_lookup:
+            continue
+        unsolved.append(slot_ref)
+    if not unsolved:
+        await query.answer("Все слова уже разгаданы", show_alert=True)
+        return
+    player = _ensure_player_profile(
+        game_state,
+        user.id,
+        name=user.full_name or user.username or str(user.id),
+        dm_chat_id=message_chat.id if message_chat.type == ChatType.PRIVATE else None,
+    )
+    _store_state(game_state)
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, slot_ref in enumerate(unsolved, start=1):
+        callback_data = f"{TURN_SLOT_CALLBACK_PREFIX}{slot_ref.public_id}"
+        row.append(InlineKeyboardButton(slot_ref.public_id, callback_data=callback_data))
+        if idx % 3 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    keyboard = InlineKeyboardMarkup(buttons)
+    target_chat_id = player.dm_chat_id or message_chat.id
+    await context.bot.send_message(
+        chat_id=target_chat_id,
+        text="Выберите слот для ответа:",
+        reply_markup=keyboard,
+    )
+
+
+@command_entrypoint()
+async def turn_slot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    data = query.data or ""
+    if not data.startswith(TURN_SLOT_CALLBACK_PREFIX):
+        return
+    slot_id = data[len(TURN_SLOT_CALLBACK_PREFIX) :]
+    await query.answer()
+    message_chat = query.message.chat if query.message else update.effective_chat
+    user = query.from_user
+    if message_chat is None or user is None:
+        return
+    game_state = _resolve_game_state_for_message(message_chat, user.id)
+    if not game_state or game_state.mode != "turn_based":
+        await context.bot.send_message(chat_id=message_chat.id, text="Нет активной пошаговой игры.")
+        return
+    if game_state.status != "running":
+        await context.bot.send_message(chat_id=message_chat.id, text="Игра ещё не запущена.")
+        return
+    if not _is_current_player(game_state, user.id):
+        current = _current_player(game_state)
+        if current:
+            await query.answer(f"Сейчас ход {current.name}", show_alert=True)
+        return
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        await query.answer("Кроссворд не найден", show_alert=True)
+        return
+    slot_ref, ambiguity = _resolve_slot(puzzle, slot_id)
+    if ambiguity:
+        await query.answer(ambiguity, show_alert=True)
+        return
+    if slot_ref is None or not slot_ref.slot.answer:
+        await query.answer("Слот не найден", show_alert=True)
+        return
+    public_id = _normalise_slot_id(slot_ref.public_id)
+    if public_id in {_normalise_slot_id(entry) for entry in game_state.solved_slots}:
+        await query.answer("Слот уже решён", show_alert=True)
+        return
+    player = _ensure_player_profile(
+        game_state,
+        user.id,
+        name=user.full_name or user.username or str(user.id),
+        dm_chat_id=message_chat.id if message_chat.type == ChatType.PRIVATE else None,
+    )
+    game_state.active_slot_id = public_id
+    _store_state(game_state)
+    clue_text = slot_ref.slot.clue or "(без подсказки)"
+    announcement = (
+        f"@{user.username}" if user.username else player.name
+    ) + f" выбрал слот {slot_ref.public_id}: {clue_text}"
+    await context.bot.send_message(chat_id=game_state.chat_id, text=announcement)
+    if player.dm_chat_id:
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id=player.dm_chat_id,
+                text=f"Вы выбрали {slot_ref.public_id}. Отправьте ответ командой /answer или сообщением.",
+            )
+
 def configure_telegram_handlers(telegram_application: Application) -> None:
     conversation = ConversationHandler(
         entry_points=[CommandHandler(["new", "start"], start_new_game)],
@@ -2328,12 +3084,31 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("answer", answer_command))
     telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
+    telegram_application.add_handler(CommandHandler("finish", finish_command))
     telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(
         CallbackQueryHandler(
             completion_callback_handler,
             pattern=fr"^{COMPLETION_CALLBACK_PREFIX}",
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            lobby_start_handler,
+            pattern=fr"^{LOBBY_START_CALLBACK}$",
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            turn_select_handler,
+            pattern=fr"^{TURN_SELECT_CALLBACK}$",
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            turn_slot_handler,
+            pattern=fr"^{TURN_SLOT_CALLBACK_PREFIX}.*",
         )
     )
 
