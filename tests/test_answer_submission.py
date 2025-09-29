@@ -60,9 +60,9 @@ def _build_game_state(puzzle: Puzzle) -> GameState:
         filled_cells={},
         solved_slots=set(),
         score=0,
-        hints_used=0,
         started_at=now,
         last_update=now,
+        scoreboard={777: 0},
     )
 
 
@@ -101,7 +101,8 @@ async def test_numeric_slot_answer_matches_across(monkeypatch, tmp_path, puzzle_
 
     clue_mock = AsyncMock()
 
-    monkeypatch.setattr(state, "active_states", {})
+    monkeypatch.setattr(state, "active_games", {})
+    monkeypatch.setattr(state, "chat_to_game", {})
     monkeypatch.setattr(app, "_load_state_for_chat", lambda chat_id: game_state)
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle_with_shared_number)
     monkeypatch.setattr(app, "_store_state", lambda _state: None)
@@ -125,7 +126,8 @@ async def test_numeric_slot_answer_matches_down(monkeypatch, tmp_path, puzzle_wi
 
     clue_mock = AsyncMock()
 
-    monkeypatch.setattr(state, "active_states", {})
+    monkeypatch.setattr(state, "active_games", {})
+    monkeypatch.setattr(state, "chat_to_game", {})
     monkeypatch.setattr(app, "_load_state_for_chat", lambda chat_id: game_state)
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle_with_shared_number)
     monkeypatch.setattr(app, "_store_state", lambda _state: None)
