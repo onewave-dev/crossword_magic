@@ -2089,7 +2089,7 @@ async def monitor_webhook(application: Application, settings: Settings) -> None:
                 await application.bot.set_webhook(
                     url=expected_url,
                     secret_token=settings.webhook_secret,
-                    allowed_updates=[],
+                    allowed_updates=["message","callback_query","chat_member","my_chat_member","message_reaction","message_reaction_count"],
                 )
                 logger.info("Webhook re-registered due to mismatch")
         except Exception:  # noqa: BLE001 - We want to log all failures
@@ -2169,7 +2169,7 @@ async def on_startup() -> None:
     await telegram_application.bot.set_webhook(
         url=expected_url,
         secret_token=settings.webhook_secret,
-        allowed_updates=[],
+        allowed_updates=["message","callback_query","chat_member","my_chat_member","message_reaction","message_reaction_count"],
     )
     logger.info("Webhook configured at %s", expected_url)
 
@@ -2260,7 +2260,7 @@ async def _set_webhook(telegram_application: Application, settings: Settings) ->
     await telegram_application.bot.set_webhook(
         url=expected_url,
         secret_token=settings.webhook_secret,
-        allowed_updates=[],
+        allowed_updates=["message","callback_query","chat_member","my_chat_member","message_reaction","message_reaction_count"],
     )
 
 
