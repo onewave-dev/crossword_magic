@@ -285,7 +285,8 @@ def _normalise_slot_id(slot_id: str) -> str:
 
 INLINE_ANSWER_PATTERN = re.compile(
     # Accept common dash-like separators (hyphen-minus, hyphen, non-breaking hyphen, en/em dash, figure dash, minus) and colon
-    r"^\s*([^\W\d_]+[0-9]+(?:-[0-9]+)?)\s*[-‐‑–—‒−:]\s*(.+)$",
+    # or just whitespace between slot and answer. Allow slot identifiers consisting solely of digits.
+    r"^\s*([^\W\d_]*[0-9]+(?:-[0-9]+)?)\s*(?:[-‐‑–—‒−:]\s*|\s+)(.+)$",
     flags=re.UNICODE,
 )
 
@@ -1436,32 +1437,56 @@ async def _handle_answer_submission(
         async def refresh_clues_if_needed() -> None:
             await _send_clues_update(message, puzzle, game_state)
 
-        slot_ref, ambiguity = _resolve_slot(puzzle, normalised_slot_id)
-        if ambiguity:
-            await message.reply_text(ambiguity)
-            await refresh_clues_if_needed()
-            log_abort("slot_reference_ambiguous", detail=ambiguity)
-            return
-        if slot_ref is None:
-            logger.warning("Answer received for missing slot %s", normalised_slot_id)
-            await message.reply_text(f"Слот {normalised_slot_id} не найден.")
-            await refresh_clues_if_needed()
-            log_abort("slot_not_found")
-            return
-
-        slot = slot_ref.slot
-        public_id = _normalise_slot_id(slot_ref.public_id)
         solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
-        if public_id in solved_ids:
-            await message.reply_text("Этот слот уже решён.")
-            await refresh_clues_if_needed()
-            log_abort("slot_already_solved", slot_identifier=public_id)
-            return
-        if not slot.answer:
-            await message.reply_text("Для этого слота не задан ответ.")
-            await refresh_clues_if_needed()
-            log_abort("slot_has_no_answer", slot_identifier=public_id)
-            return
+        is_numeric_slot = normalised_slot_id.isdigit()
+        candidate_refs: list[SlotRef] = []
+        selected_slot_ref: SlotRef | None = None
+        slot_identifier = normalised_slot_id
+
+        if is_numeric_slot:
+            slot_number: int | None = None
+            try:
+                slot_number = int(normalised_slot_id)
+            except ValueError:
+                slot_number = None
+            if slot_number is not None:
+                candidate_refs = [
+                    ref
+                    for ref in iter_slot_refs(puzzle)
+                    if ref.slot.number == slot_number
+                ]
+            if not candidate_refs:
+                logger.warning("Answer received for missing slot %s", normalised_slot_id)
+                await message.reply_text(f"Слот {normalised_slot_id} не найден.")
+                await refresh_clues_if_needed()
+                log_abort("slot_not_found")
+                return
+        else:
+            resolved_slot_ref, ambiguity = _resolve_slot(puzzle, normalised_slot_id)
+            if ambiguity:
+                await message.reply_text(ambiguity)
+                await refresh_clues_if_needed()
+                log_abort("slot_reference_ambiguous", detail=ambiguity)
+                return
+            if resolved_slot_ref is None:
+                logger.warning("Answer received for missing slot %s", normalised_slot_id)
+                await message.reply_text(f"Слот {normalised_slot_id} не найден.")
+                await refresh_clues_if_needed()
+                log_abort("slot_not_found")
+                return
+            selected_slot_ref = resolved_slot_ref
+            slot_identifier = _normalise_slot_id(resolved_slot_ref.public_id)
+            if slot_identifier in solved_ids:
+                await message.reply_text("Этот слот уже решён.")
+                await refresh_clues_if_needed()
+                log_abort("slot_already_solved", slot_identifier=slot_identifier)
+                return
+            if not resolved_slot_ref.slot.answer:
+                await message.reply_text("Для этого слота не задан ответ.")
+                await refresh_clues_if_needed()
+                log_abort("slot_has_no_answer", slot_identifier=slot_identifier)
+                return
+            candidate_refs = [resolved_slot_ref]
 
         try:
             validated = validate_word_list(
@@ -1472,49 +1497,108 @@ async def _handle_answer_submission(
         except WordValidationError as exc:
             logger.warning(
                 "Rejected answer for slot %s due to validation: %s",
-                slot.slot_id,
+                slot_identifier,
                 exc,
             )
             await message.reply_text(f"Слово не прошло проверку: {exc}")
             await refresh_clues_if_needed()
             log_abort(
                 "answer_validation_failed",
-                slot_identifier=public_id,
+                slot_identifier=slot_identifier,
                 detail=str(exc),
             )
             return
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected error validating answer for slot %s", slot.slot_id)
+            logger.exception(
+                "Unexpected error validating answer for slot %s",
+                slot_identifier,
+            )
             await message.reply_text("Не удалось проверить слово. Попробуйте позже.")
             await refresh_clues_if_needed()
             log_abort(
                 "answer_validation_error",
-                slot_identifier=public_id,
+                slot_identifier=slot_identifier,
                 detail=str(exc),
             )
             return
 
         if not validated:
-            logger.info("Answer for slot %s failed language rules", slot.slot_id)
+            logger.info("Answer for slot %s failed language rules", slot_identifier)
             await message.reply_text("Слово не соответствует правилам языка.")
             await refresh_clues_if_needed()
-            log_abort("answer_not_validated", slot_identifier=public_id)
+            log_abort("answer_not_validated", slot_identifier=slot_identifier)
             return
 
         candidate = validated[0].word
+        candidate_canonical = _canonical_answer(candidate, puzzle.language)
+
+        if is_numeric_slot:
+            answerable_refs = [ref for ref in candidate_refs if ref.slot.answer]
+            if not answerable_refs:
+                await message.reply_text("Для этого слота не задан ответ.")
+                await refresh_clues_if_needed()
+                log_abort("slot_has_no_answer", slot_identifier=normalised_slot_id)
+                return
+
+            matching_refs = [
+                ref
+                for ref in answerable_refs
+                if _canonical_answer(ref.slot.answer, puzzle.language)
+                == candidate_canonical
+            ]
+            if not matching_refs:
+                logger.info(
+                    "Incorrect answer for slot number %s",
+                    normalised_slot_id,
+                )
+                await message.reply_text("Ответ неверный, попробуйте ещё раз.")
+                await refresh_clues_if_needed()
+                log_abort(
+                    "answer_incorrect",
+                    slot_identifier=normalised_slot_id,
+                )
+                return
+
+            matching_refs.sort(
+                key=lambda ref: (
+                    0
+                    if _normalise_slot_id(ref.public_id) not in solved_ids
+                    else 1,
+                    0 if ref.slot.direction is Direction.ACROSS else 1,
+                    _normalise_slot_id(ref.public_id),
+                )
+            )
+            selected_slot_ref = matching_refs[0]
+            slot_identifier = _normalise_slot_id(selected_slot_ref.public_id)
+            if slot_identifier in solved_ids:
+                await message.reply_text("Этот слот уже решён.")
+                await refresh_clues_if_needed()
+                log_abort("slot_already_solved", slot_identifier=slot_identifier)
+                return
+
+        if selected_slot_ref is None:
+            logger.warning("Failed to resolve slot %s after validation", normalised_slot_id)
+            await message.reply_text(f"Слот {normalised_slot_id} не найден.")
+            await refresh_clues_if_needed()
+            log_abort("slot_not_found", slot_identifier=normalised_slot_id)
+            return
+
+        slot = selected_slot_ref.slot
+        public_id = _normalise_slot_id(selected_slot_ref.public_id)
+
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
             slot.answer,
             puzzle.language,
         ):
-            logger.info("Incorrect answer for slot %s", slot_ref.public_id)
+            logger.info("Incorrect answer for slot %s", selected_slot_ref.public_id)
             await message.reply_text("Ответ неверный, попробуйте ещё раз.")
             await refresh_clues_if_needed()
             log_abort("answer_incorrect", slot_identifier=public_id)
             return
 
         game_state.score += slot.length
-        _apply_answer_to_state(game_state, slot_ref, candidate)
-        logger.info("Accepted answer for slot %s", slot_ref.public_id)
+        _apply_answer_to_state(game_state, selected_slot_ref, candidate)
+        logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
         try:
             image_path = render_puzzle(puzzle, game_state)
@@ -1523,7 +1607,7 @@ async def _handle_answer_submission(
             )
             with open(image_path, "rb") as photo:
                 await message.reply_photo(
-                    photo=photo, caption=f"Верно! {slot_ref.public_id}"
+                    photo=photo, caption=f"Верно! {selected_slot_ref.public_id}"
                 )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to render updated grid after correct answer")
