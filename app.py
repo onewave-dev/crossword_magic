@@ -2031,6 +2031,9 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(conversation)
     telegram_application.add_handler(
+    MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
+)
+    telegram_application.add_handler(
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         inline_answer_handler,
@@ -2058,9 +2061,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
-    telegram_application.add_handler(
-        MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
-    )
     telegram_application.add_handler(
         CallbackQueryHandler(
             completion_callback_handler,
