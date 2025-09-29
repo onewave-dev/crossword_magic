@@ -2034,21 +2034,21 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         inline_answer_handler,
-        block=False, group = 1
+        block=False
     )
 )
     telegram_application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             button_language_handler,
-            block=False, group = 2
+            block=False
         )
     )
     telegram_application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             button_theme_handler,
-            block=False, group=3
+            block=False
         )
     )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
