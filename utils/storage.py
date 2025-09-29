@@ -108,6 +108,8 @@ class GameState:
     created_at: float = field(default_factory=time.time)
     test_mode: bool = False
     dummy_user_id: int | None = None
+    language: str | None = None
+    theme: str | None = None
 
     def __post_init__(self) -> None:
         self.game_id = str(self.game_id or self.chat_id)
@@ -192,6 +194,10 @@ class GameState:
         # Ensure scoreboard has an entry for singleplayer score when applicable.
         if self.host_id is not None and self.host_id not in self.scoreboard:
             self.scoreboard[self.host_id] = int(self.score)
+        if self.language:
+            self.language = str(self.language)
+        if self.theme:
+            self.theme = str(self.theme)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the state into a JSON-compatible dictionary."""
@@ -226,6 +232,8 @@ class GameState:
             "join_codes": self.join_codes,
             "test_mode": self.test_mode,
             "dummy_user_id": self.dummy_user_id,
+            "language": self.language,
+            "theme": self.theme,
         }
 
     @classmethod
@@ -337,6 +345,11 @@ class GameState:
         dummy_raw = payload.get("dummy_user_id")
         dummy_user_id = int(dummy_raw) if dummy_raw not in (None, "") else None
 
+        language_raw = payload.get("language")
+        language = str(language_raw) if language_raw not in (None, "") else None
+        theme_raw = payload.get("theme")
+        theme = str(theme_raw) if theme_raw not in (None, "") else None
+
         hinted_cells_raw = payload.get("hinted_cells", [])
         hinted_cells_iter: Iterable[Any]
         if isinstance(hinted_cells_raw, Iterable) and not isinstance(
@@ -376,6 +389,8 @@ class GameState:
             join_codes=join_codes,
             test_mode=bool(payload.get("test_mode", False)),
             dummy_user_id=dummy_user_id,
+            language=language,
+            theme=theme,
         )
 
 

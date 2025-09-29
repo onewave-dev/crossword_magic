@@ -6,6 +6,7 @@ import asyncio
 import html
 import re
 import os
+import secrets
 import time
 from uuid import uuid4
 from contextlib import suppress
@@ -17,10 +18,15 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from telegram import (
     Chat,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
+    User,
     constants,
 )
 from telegram.constants import ChatType
@@ -35,10 +41,12 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+from telegram.error import Forbidden, TelegramError
 
 from utils.storage import (
     STATE_CLEANUP_INTERVAL,
     GameState,
+    Player,
     delete_puzzle,
     delete_state,
     load_puzzle,
@@ -175,6 +183,7 @@ class AppState:
         self.player_chats: dict[int, int] = {}
         self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
+        self.lobby_messages: dict[str, tuple[int, int]] = {}
 
 
 state = AppState()
@@ -203,6 +212,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
             for code, target in list(state.join_codes.items()):
                 if target == game_id:
                     state.join_codes.pop(code, None)
+            state.lobby_messages.pop(game_id, None)
             if puzzle_id:
                 delete_puzzle(puzzle_id)
             logger.info("Cleaned up resources for chat %s", chat_id)
@@ -215,6 +225,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
         for code, target in list(state.join_codes.items()):
             if target == str(chat_id):
                 state.join_codes.pop(code, None)
+        state.lobby_messages.pop(str(chat_id), None)
         if puzzle_id:
             delete_puzzle(puzzle_id)
         logger.info("Cleaned up resources for chat %s", chat_id)
@@ -234,6 +245,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         for user_id, mapped_chat in list(state.player_chats.items()):
             if mapped_chat == game_state.chat_id:
                 state.player_chats.pop(user_id, None)
+        state.lobby_messages.pop(game_state.game_id, None)
         if game_state.puzzle_id:
             delete_puzzle(game_state.puzzle_id)
         logger.info("Cleaned up resources for game %s", game_state.game_id)
@@ -338,6 +350,43 @@ def _normalise_thread_id(update: Update) -> int:
     return thread_id
 
 
+def _get_new_game_storage(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> dict:
+    if chat and chat.type in GROUP_CHAT_TYPES:
+        data = getattr(context, "chat_data", None)
+        if not isinstance(data, dict):
+            data = {}
+            setattr(context, "chat_data", data)
+        return data
+    data = getattr(context, "user_data", None)
+    if not isinstance(data, dict):
+        data = {}
+        setattr(context, "user_data", data)
+    return data
+
+
+def _get_pending_language(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> str | None:
+    storage = _get_new_game_storage(context, chat)
+    value = storage.get("new_game_language")
+    if value is None:
+        return None
+    return str(value)
+
+
+def _set_pending_language(
+    context: ContextTypes.DEFAULT_TYPE, chat: Chat | None, language: str | None
+) -> None:
+    storage = _get_new_game_storage(context, chat)
+    if language is None:
+        storage["new_game_language"] = None
+    else:
+        storage["new_game_language"] = str(language)
+
+
+def _clear_pending_language(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> None:
+    storage = _get_new_game_storage(context, chat)
+    storage.pop("new_game_language", None)
+
+
 def _coord_key(row: int, col: int, component: int | None = None) -> str:
     base = f"{row},{col}"
     if component is None:
@@ -376,6 +425,18 @@ GENERATION_NOTICE_KEY = "puzzle_generation_notice"
 ADMIN_COMMAND_PATTERN = re.compile(r"(?i)^\s*adm key")
 ADMIN_KEYS_ONLY_PATTERN = re.compile(r"(?i)^\s*adm keys\s*$")
 ADMIN_SINGLE_KEY_PATTERN = re.compile(r"(?i)^\s*adm key\s+(.+)$")
+
+GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+
+LOBBY_INVITE_CALLBACK_PREFIX = "lobby_invite:"
+LOBBY_LINK_CALLBACK_PREFIX = "lobby_link:"
+LOBBY_START_CALLBACK_PREFIX = "lobby_start:"
+LOBBY_WAIT_CALLBACK_PREFIX = "lobby_wait:"
+
+MAX_LOBBY_PLAYERS = 6
+
+JOIN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+JOIN_CODE_LENGTH = 6
 
 
 def _parse_inline_answer(text: str | None) -> Optional[tuple[str, str]]:
@@ -467,6 +528,173 @@ def _record_hint_usage(
     if player_id is None:
         player_id = 0
     usage[player_id] = usage.get(player_id, 0) + 1
+
+
+def _register_player_chat(user_id: int, chat_id: int | None) -> None:
+    if chat_id is None:
+        return
+    state.player_chats[user_id] = chat_id
+
+
+def _lookup_player_chat(user_id: int) -> int | None:
+    return state.player_chats.get(user_id)
+
+
+def _user_display_name(user: User | None) -> str:
+    if user is None:
+        return "Игрок"
+    if user.full_name:
+        return user.full_name
+    if user.username:
+        return f"@{user.username}"
+    return str(user.id)
+
+
+def _player_display_name(player: Player) -> str:
+    if player.name:
+        return player.name
+    return str(player.user_id)
+
+
+def _assign_join_code(game_state: GameState) -> str:
+    for _ in range(64):
+        code = "".join(secrets.choice(JOIN_CODE_ALPHABET) for _ in range(JOIN_CODE_LENGTH))
+        if code not in state.join_codes and code not in game_state.join_codes:
+            game_state.join_codes[code] = game_state.game_id
+            return code
+    raise RuntimeError("Не удалось сгенерировать код присоединения")
+
+
+def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
+    invite_button = InlineKeyboardButton(
+        text="Пригласить из контактов",
+        callback_data=f"{LOBBY_INVITE_CALLBACK_PREFIX}{game_state.game_id}",
+    )
+    link_button = InlineKeyboardButton(
+        text="Создать ссылку",
+        callback_data=f"{LOBBY_LINK_CALLBACK_PREFIX}{game_state.game_id}",
+    )
+    has_min_players = len(game_state.players) >= 2
+    if has_min_players:
+        start_callback = f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}"
+    else:
+        start_callback = f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}"
+    start_button = InlineKeyboardButton(text="Старт", callback_data=start_callback)
+    return InlineKeyboardMarkup([[invite_button, link_button], [start_button]])
+
+
+def _format_lobby_text(game_state: GameState) -> str:
+    language = (game_state.language or "?").upper()
+    theme = game_state.theme or "(тема не выбрана)"
+    players = ", ".join(
+        _player_display_name(player) for player in game_state.players.values()
+    )
+    return (
+        "Комната готова!\n"
+        f"Язык: {language}\n"
+        f"Тема: {theme}\n"
+        f"Игроки ({len(game_state.players)}/{MAX_LOBBY_PLAYERS}): {players or 'ещё нет участников'}"
+    )
+
+
+async def _publish_lobby_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    message: Message | None = None,
+) -> None:
+    chat_id = game_state.chat_id
+    keyboard = _build_lobby_keyboard(game_state)
+    text = _format_lobby_text(game_state)
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+    )
+    state.lobby_messages[game_state.game_id] = (chat_id, sent.message_id)
+
+
+async def _update_lobby_message(
+    context: ContextTypes.DEFAULT_TYPE, game_state: GameState
+) -> None:
+    entry = state.lobby_messages.get(game_state.game_id)
+    if not entry:
+        return
+    chat_id, message_id = entry
+    keyboard = _build_lobby_keyboard(game_state)
+    text = _format_lobby_text(game_state)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except TelegramError:
+        logger.exception("Failed to update lobby message for game %s", game_state.game_id)
+
+
+def _load_state_by_game_id(game_id: str) -> GameState | None:
+    if not game_id:
+        return None
+    if game_id in state.active_games:
+        return state.active_games[game_id]
+    restored = load_state(game_id)
+    if restored is None:
+        return None
+    state.active_games[restored.game_id] = restored
+    state.chat_to_game[restored.chat_id] = restored.game_id
+    for code, target in list(state.join_codes.items()):
+        if target == restored.game_id and code not in restored.join_codes:
+            state.join_codes.pop(code, None)
+    for code, target in restored.join_codes.items():
+        state.join_codes[code] = target
+    return restored
+
+
+def _ensure_player_entry(
+    game_state: GameState, user: User, name: str, dm_chat_id: int | None
+) -> Player:
+    existing = game_state.players.get(user.id)
+    if existing:
+        if name:
+            existing.name = name
+        if dm_chat_id is not None:
+            existing.dm_chat_id = dm_chat_id
+        game_state.scoreboard.setdefault(user.id, 0)
+        return existing
+    player = Player(user_id=user.id, name=name, dm_chat_id=dm_chat_id)
+    game_state.players[user.id] = player
+    game_state.scoreboard.setdefault(user.id, 0)
+    return player
+
+
+async def _build_join_link(context: ContextTypes.DEFAULT_TYPE, code: str) -> str | None:
+    username = context.bot.username
+    if not username:
+        try:
+            me = await context.bot.get_me()
+        except TelegramError:
+            logger.exception("Failed to resolve bot username for deep link")
+            return None
+        username = me.username or ""
+    if not username:
+        return None
+    return f"https://t.me/{username}?start=join_{code}"
+
+
+async def track_player_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and user and chat.type == ChatType.PRIVATE:
+        _register_player_chat(user.id, chat.id)
+
+
+async def track_player_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and user and chat.type == ChatType.PRIVATE:
+        _register_player_chat(user.id, chat.id)
 
 
 def _store_state(game_state: GameState) -> None:
@@ -1150,15 +1378,15 @@ def _generate_puzzle(
 # ---------------------------------------------------------------------------
 
 
-@command_entrypoint(fallback=ConversationHandler.END)
-async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        return ConversationHandler.END
+async def _start_new_private_game(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     chat = update.effective_chat
     message = update.effective_message
     chat_id = chat.id if chat else None
-    logger.debug("Chat %s initiated /new", chat_id if chat_id is not None else "<unknown>")
+    logger.debug(
+        "Chat %s initiated private /new", chat_id if chat_id is not None else "<unknown>"
+    )
 
     if chat_id is not None and chat_id in state.generating_chats:
         if message:
@@ -1181,10 +1409,10 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         and puzzle is not None
         and not _all_slots_solved(puzzle, game_state)
     ):
-        context.user_data.pop("new_game_language", None)
+        _clear_pending_language(context, chat)
         set_chat_mode(context, MODE_IN_GAME)
         reminder_text = (
-            "У вас уже есть активный кроссворд. Давайте продолжим текущую игру!"
+            "У вас уже есть активный кроссворд. Давате продолжим текущую игру!"
         )
         if message:
             await message.reply_text(reminder_text)
@@ -1198,7 +1426,6 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if message:
                     with open(image_path, "rb") as photo:
                         await message.reply_photo(photo=photo)
-                if message:
                     await message.reply_text(
                         _format_clues_message(puzzle, game_state),
                         parse_mode=constants.ParseMode.HTML,
@@ -1211,7 +1438,7 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
         return ConversationHandler.END
 
-    context.user_data["new_game_language"] = None
+    _set_pending_language(context, chat, None)
     set_chat_mode(context, MODE_AWAIT_LANGUAGE)
     if message:
         await message.reply_text(
@@ -1220,26 +1447,189 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return LANGUAGE_STATE
 
 
+async def _start_new_group_game(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None:
+        return ConversationHandler.END
+    if chat.id in state.generating_chats:
+        await message.reply_text(
+            "Мы всё ещё готовим предыдущую игру. Пожалуйста, подождите."
+        )
+        return ConversationHandler.END
+
+    existing = _load_state_for_chat(chat.id)
+    if (
+        existing is not None
+        and existing.mode != "single"
+        and existing.status == "running"
+    ):
+        await message.reply_text(
+            "В этой группе уже идёт игра. Завершите её или используйте /quit."
+        )
+        return ConversationHandler.END
+
+    if existing is not None:
+        _cleanup_game_state(existing)
+
+    state.lobby_messages.pop(str(chat.id), None)
+    context.chat_data.pop("lobby_message_id", None)
+
+    now = time.time()
+    host_id = user.id if user else None
+    host_name = _user_display_name(user)
+    dm_chat_id = _lookup_player_chat(host_id) if host_id else None
+    game_state = GameState(
+        chat_id=chat.id,
+        puzzle_id="",
+        filled_cells={},
+        solved_slots=set(),
+        score=0,
+        started_at=now,
+        last_update=now,
+        hinted_cells=set(),
+        host_id=host_id,
+        game_id=str(chat.id),
+        scoreboard={},
+        mode="turn_based",
+        status="lobby",
+        players={},
+    )
+    if user and host_id is not None:
+        _ensure_player_entry(game_state, user, host_name, dm_chat_id)
+    game_state.language = None
+    game_state.theme = None
+    _store_state(game_state)
+    set_chat_mode(context, MODE_AWAIT_LANGUAGE)
+    _set_pending_language(context, chat, None)
+    await message.reply_text(
+        f"{host_name} создаёт новую игру! Укажите язык кроссворда (например: ru, en)."
+    )
+    return LANGUAGE_STATE
+
+
+async def _process_join_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    code_raw: str,
+) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    if chat.type != ChatType.PRIVATE:
+        await message.reply_text("Присоединение доступно только в личном чате с ботом.")
+        return
+    code = code_raw.strip()
+    if not code:
+        await message.reply_text("Укажите код для присоединения.")
+        return
+    code_upper = code.upper()
+    game_id = state.join_codes.get(code_upper)
+    if not game_id:
+        await message.reply_text("Не удалось найти игру по этому коду.")
+        return
+    game_state = _load_state_by_game_id(game_id)
+    if game_state is None or game_state.status != "lobby":
+        await message.reply_text("Игра не готова к присоединению.")
+        return
+    if len(game_state.players) >= MAX_LOBBY_PLAYERS and user.id not in game_state.players:
+        await message.reply_text("Достигнут лимит игроков в этой комнате (6).")
+        return
+    _register_player_chat(user.id, chat.id)
+    existing = game_state.players.get(user.id)
+    if existing:
+        existing.dm_chat_id = chat.id
+        _store_state(game_state)
+        await message.reply_text(
+            f"Вы уже в игре «{game_state.theme or 'без темы'}». Ожидаем старт."
+        )
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=f"{existing.name} снова с нами!",
+        )
+        return
+
+    stored_name = context.user_data.get("player_name") if isinstance(
+        context.user_data, dict
+    ) else None
+    if stored_name:
+        player = _ensure_player_entry(game_state, user, str(stored_name), chat.id)
+        _store_state(game_state)
+        await message.reply_text(
+            f"Добро пожаловать обратно, {player.name}! Ждите начала игры."
+        )
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=f"{player.name} подключился к игре!",
+        )
+        await _update_lobby_message(context, game_state)
+        return
+
+    context.user_data["pending_join"] = {"game_id": game_state.game_id, "code": code_upper}
+    await message.reply_text(
+        "Как вас представить другим игрокам?", reply_markup=ForceReply(selective=True)
+    )
+
+
+@command_entrypoint(fallback=ConversationHandler.END)
+async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    if chat and chat.type == ChatType.PRIVATE and context.args:
+        first_arg = context.args[0]
+        if first_arg and first_arg.lower().startswith("join_"):
+            await _process_join_code(update, context, first_arg[5:])
+            return ConversationHandler.END
+
+    if chat and chat.type in GROUP_CHAT_TYPES:
+        return await _start_new_group_game(update, context)
+
+    return await _start_new_private_game(update, context)
+
+
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        return ConversationHandler.END
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None or not message.text:
+        return LANGUAGE_STATE
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
         logger.debug(
             "Ignoring language input while in mode %s",
             get_chat_mode(context),
         )
         return LANGUAGE_STATE
-    message = update.effective_message
-    if message is None or not message.text:
-        return LANGUAGE_STATE
     language = message.text.strip().lower()
     if not language or not language.isalpha():
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
         return LANGUAGE_STATE
-    logger.debug("Chat %s selected language %s", update.effective_chat.id if update.effective_chat else "<unknown>", language)
-    context.user_data["new_game_language"] = language
+    logger.debug(
+        "Chat %s selected language %s",
+        chat.id if chat else "<unknown>",
+        language,
+    )
+    if chat.type in GROUP_CHAT_TYPES:
+        game_state = _load_state_for_chat(chat.id)
+        if not game_state or game_state.status != "lobby":
+            await message.reply_text("Создайте новую игру командой /new в этом чате.")
+            set_chat_mode(context, MODE_IDLE)
+            _clear_pending_language(context, chat)
+            return ConversationHandler.END
+        game_state.language = language
+        game_state.last_update = time.time()
+        _store_state(game_state)
+        _set_pending_language(context, chat, language)
+        set_chat_mode(context, MODE_AWAIT_THEME)
+        await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+        return THEME_STATE
+
+    _set_pending_language(context, chat, language)
     set_chat_mode(context, MODE_AWAIT_THEME)
     await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
     return THEME_STATE
@@ -1248,27 +1638,27 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @command_entrypoint()
 async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        return
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
         logger.debug(
             "Ignoring button language input while in mode %s",
             get_chat_mode(context),
         )
         return
-    state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
-    if not state or state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
+    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
         return
     message = update.effective_message
-    if message is None or not message.text:
+    chat = update.effective_chat
+    if chat is None or message is None or not message.text:
         return
     language = message.text.strip().lower()
     if not language or not language.isalpha():
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
         return
-    state[BUTTON_LANGUAGE_KEY] = language
-    state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
+    flow_state[BUTTON_LANGUAGE_KEY] = language
+    flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
     set_chat_mode(context, MODE_AWAIT_THEME)
+    _set_pending_language(context, chat, language)
     logger.debug(
         "Chat %s selected language %s via button flow",
         update.effective_chat.id if update.effective_chat else "<unknown>",
@@ -1280,37 +1670,66 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
-        set_chat_mode(context, MODE_IDLE)
-        context.user_data.pop("new_game_language", None)
-        return ConversationHandler.END
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None or not message.text:
+        return THEME_STATE
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_THEME:
         logger.debug(
             "Ignoring theme input while in mode %s",
             get_chat_mode(context),
         )
         return THEME_STATE
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None or not message.text:
-        return THEME_STATE
+
+    if chat.type in GROUP_CHAT_TYPES:
+        game_state = _load_state_for_chat(chat.id)
+        if not game_state or game_state.status != "lobby":
+            await message.reply_text("Создайте новую игру командой /new в этом чате.")
+            set_chat_mode(context, MODE_IDLE)
+            _clear_pending_language(context, chat)
+            return ConversationHandler.END
+        theme = message.text.strip()
+        if not theme:
+            await message.reply_text("Введите тему, например: Древний Рим.")
+            return THEME_STATE
+        language = game_state.language or _get_pending_language(context, chat)
+        if not language:
+            await message.reply_text("Сначала выберите язык через команду /new.")
+            set_chat_mode(context, MODE_IDLE)
+            _clear_pending_language(context, chat)
+            return ConversationHandler.END
+        game_state.language = language
+        game_state.theme = theme
+        game_state.last_update = time.time()
+        _store_state(game_state)
+        _clear_pending_language(context, chat)
+        set_chat_mode(context, MODE_IDLE)
+        await message.reply_text(
+            "Тема сохранена! Используйте кнопки ниже, чтобы пригласить игроков."
+        )
+        await _publish_lobby_message(context, game_state)
+        return ConversationHandler.END
+
     if chat.id in state.generating_chats:
         await message.reply_text(
             "Мы всё ещё готовим ваш кроссворд. Пожалуйста, подождите."
         )
         set_chat_mode(context, MODE_IDLE)
-        context.user_data.pop("new_game_language", None)
+        _clear_pending_language(context, chat)
         return ConversationHandler.END
-    language = context.user_data.get("new_game_language")
+
+    language = _get_pending_language(context, chat)
     if not language:
         await message.reply_text("Сначала выберите язык через команду /new.")
         set_chat_mode(context, MODE_IDLE)
-        context.user_data.pop("new_game_language", None)
+        _clear_pending_language(context, chat)
         return ConversationHandler.END
+
     theme = message.text.strip()
     if not theme:
         await message.reply_text("Введите тему, например: Древний Рим.")
         return THEME_STATE
+
     logger.info("Chat %s selected theme %s", chat.id, theme)
     _cancel_reminder(context)
     await _send_generation_notice(
@@ -1364,26 +1783,28 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         logger.info("Delivered freshly generated puzzle to chat")
         return ConversationHandler.END
     finally:
-        context.user_data.pop("new_game_language", None)
+        _clear_pending_language(context, chat)
 
 
 @command_entrypoint()
 async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
-    if not await _reject_group_chat(update):
+    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None or not message.text:
+        return
+    if chat.type in GROUP_CHAT_TYPES:
+        await handle_theme(update, context)
+        flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
         return
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_THEME:
         logger.debug(
             "Ignoring button theme input while in mode %s",
             get_chat_mode(context),
         )
-        return
-    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
-    if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
-        return
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or not message.text or chat is None:
         return
     if chat.id in state.generating_chats:
         await message.reply_text(
@@ -1449,12 +1870,197 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     _clear_generation_notice(context, chat.id)
 
 
+@command_entrypoint()
+async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    if chat.type != ChatType.PRIVATE:
+        await message.reply_text("Используйте эту команду в личном чате с ботом.")
+        return
+    if not context.args:
+        await message.reply_text("Использование: /join <код>")
+        return
+    await _process_join_code(update, context, context.args[0])
+
+
+@command_entrypoint()
+async def join_name_response_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    if chat.type != ChatType.PRIVATE:
+        return
+    pending = context.user_data.get("pending_join")
+    if not isinstance(pending, dict):
+        return
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None or reply.from_user.id != context.bot.id:
+        return
+    game_id = pending.get("game_id")
+    if not game_id:
+        context.user_data.pop("pending_join", None)
+        return
+    name = message.text.strip() if message.text else ""
+    if not name:
+        await message.reply_text(
+            "Имя не может быть пустым. Попробуйте снова.",
+            reply_markup=ForceReply(selective=True),
+        )
+        return
+    context.user_data["player_name"] = name
+    context.user_data.pop("pending_join", None)
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state or game_state.status != "lobby":
+        await message.reply_text("Игра уже недоступна для присоединения.")
+        return
+    if len(game_state.players) >= MAX_LOBBY_PLAYERS and user.id not in game_state.players:
+        await message.reply_text("К сожалению, комната уже заполнена.")
+        return
+    _register_player_chat(user.id, chat.id)
+    player = _ensure_player_entry(game_state, user, name, chat.id)
+    _store_state(game_state)
+    await message.reply_text(
+        f"Приятно познакомиться, {player.name}! Ждите начала игры.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await context.bot.send_message(
+        chat_id=game_state.chat_id,
+        text=f"{player.name} присоединился к игре!",
+    )
+    await _update_lobby_message(context, game_state)
+
+
+@command_entrypoint()
+async def lobby_invite_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if not query.data.startswith(LOBBY_INVITE_CALLBACK_PREFIX):
+        return
+    game_id = query.data[len(LOBBY_INVITE_CALLBACK_PREFIX) :]
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state or game_state.status != "lobby":
+        await query.answer("Лобби недоступно.", show_alert=True)
+        return
+    user = update.effective_user
+    if user is None:
+        return
+    dm_chat_id = _lookup_player_chat(user.id) or user.id
+    text = (
+        "Выберите контакт, которому хотите отправить приглашение, или поделитесь ссылкой"
+        " через кнопку «Создать ссылку»."
+    )
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton(text="Поделиться контактом", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=dm_chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except Forbidden:
+        await query.answer(
+            "Не могу отправить сообщение — напишите боту в личном чате.",
+            show_alert=True,
+        )
+        return
+    await query.answer("Открыл меню приглашений в личном чате.")
+
+
+@command_entrypoint()
+async def lobby_link_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if not query.data.startswith(LOBBY_LINK_CALLBACK_PREFIX):
+        return
+    game_id = query.data[len(LOBBY_LINK_CALLBACK_PREFIX) :]
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state or game_state.status != "lobby":
+        await query.answer("Лобби недоступно.", show_alert=True)
+        return
+    try:
+        code = _assign_join_code(game_state)
+    except RuntimeError:
+        await query.answer("Не удалось создать новый код. Попробуйте ещё раз позже.", show_alert=True)
+        return
+    _store_state(game_state)
+    link = await _build_join_link(context, code)
+    user = update.effective_user
+    if user is None:
+        return
+    dm_chat_id = _lookup_player_chat(user.id) or user.id
+    parts = [f"Код для присоединения: {code}"]
+    if link:
+        parts.append(f"Ссылка: {link}")
+    try:
+        await context.bot.send_message(
+            chat_id=dm_chat_id,
+            text="\n".join(parts),
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Forbidden:
+        await query.answer(
+            "Не могу отправить ссылку — напишите боту в личном чате.",
+            show_alert=True,
+        )
+        return
+    await query.answer("Ссылка отправлена в личном чате.")
+
+
+@command_entrypoint()
+async def lobby_start_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    data = query.data
+    if data.startswith(LOBBY_WAIT_CALLBACK_PREFIX):
+        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
+        return
+    if not data.startswith(LOBBY_START_CALLBACK_PREFIX):
+        return
+    game_id = data[len(LOBBY_START_CALLBACK_PREFIX) :]
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state or game_state.status != "lobby":
+        await query.answer("Игра уже запущена или недоступна.", show_alert=True)
+        return
+    if len(game_state.players) < 2:
+        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
+        await _update_lobby_message(context, game_state)
+        return
+    await query.answer("Старт игры будет доступен в одном из следующих обновлений.", show_alert=True)
+    await context.bot.send_message(
+        chat_id=game_state.chat_id,
+        text="Кнопка «Старт» пока не активирует игру. Дождитесь дальнейших обновлений.",
+    )
+
+
 @command_entrypoint(fallback=ConversationHandler.END)
 async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
-    context.user_data.pop("new_game_language", None)
     set_chat_mode(context, MODE_IDLE)
     chat = update.effective_chat
+    _clear_pending_language(context, chat)
     if chat is not None:
         _clear_generation_notice(context, chat.id)
     if update.effective_message:
@@ -1874,8 +2480,9 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat = update.effective_chat
     message = update.effective_message
     current_mode = get_chat_mode(context)
+    pending_language = _get_pending_language(context, chat)
     if is_chat_mode_set(context) and current_mode != MODE_IN_GAME:
-        if "new_game_language" in context.user_data:
+        if pending_language is not None:
             chat_id = chat.id if chat else None
             if chat is None or message is None:
                 logger.info(
@@ -1914,7 +2521,7 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 current_mode,
             )
         return
-    if not is_chat_mode_set(context) and "new_game_language" in context.user_data:
+    if not is_chat_mode_set(context) and pending_language is not None:
         chat_id = chat.id if chat else None
         if chat is None or message is None:
             logger.info(
@@ -2275,7 +2882,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         if game_state and (not puzzle_id or game_state.puzzle_id == puzzle_id):
             _cleanup_game_state(game_state)
         _cancel_reminder(context)
-        context.user_data.pop("new_game_language", None)
+        _clear_pending_language(context, chat)
         context.chat_data[BUTTON_NEW_GAME_KEY] = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
         set_chat_mode(context, MODE_AWAIT_LANGUAGE)
         await context.bot.send_message(
@@ -2300,27 +2907,42 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(conversation)
     telegram_application.add_handler(
-    MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
-)
-    telegram_application.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        inline_answer_handler,
-        block=False
+        MessageHandler(filters.ALL, track_player_message),
+        group=-1,
     )
-)
+    telegram_application.add_handler(
+        CallbackQueryHandler(track_player_callback, pattern=".*", block=False),
+        group=-1,
+    )
+    telegram_application.add_handler(
+        MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
+    )
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            inline_answer_handler,
+            block=False,
+        )
+    )
     telegram_application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             button_language_handler,
-            block=False
+            block=False,
         )
     )
     telegram_application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             button_theme_handler,
-            block=False
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            join_name_response_handler,
+            block=False,
         )
     )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
@@ -2330,10 +2952,32 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
+    telegram_application.add_handler(CommandHandler("join", join_command))
     telegram_application.add_handler(
         CallbackQueryHandler(
             completion_callback_handler,
             pattern=fr"^{COMPLETION_CALLBACK_PREFIX}",
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            lobby_invite_callback_handler,
+            pattern=fr"^{LOBBY_INVITE_CALLBACK_PREFIX}.*",
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            lobby_link_callback_handler,
+            pattern=fr"^{LOBBY_LINK_CALLBACK_PREFIX}.*",
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            lobby_start_callback_handler,
+            pattern=fr"^{LOBBY_START_CALLBACK_PREFIX}.*|^{LOBBY_WAIT_CALLBACK_PREFIX}.*",
+            block=False,
         )
     )
 
