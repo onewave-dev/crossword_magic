@@ -73,7 +73,7 @@ async def test_inline_handler_passes_parsed_values_to_submission_handler():
 
 
 @pytest.mark.anyio
-async def test_inline_handler_replies_when_parse_fails():
+async def test_inline_handler_replies_when_parse_fails_with_active_game():
     chat = SimpleNamespace(id=124, type=ChatType.PRIVATE)
     message = SimpleNamespace(
         text="неверный формат",
@@ -84,8 +84,9 @@ async def test_inline_handler_replies_when_parse_fails():
     update = SimpleNamespace(effective_chat=chat, effective_message=message)
     context = SimpleNamespace(user_data={})
 
-    with patch("app._handle_answer_submission", new_callable=AsyncMock) as handler_mock:
-        await inline_answer_handler(update, context)
+    with patch("app._load_state_for_chat", return_value=SimpleNamespace()):
+        with patch("app._handle_answer_submission", new_callable=AsyncMock) as handler_mock:
+            await inline_answer_handler(update, context)
 
     handler_mock.assert_not_awaited()
     message.reply_text.assert_awaited_once()
@@ -130,3 +131,42 @@ async def test_inline_answer_allowed_after_extra_theme_during_generation():
         handler_mock.assert_awaited_once_with(context, chat, answer_message, "A1", "ответ")
     finally:
         state.generating_chats.discard(chat.id)
+
+
+@pytest.mark.anyio
+async def test_inline_handler_uses_caption_when_text_missing():
+    chat = SimpleNamespace(id=555, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text=None,
+        caption="D1 - такса",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=3,
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+    context = SimpleNamespace(user_data={})
+
+    with patch("app._handle_answer_submission", new_callable=AsyncMock) as handler_mock:
+        await inline_answer_handler(update, context)
+
+    handler_mock.assert_awaited_once_with(context, chat, message, "D1", "такса")
+
+
+@pytest.mark.anyio
+async def test_inline_handler_silent_when_no_game_and_parse_fails():
+    chat = SimpleNamespace(id=556, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text="какой-то текст",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=4,
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+    context = SimpleNamespace(user_data={})
+
+    with patch("app._load_state_for_chat", return_value=None):
+        with patch("app._handle_answer_submission", new_callable=AsyncMock) as handler_mock:
+            await inline_answer_handler(update, context)
+
+    handler_mock.assert_not_awaited()
+    message.reply_text.assert_not_awaited()

@@ -1691,7 +1691,13 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
             },
         )
         return
-    if not message.text:
+    raw_text = message.text
+    if not raw_text or not raw_text.strip():
+        caption = getattr(message, "caption", None)
+        if caption and caption.strip():
+            raw_text = caption
+
+    if not raw_text or not raw_text.strip():
         logger.debug(
             "Inline answer handler aborted: message text missing",
             extra={
@@ -1701,19 +1707,30 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    parsed = _parse_inline_answer(message.text)
+    parsed = _parse_inline_answer(raw_text)
     if not parsed:
-        logger.info(
-            "Inline answer handler aborted: failed to parse inline answer",
-            extra={
-                "chat_id": chat.id,
-                "message_id": message.message_id,
-                "text": message.text,
-            },
-        )
-        await message.reply_text(
-            "Не удалось распознать ответ. Используйте формат «A1 - слово»."
-        )
+        game_state = _load_state_for_chat(chat.id)
+        if game_state:
+            logger.info(
+                "Inline answer handler aborted: failed to parse inline answer",
+                extra={
+                    "chat_id": chat.id,
+                    "message_id": message.message_id,
+                    "text": raw_text,
+                },
+            )
+            await message.reply_text(
+                "Не удалось распознать ответ. Используйте формат «A1 - слово»."
+            )
+        else:
+            logger.debug(
+                "Inline answer ignored: no active game and input not recognised",
+                extra={
+                    "chat_id": chat.id,
+                    "message_id": message.message_id,
+                    "text": raw_text,
+                },
+            )
         return
 
     slot_id, answer_text = parsed
@@ -2035,7 +2052,11 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(
-        MessageHandler(filters.Regex(INLINE_ANSWER_PATTERN), inline_answer_handler)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            inline_answer_handler,
+            block=False,
+        )
     )
     telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
