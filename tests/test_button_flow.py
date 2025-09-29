@@ -59,9 +59,9 @@ async def test_button_theme_handler_generates_puzzle_via_completion_menu(monkeyp
         filled_cells={},
         solved_slots=set(),
         score=0,
-        hints_used=0,
         started_at=now,
         last_update=now,
+        scoreboard={chat_id: 0},
     )
 
     generate_calls: list[tuple[int, str, str]] = []

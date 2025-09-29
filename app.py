@@ -170,7 +170,10 @@ class AppState:
         self.telegram_app: Optional[Application] = None
         self.webhook_task: Optional[asyncio.Task[None]] = None
         self.cleanup_task: Optional[asyncio.Task[None]] = None
-        self.active_states: dict[int, GameState] = {}
+        self.active_games: dict[str, GameState] = {}
+        self.chat_to_game: dict[int, str] = {}
+        self.player_chats: dict[int, int] = {}
+        self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
 
 
@@ -187,11 +190,31 @@ def get_telegram_application() -> Application:
 def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
     """Remove in-memory and persisted resources for the provided chat."""
 
+    game_id = state.chat_to_game.get(chat_id)
+    if game_id:
+        game_state = state.active_games.get(game_id)
+        if game_state is not None:
+            _cleanup_game_state(game_state)
+            return
+        with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
+            state.generating_chats.discard(chat_id)
+            state.chat_to_game.pop(chat_id, None)
+            delete_state(game_id)
+            for code, target in list(state.join_codes.items()):
+                if target == game_id:
+                    state.join_codes.pop(code, None)
+            if puzzle_id:
+                delete_puzzle(puzzle_id)
+            logger.info("Cleaned up resources for chat %s", chat_id)
+            return
+
     with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
         state.generating_chats.discard(chat_id)
-        if chat_id in state.active_states:
-            del state.active_states[chat_id]
+        state.chat_to_game.pop(chat_id, None)
         delete_state(chat_id)
+        for code, target in list(state.join_codes.items()):
+            if target == str(chat_id):
+                state.join_codes.pop(code, None)
         if puzzle_id:
             delete_puzzle(puzzle_id)
         logger.info("Cleaned up resources for chat %s", chat_id)
@@ -200,7 +223,20 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
 def _cleanup_game_state(game_state: GameState | None) -> None:
     if game_state is None:
         return
-    _cleanup_chat_resources(game_state.chat_id, game_state.puzzle_id)
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        state.generating_chats.discard(game_state.chat_id)
+        state.chat_to_game.pop(game_state.chat_id, None)
+        state.active_games.pop(game_state.game_id, None)
+        delete_state(game_state)
+        for code, target in list(state.join_codes.items()):
+            if target == game_state.game_id:
+                state.join_codes.pop(code, None)
+        for user_id, mapped_chat in list(state.player_chats.items()):
+            if mapped_chat == game_state.chat_id:
+                state.player_chats.pop(user_id, None)
+        if game_state.puzzle_id:
+            delete_puzzle(game_state.puzzle_id)
+        logger.info("Cleaned up resources for game %s", game_state.game_id)
 
 
 def command_entrypoint(fallback=None):
@@ -370,21 +406,65 @@ def _ensure_hint_set(game_state: GameState) -> set[str]:
     return game_state.hinted_cells
 
 
+def _resolve_player_id(game_state: GameState, user_id: int | None = None) -> int | None:
+    if user_id is not None:
+        return user_id
+    if game_state.host_id is not None:
+        return game_state.host_id
+    return game_state.chat_id
+
+
+def _record_score(game_state: GameState, delta: int, user_id: int | None = None) -> None:
+    if not delta:
+        return
+    player_id = _resolve_player_id(game_state, user_id)
+    if player_id is None:
+        return
+    game_state.scoreboard[player_id] = game_state.scoreboard.get(player_id, 0) + delta
+
+
+def _record_hint_usage(
+    game_state: GameState, slot_identifier: str, user_id: int | None = None
+) -> None:
+    player_id = _resolve_player_id(game_state, user_id)
+    slot_key = _normalise_slot_id(slot_identifier)
+    usage = game_state.hints_used.setdefault(slot_key, {})
+    if player_id is None:
+        player_id = 0
+    usage[player_id] = usage.get(player_id, 0) + 1
+
+
 def _store_state(game_state: GameState) -> None:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
-        state.active_states[game_state.chat_id] = game_state
+        state.active_games[game_state.game_id] = game_state
+        state.chat_to_game[game_state.chat_id] = game_state.game_id
+        for code, target in list(state.join_codes.items()):
+            if target == game_state.game_id and code not in game_state.join_codes:
+                state.join_codes.pop(code, None)
+        for code, target in game_state.join_codes.items():
+            state.join_codes[code] = target
         save_state(game_state)
-        logger.info("Game state persisted for chat %s", game_state.chat_id)
+        logger.info("Game state persisted for game %s", game_state.game_id)
 
 
 def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
     with logging_context(chat_id=chat_id):
-        if chat_id in state.active_states:
-            return state.active_states[chat_id]
-        restored = load_state(chat_id)
+        game_id = state.chat_to_game.get(chat_id)
+        if game_id and game_id in state.active_games:
+            return state.active_games[game_id]
+        identifier = game_id if game_id is not None else chat_id
+        restored = load_state(identifier)
         if restored is None:
+            if game_id is not None:
+                state.chat_to_game.pop(chat_id, None)
             return None
-        state.active_states[chat_id] = restored
+        state.active_games[restored.game_id] = restored
+        state.chat_to_game[restored.chat_id] = restored.game_id
+        for code, target in list(state.join_codes.items()):
+            if target == restored.game_id and code not in restored.join_codes:
+                state.join_codes.pop(code, None)
+        for code, target in restored.join_codes.items():
+            state.join_codes[code] = target
         logger.info("Restored state from disk during command handling")
         return restored
 
@@ -668,7 +748,7 @@ def _reveal_letter(
         letter = answer[index]
         game_state.filled_cells[key] = letter
         hint_set.add(key)
-        game_state.hints_used += 1
+        _record_hint_usage(game_state, slot_ref.public_id)
         game_state.last_update = time.time()
         _store_state(game_state)
         return index, letter
@@ -828,10 +908,12 @@ def _generate_composite(
         filled_cells={},
         solved_slots=set(),
         score=0,
-        hints_used=0,
         started_at=now,
         last_update=now,
         hinted_cells=set(),
+        host_id=chat_id,
+        game_id=str(chat_id),
+        scoreboard={chat_id: 0},
     )
     return composite, game_state
 
@@ -1007,10 +1089,12 @@ def _generate_puzzle(
                             filled_cells={},
                             solved_slots=set(),
                             score=0,
-                            hints_used=0,
                             started_at=now,
                             last_update=now,
                             hinted_cells=set(),
+                            host_id=chat_id,
+                            game_id=str(chat_id),
+                            scoreboard={chat_id: 0},
                         )
                         _store_state(game_state)
                         logger.info("Generated puzzle ready for delivery")
@@ -1597,6 +1681,7 @@ async def _handle_answer_submission(
             return
 
         game_state.score += slot.length
+        _record_score(game_state, slot.length)
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
         logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
@@ -1877,7 +1962,7 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         result = _reveal_letter(game_state, slot_ref, slot_ref.slot.answer)
         if result is None:
-            game_state.hints_used += 1
+            _record_hint_usage(game_state, slot_ref.public_id)
             game_state.last_update = time.time()
             _store_state(game_state)
             reply_text = (
@@ -2195,9 +2280,11 @@ async def cleanup_states_periodically(app_state: AppState) -> None:
     )
     while True:
         try:
-            expired = prune_expired_states(app_state.active_states)
-            if expired:
-                logger.info("Removed %s expired game states", len(expired))
+            expired_states = prune_expired_states(app_state.active_games)
+            if expired_states:
+                for expired_state in expired_states:
+                    _cleanup_game_state(expired_state)
+                logger.info("Removed %s expired game states", len(expired_states))
         except Exception:  # noqa: BLE001 - log any cleanup issues
             logger.exception("State cleanup task encountered an error")
 
@@ -2214,9 +2301,15 @@ async def on_startup() -> None:
     logger.debug("FastAPI startup initiated")
     ensure_storage_directories()
 
-    state.active_states = load_all_states()
-    if state.active_states:
-        logger.info("Restored %s active game states", len(state.active_states))
+    restored_games = load_all_states()
+    state.active_games = restored_games
+    state.chat_to_game = {game_state.chat_id: game_id for game_id, game_state in restored_games.items()}
+    state.join_codes = {}
+    for game_state in restored_games.values():
+        for code, target in game_state.join_codes.items():
+            state.join_codes[code] = target
+    if restored_games:
+        logger.info("Restored %s active game states", len(restored_games))
     else:
         logger.debug("No persisted game states found during startup")
 
