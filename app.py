@@ -248,10 +248,45 @@ def register_webhook_route(path: str) -> None:
 
 LANGUAGE_STATE, THEME_STATE = range(2)
 
+MODE_IDLE = "idle"
+MODE_AWAIT_LANGUAGE = "await_language"
+MODE_AWAIT_THEME = "await_theme"
+MODE_IN_GAME = "in_game"
+
 REMINDER_DELAY_SECONDS = 10 * 60
 
 MAX_PUZZLE_SIZE = 15
 MAX_REPLACEMENT_REQUESTS = 30
+
+
+def get_chat_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Return the current chat mode stored in chat_data."""
+
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, dict):
+        chat_data = {}
+        setattr(context, "chat_data", chat_data)
+    return chat_data.get("chat_mode", MODE_IDLE)
+
+
+def set_chat_mode(context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    """Persist the provided chat mode in chat_data."""
+
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, dict):
+        chat_data = {}
+        setattr(context, "chat_data", chat_data)
+    if mode == MODE_IDLE:
+        chat_data.pop("chat_mode", None)
+    else:
+        chat_data["chat_mode"] = mode
+
+
+def is_chat_mode_set(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if a chat mode has been explicitly stored for the chat."""
+
+    chat_data = getattr(context, "chat_data", None)
+    return isinstance(chat_data, dict) and "chat_mode" in chat_data
 
 
 def _normalise_thread_id(update: Update) -> int:
@@ -579,6 +614,13 @@ async def _deliver_puzzle_via_bot(
     puzzle: Puzzle | CompositePuzzle,
     game_state: GameState,
 ) -> bool:
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        logger.warning(
+            "Attempted to deliver puzzle while chat %s in mode %s",
+            chat_id,
+            get_chat_mode(context),
+        )
+        return False
     image_path = None
     try:
         with logging_context(puzzle_id=puzzle.id):
@@ -1050,8 +1092,13 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if game_state is not None:
         puzzle = _load_puzzle_for_state(game_state)
 
-    if game_state is not None and puzzle is not None and not _all_slots_solved(puzzle, game_state):
+    if (
+        game_state is not None
+        and puzzle is not None
+        and not _all_slots_solved(puzzle, game_state)
+    ):
         context.user_data.pop("new_game_language", None)
+        set_chat_mode(context, MODE_IN_GAME)
         reminder_text = (
             "У вас уже есть активный кроссворд. Давайте продолжим текущую игру!"
         )
@@ -1081,6 +1128,7 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     context.user_data["new_game_language"] = None
+    set_chat_mode(context, MODE_AWAIT_LANGUAGE)
     if message:
         await message.reply_text(
             "Выберите язык кроссворда (например: ru, en, it, es).",
@@ -1093,6 +1141,12 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
         return ConversationHandler.END
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
+        logger.debug(
+            "Ignoring language input while in mode %s",
+            get_chat_mode(context),
+        )
+        return LANGUAGE_STATE
     message = update.effective_message
     if message is None or not message.text:
         return LANGUAGE_STATE
@@ -1102,6 +1156,7 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return LANGUAGE_STATE
     logger.debug("Chat %s selected language %s", update.effective_chat.id if update.effective_chat else "<unknown>", language)
     context.user_data["new_game_language"] = language
+    set_chat_mode(context, MODE_AWAIT_THEME)
     await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
     return THEME_STATE
 
@@ -1110,6 +1165,12 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
+        return
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
+        logger.debug(
+            "Ignoring button language input while in mode %s",
+            get_chat_mode(context),
+        )
         return
     state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
     if not state or state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
@@ -1123,6 +1184,7 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
         return
     state[BUTTON_LANGUAGE_KEY] = language
     state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
+    set_chat_mode(context, MODE_AWAIT_THEME)
     logger.debug(
         "Chat %s selected language %s via button flow",
         update.effective_chat.id if update.effective_chat else "<unknown>",
@@ -1133,49 +1195,48 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
 
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    should_clear_language = False
-    try:
-        _normalise_thread_id(update)
-        if not await _reject_group_chat(update):
-            should_clear_language = True
-            return ConversationHandler.END
-
-        message = update.effective_message
-        if message is None or not message.text:
-            return THEME_STATE
-
-        language = context.user_data.get("new_game_language")
-        if not language:
-            await message.reply_text("Сначала выберите язык через команду /new.")
-            should_clear_language = True
-            return ConversationHandler.END
-
-        theme = message.text.strip()
-        if not theme:
-            await message.reply_text("Введите тему, например: Древний Рим.")
-            return THEME_STATE
-
-        chat = update.effective_chat
-        if chat is None:
-            should_clear_language = True
-            return ConversationHandler.END
-
-        if chat.id in state.generating_chats:
-            await message.reply_text(
-                "Мы всё ещё готовим ваш предыдущий кроссворд. Пожалуйста, подождите."
-            )
-            should_clear_language = True
-            return ConversationHandler.END
-
-        logger.info("Chat %s requested theme '%s'", chat.id, theme)
-        await _send_generation_notice(
-            context,
-            chat.id,
-            "Готовлю кроссворд, это может занять немного времени...",
-            message=message,
+    _normalise_thread_id(update)
+    if not await _reject_group_chat(update):
+        set_chat_mode(context, MODE_IDLE)
+        context.user_data.pop("new_game_language", None)
+        return ConversationHandler.END
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_THEME:
+        logger.debug(
+            "Ignoring theme input while in mode %s",
+            get_chat_mode(context),
         )
-
-        loop = asyncio.get_running_loop()
+        return THEME_STATE
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None or not message.text:
+        return THEME_STATE
+    if chat.id in state.generating_chats:
+        await message.reply_text(
+            "Мы всё ещё готовим ваш кроссворд. Пожалуйста, подождите."
+        )
+        set_chat_mode(context, MODE_IDLE)
+        context.user_data.pop("new_game_language", None)
+        return ConversationHandler.END
+    language = context.user_data.get("new_game_language")
+    if not language:
+        await message.reply_text("Сначала выберите язык через команду /new.")
+        set_chat_mode(context, MODE_IDLE)
+        context.user_data.pop("new_game_language", None)
+        return ConversationHandler.END
+    theme = message.text.strip()
+    if not theme:
+        await message.reply_text("Введите тему, например: Древний Рим.")
+        return THEME_STATE
+    logger.info("Chat %s selected theme %s", chat.id, theme)
+    _cancel_reminder(context)
+    await _send_generation_notice(
+        context,
+        chat.id,
+        "Готовлю кроссворд, это может занять немного времени...",
+        message=message,
+    )
+    loop = asyncio.get_running_loop()
+    try:
         puzzle: Puzzle | CompositePuzzle | None = None
         game_state: GameState | None = None
         state.generating_chats.add(chat.id)
@@ -1190,46 +1251,20 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await message.reply_text(
                 "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
             )
-            should_clear_language = True
+            set_chat_mode(context, MODE_IDLE)
             return ConversationHandler.END
         finally:
             state.generating_chats.discard(chat.id)
 
-        should_clear_language = True
-        _cancel_reminder(context)
-
-        image_path = None
-        try:
-            with logging_context(puzzle_id=puzzle.id):
-                image_path = render_puzzle(puzzle, game_state)
-                await context.bot.send_chat_action(
-                    chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
-                )
-                with open(image_path, "rb") as photo:
-                    await message.reply_photo(
-                        photo=photo,
-                        caption=(
-                            f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
-                        ),
-                    )
-                await message.reply_text(
-                    _format_clues_message(puzzle, game_state),
-                    parse_mode=constants.ParseMode.HTML,
-                )
-                await message.reply_text(
-                    "Отправляйте ответы прямо в чат в формате «A1 - ответ». Если удобнее, можно пользоваться и командой /answer."
-                )
-                logger.info("Delivered freshly generated puzzle to chat")
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to deliver puzzle to chat %s", chat.id)
+        set_chat_mode(context, MODE_IN_GAME)
+        delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
+        if not delivered:
+            set_chat_mode(context, MODE_IDLE)
             _cleanup_game_state(game_state)
-            if image_path is not None:
-                with suppress(OSError):
-                    image_path.unlink(missing_ok=True)
+            _clear_generation_notice(context, chat.id)
             await message.reply_text(
                 "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
             )
-            _clear_generation_notice(context, chat.id)
             return ConversationHandler.END
 
         if context.job_queue:
@@ -1242,16 +1277,22 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             context.chat_data["reminder_job"] = job
 
         _clear_generation_notice(context, chat.id)
+        logger.info("Delivered freshly generated puzzle to chat")
         return ConversationHandler.END
     finally:
-        if should_clear_language:
-            context.user_data.pop("new_game_language", None)
+        context.user_data.pop("new_game_language", None)
 
 
 @command_entrypoint()
 async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
+        return
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_THEME:
+        logger.debug(
+            "Ignoring button theme input while in mode %s",
+            get_chat_mode(context),
+        )
         return
     flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
     if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
@@ -1302,8 +1343,10 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         state.generating_chats.discard(chat.id)
     context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+    set_chat_mode(context, MODE_IN_GAME)
     delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
     if not delivered:
+        set_chat_mode(context, MODE_IDLE)
         _cleanup_game_state(game_state)
         _clear_generation_notice(context, chat.id)
         await message.reply_text(
@@ -1326,6 +1369,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     context.user_data.pop("new_game_language", None)
+    set_chat_mode(context, MODE_IDLE)
     chat = update.effective_chat
     if chat is not None:
         _clear_generation_notice(context, chat.id)
@@ -1344,6 +1388,9 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if chat is None or message is None:
         return
     logger.debug("Chat %s requested /clues", chat.id)
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        await message.reply_text("Нет активной игры. Используйте /new для начала.")
+        return
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
         await message.reply_text("Нет активной игры. Используйте /new для начала.")
@@ -1370,6 +1417,9 @@ async def send_state_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if chat is None or message is None:
         return
     logger.debug("Chat %s requested /state", chat.id)
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        await message.reply_text("Нет активного кроссворда. Используйте /new.")
+        return
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
         await message.reply_text("Нет активного кроссворда. Используйте /new.")
@@ -1415,6 +1465,12 @@ async def _handle_answer_submission(
             reason,
             detail or "-",
         )
+
+    current_mode = get_chat_mode(context)
+    if is_chat_mode_set(context) and current_mode != MODE_IN_GAME:
+        await message.reply_text("Нет активной игры. Используйте /new.")
+        log_abort("invalid_mode", detail=current_mode)
+        return
 
     if not answer_text:
         await message.reply_text("Введите ответ после слота.")
@@ -1617,6 +1673,7 @@ async def _handle_answer_submission(
 
         if _all_slots_solved(puzzle, game_state):
             _cancel_reminder(context)
+            set_chat_mode(context, MODE_IDLE)
             await message.reply_text(
                 "🎉 <b>Поздравляем!</b>\nВсе слова разгаданы! ✨",
                 parse_mode=constants.ParseMode.HTML,
@@ -1731,8 +1788,48 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     chat = update.effective_chat
     message = update.effective_message
+    current_mode = get_chat_mode(context)
+    if is_chat_mode_set(context) and current_mode != MODE_IN_GAME:
+        if "new_game_language" in context.user_data:
+            chat_id = chat.id if chat else None
+            if chat is None or message is None:
+                logger.info(
+                    "Skipping inline answer: /new conversation active but no message available",
+                    extra={"chat_id": chat_id, "has_message": message is not None},
+                )
+                return
 
-    if "new_game_language" in context.user_data:
+            if chat_id in state.generating_chats:
+                logger.info(
+                    "Skipping inline answer: setup or generation is in progress",
+                    extra={
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "generating": True,
+                    },
+                )
+            else:
+                logger.info(
+                    "Skipping inline answer: language/theme selection is in progress",
+                    extra={
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "generating": False,
+                    },
+                )
+
+            await message.reply_text(
+                "Сначала завершите выбор языка/темы или дождитесь подготовки кроссворда."
+                " Если хотите прервать, отправьте /cancel."
+            )
+        else:
+            logger.debug(
+                "Ignoring inline answer while chat %s in mode %s",
+                chat.id if chat else None,
+                current_mode,
+            )
+        return
+    if not is_chat_mode_set(context) and "new_game_language" in context.user_data:
         chat_id = chat.id if chat else None
         if chat is None or message is None:
             logger.info(
@@ -1740,26 +1837,6 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 extra={"chat_id": chat_id, "has_message": message is not None},
             )
             return
-
-        if chat_id in state.generating_chats:
-            logger.info(
-                "Skipping inline answer: setup or generation is in progress",
-                extra={
-                    "chat_id": chat_id,
-                    "message_id": message.message_id,
-                    "generating": True,
-                },
-            )
-        else:
-            logger.info(
-                "Skipping inline answer: language/theme selection is in progress",
-                extra={
-                    "chat_id": chat_id,
-                    "message_id": message.message_id,
-                    "generating": False,
-                },
-            )
-
         await message.reply_text(
             "Сначала завершите выбор языка/темы или дождитесь подготовки кроссворда."
             " Если хотите прервать, отправьте /cancel."
@@ -1831,6 +1908,9 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat is None or message is None:
         return
     logger.debug("Chat %s requested /hint", chat.id)
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        await message.reply_text("Нет активной игры. Используйте /new.")
+        return
 
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
@@ -1921,6 +2001,9 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat is None or message is None:
         return
     logger.debug("Chat %s requested /solve", chat.id)
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        await message.reply_text("Нет активной игры.")
+        return
 
     game_state = _load_state_for_chat(chat.id)
     if not game_state:
@@ -1955,6 +2038,7 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         solved_lines = "\n".join(f"{slot_id}: {answer}" for slot_id, answer in solved_now)
         await message.reply_text(f"Оставшиеся ответы:\n{solved_lines}")
+        set_chat_mode(context, MODE_IDLE)
         await _send_completion_options(context, chat.id, message, puzzle)
         logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
 
@@ -1969,6 +2053,10 @@ async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     logger.info("Chat %s requested /quit", chat.id)
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+        set_chat_mode(context, MODE_IDLE)
+        await message.reply_text("Нет активной игры. Используйте /new, чтобы начать новую сессию.")
+        return
     game_state = _load_state_for_chat(chat.id)
 
     _cancel_reminder(context)
@@ -1978,6 +2066,7 @@ async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         _cleanup_chat_resources(chat.id)
 
+    set_chat_mode(context, MODE_IDLE)
     await message.reply_text("Сессия завершена. Нажмите /start, чтобы начать заново")
 
 
@@ -1992,6 +2081,13 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         return
     chat = update.effective_chat
     if chat is None:
+        return
+    current_mode = get_chat_mode(context)
+    if is_chat_mode_set(context) and current_mode == MODE_IN_GAME:
+        logger.debug(
+            "Ignoring completion callback while chat %s in active game mode",
+            chat.id,
+        )
         return
 
     data = (query.data or "").strip()
@@ -2039,6 +2135,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             return
         _cancel_reminder(context)
         _cleanup_game_state(game_state)
+        set_chat_mode(context, MODE_AWAIT_THEME)
         await _send_generation_notice(
             context,
             chat.id,
@@ -2065,8 +2162,10 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             return
         finally:
             state.generating_chats.discard(chat.id)
+        set_chat_mode(context, MODE_IN_GAME)
         delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
         if not delivered:
+            set_chat_mode(context, MODE_IDLE)
             _cleanup_game_state(new_state)
             _clear_generation_notice(context, chat.id)
             await context.bot.send_message(
@@ -2093,6 +2192,7 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         _cancel_reminder(context)
         context.user_data.pop("new_game_language", None)
         context.chat_data[BUTTON_NEW_GAME_KEY] = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
+        set_chat_mode(context, MODE_AWAIT_LANGUAGE)
         await context.bot.send_message(
             chat_id=chat.id,
             text="Выберите язык кроссворда (например: ru, en, it, es).",
