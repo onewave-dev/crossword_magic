@@ -110,6 +110,11 @@ class GameState:
     dummy_user_id: int | None = None
     language: str | None = None
     theme: str | None = None
+    active_slot_id: str | None = None
+    turn_timer_job_id: str | None = None
+    turn_warn_job_id: str | None = None
+    game_timer_job_id: str | None = None
+    game_warn_job_id: str | None = None
 
     def __post_init__(self) -> None:
         self.game_id = str(self.game_id or self.chat_id)
@@ -181,6 +186,20 @@ class GameState:
         self.hints_used = hints_normalised
         self.timer_job_id = str(self.timer_job_id) if self.timer_job_id else None
         self.warn_job_id = str(self.warn_job_id) if self.warn_job_id else None
+        self.turn_timer_job_id = (
+            str(self.turn_timer_job_id) if self.turn_timer_job_id else None
+        )
+        self.turn_warn_job_id = (
+            str(self.turn_warn_job_id) if self.turn_warn_job_id else None
+        )
+        self.game_timer_job_id = (
+            str(self.game_timer_job_id) if self.game_timer_job_id else None
+        )
+        self.game_warn_job_id = (
+            str(self.game_warn_job_id) if self.game_warn_job_id else None
+        )
+        if self.active_slot_id:
+            self.active_slot_id = str(self.active_slot_id)
         self.join_codes = {
             str(code): str(target)
             for code, target in dict(self.join_codes).items()
