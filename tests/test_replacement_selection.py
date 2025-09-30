@@ -76,6 +76,66 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
     assert game_state.chat_id == 1
 
 
+def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
+    """Select the replacement with the strongest letter connectivity."""
+
+    base_clues = [
+        WordClue(word="BRIDGE", clue="structure"),
+        WordClue(word="BRICK", clue="material"),
+        WordClue(word="MORTAR", clue="binder"),
+        WordClue(word="COLUMN", clue="support"),
+        WordClue(word="BEAM", clue="frame"),
+        WordClue(word="ROOF", clue="top"),
+        WordClue(word="WINDOW", clue="opening"),
+        WordClue(word="DOOR", clue="entry"),
+        WordClue(word="STAIRS", clue="steps"),
+        WordClue(word="LADDER", clue="access"),
+    ]
+    replacement_candidates = [
+        WordClue(word="ROAD", clue="path"),
+        WordClue(word="BOARD", clue="panel"),
+        WordClue(word="TILE", clue="cover"),
+    ]
+
+    call_state: dict[str, object] = {"attempts": 0, "final_words": None}
+
+    def fake_generate_clues(theme: str, language: str):
+        if "вместо" in theme:
+            return replacement_candidates
+        return base_clues
+
+    def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
+        return list(clues)
+
+    def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
+        call_state["attempts"] = call_state.get("attempts", 0) + 1
+        if call_state["attempts"] == 1:
+            raise DisconnectedWordError("BRIDGE")
+        call_state["final_words"] = list(words)
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
+
+    monkeypatch.setattr("app.generate_clues", fake_generate_clues)
+    monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
+    monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
+    monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
+
+    _generate_puzzle(chat_id=1, language="en", theme="Space")
+
+    assert call_state["attempts"] == 2
+    assert isinstance(call_state["final_words"], list)
+    assert "BOARD" in call_state["final_words"]
+    assert "ROAD" not in call_state["final_words"]
+    assert len(call_state["final_words"]) == len(base_clues)
+
+
 def test_replacement_attempt_cap(monkeypatch) -> None:
     """Abort replacement requests after hitting the configured cap."""
 
