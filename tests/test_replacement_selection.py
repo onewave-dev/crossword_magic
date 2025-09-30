@@ -229,10 +229,10 @@ def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
     assert len(call_state["final_words"]) == len(base_clues)
 
 
-def test_replacement_attempt_cap(monkeypatch) -> None:
-    """Abort replacement requests after hitting the configured cap."""
+def test_replacement_cap_triggers_regeneration(monkeypatch) -> None:
+    """Exhausting replacements should restart clue generation instead of failing."""
 
-    base_clues = [
+    initial_clues = [
         WordClue(word="AAAA", clue="first"),
         WordClue(word="BBBB", clue="second"),
         WordClue(word="CCCCC", clue="third"),
@@ -244,8 +244,17 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
         WordClue(word="IIIII", clue="ninth"),
         WordClue(word="JJJJJ", clue="tenth"),
     ]
+    refreshed_clues = [
+        WordClue(word=f"NEWS{i}", clue=f"fresh {i}") for i in range(1, 11)
+    ]
+    replacement_candidates = [WordClue(word="AAAA", clue="duplicate")]
 
-    call_counts = {"base": 0, "replacement": 0, "theme": None}
+    call_counts = {
+        "base": 0,
+        "replacement": 0,
+        "final_words": None,
+        "fill_in_attempts": 0,
+    }
 
     def fake_generate_clues(
         theme: str,
@@ -257,32 +266,54 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
         if "вместо" in theme:
             assert (min_results, max_results) == (6, 8)
             call_counts["replacement"] += 1
-            if call_counts["theme"] is None:
-                call_counts["theme"] = theme
-                assert "Подбери 6-8 новых слов" in theme
-                assert "Избегай слов:" in theme
-            return [WordClue(word="AAAA", clue="duplicate")]
-        call_counts["base"] += 1
+            return replacement_candidates
         assert (min_results, max_results) == (10, 40)
-        return base_clues
+        call_counts["base"] += 1
+        return initial_clues if call_counts["base"] == 1 else refreshed_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
         return list(clues)
 
+    def fake_build_word_components(clues, language):
+        return [list(clues)]
+
+    def fake_select_connected_clue_set(components, language, size):
+        if not components:
+            return []
+        component = list(components[0])
+        if len(component) < size:
+            return None
+        return component[:size]
+
     def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
-        raise DisconnectedWordError("AAAA")
+        call_counts["fill_in_attempts"] += 1
+        if call_counts["base"] == 1:
+            raise DisconnectedWordError("AAAA")
+        call_counts["final_words"] = list(words)
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
 
     monkeypatch.setattr("app.generate_clues", fake_generate_clues)
     monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app._build_word_components", fake_build_word_components)
+    monkeypatch.setattr(
+        "app._select_connected_clue_set", fake_select_connected_clue_set
+    )
     monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
     monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
     monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
     monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
     monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
 
-    with pytest.raises(RuntimeError):
-        _generate_puzzle(chat_id=1, language="en", theme="Space")
+    puzzle, state = _generate_puzzle(chat_id=1, language="en", theme="Space")
 
-    assert call_counts["base"] == 1
+    assert call_counts["base"] == 2
     assert call_counts["replacement"] == MAX_REPLACEMENT_REQUESTS
-    assert call_counts["theme"] is not None
+    assert call_counts["fill_in_attempts"] == 2
+    assert call_counts["final_words"] == [clue.word for clue in refreshed_clues]
+    assert puzzle.language == "en"
+    assert state.chat_id == 1

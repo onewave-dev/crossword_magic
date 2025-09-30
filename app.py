@@ -2178,263 +2178,312 @@ def _generate_puzzle(
             language,
             theme,
         )
-        clues = generate_clues(theme=theme, language=language)
-        logger.info("Received %s raw clues from LLM", len(clues))
-        validated_clues = validate_word_list(language, clues, deduplicate=True)
-        logger.info("Validated %s clues for placement", len(validated_clues))
-        word_components = _build_word_components(validated_clues, language)
-        logger.debug(
-            "Identified %s connected word components after validation",
-            len(word_components),
-        )
-        if not validated_clues:
-            raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
-
-        max_attempt_words = min(len(validated_clues), 80)
-        dynamic_floor = int(max_attempt_words * 0.6)
-        min_attempt_words = min(
-            max_attempt_words,
-            max(8, min(30, dynamic_floor)),
-        )
-
+        validated_clues: list[WordClue] = []
+        word_components: list[list[WordClue]] = []
+        fallback_component: list[WordClue] | None = None
+        max_attempt_words = 0
+        min_attempt_words = 0
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
-        used_canonical_words: set[str] = {
-            _canonical_answer(clue.word, language) for clue in validated_clues
-        }
+        used_canonical_words: set[str] = set()
         replacement_requests = 0
+        need_refresh = True
 
-        def request_replacement(
-            word: str, attempt_clues: Sequence[WordClue]
-        ) -> WordClue | None:
-            nonlocal replacement_requests
-            canonical = _canonical_answer(word, language)
-            replacement_prompt_words.add(canonical)
-            other_letters: set[str] = set()
-            other_letter_sets: list[set[str]] = []
-            for clue in attempt_clues:
-                if _canonical_answer(clue.word, language) == canonical:
-                    continue
-                letters = _canonical_letter_set(clue.word, language)
-                other_letters.update(letters)
-                other_letter_sets.append(letters)
-            other_letters_text = ", ".join(sorted(other_letters))
-            while True:
-                if replacement_requests >= MAX_REPLACEMENT_REQUESTS:
-                    logger.warning(
-                        "Reached maximum replacement requests (%s) while trying to replace %s",
-                        MAX_REPLACEMENT_REQUESTS,
-                        word,
-                    )
-                    return None
-                replacement_requests += 1
-                prompt_suffix = ", ".join(sorted(replacement_prompt_words))
-                avoided_words_text = ", ".join(sorted(used_canonical_words))
-                letter_clause = (
-                    f"Каждое слово должно содержать хотя бы одну букву из: {other_letters_text}."
-                    if other_letters_text
-                    else "Предложи новые слова без повторов."
-                )
-                replacement_theme = (
-                    f"{theme}. Подбери 6-8 новых слов для кроссворда вместо: {prompt_suffix}. "
-                    f"{letter_clause} Избегай слов: {avoided_words_text}."
-                )
-                logger.debug(
-                    "Replacement prompt letters: %s; avoiding words: %s",
-                    other_letters_text or "—",
-                    avoided_words_text or "—",
-                )
-                logger.info(
-                    "Requesting replacement clues (attempt %s) for: %s",
-                    replacement_requests,
-                    prompt_suffix,
-                )
-                new_clues = generate_clues(
-                    theme=replacement_theme,
-                    language=language,
-                    min_results=6,
-                    max_results=8,
-                )
-                new_validated = validate_word_list(language, new_clues, deduplicate=True)
-                logger.info(
-                    "Validated %s replacement candidates", len(new_validated)
-                )
-                scored_candidates: list[tuple[int, int, str, WordClue]] = []
-                for candidate in new_validated:
-                    candidate_canonical = _canonical_answer(candidate.word, language)
-                    if candidate_canonical in used_canonical_words:
+        class RestartGeneration(Exception):
+            """Sentinel used to restart base clue generation."""
+
+        def refresh_clues() -> None:
+            nonlocal validated_clues, word_components, fallback_component
+            nonlocal max_attempt_words, min_attempt_words, attempted_component_split
+            nonlocal replacement_prompt_words, used_canonical_words, replacement_requests
+            nonlocal need_refresh
+
+            clues = generate_clues(theme=theme, language=language)
+            logger.info("Received %s raw clues from LLM", len(clues))
+            new_validated = validate_word_list(language, clues, deduplicate=True)
+            logger.info("Validated %s clues for placement", len(new_validated))
+            if not new_validated:
+                raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
+
+            validated_clues = new_validated
+            word_components = _build_word_components(validated_clues, language)
+            logger.debug(
+                "Identified %s connected word components after validation",
+                len(word_components),
+            )
+
+            max_attempt_words = min(len(validated_clues), 80)
+            dynamic_floor = int(max_attempt_words * 0.6)
+            min_attempt_words = min(
+                max_attempt_words,
+                max(8, min(30, dynamic_floor)),
+            )
+
+            attempted_component_split = False
+            replacement_prompt_words = set()
+            used_canonical_words = {
+                _canonical_answer(clue.word, language) for clue in validated_clues
+            }
+            replacement_requests = 0
+
+            fallback_component = None
+            if word_components:
+                largest_component = max(word_components, key=len)
+                fallback_size = min(len(largest_component), max_attempt_words)
+                fallback_component = list(largest_component[:fallback_size])
+
+            need_refresh = False
+
+        while True:
+            if need_refresh:
+                refresh_clues()
+
+            restart_generation = False
+
+            def request_replacement(
+                word: str, attempt_clues: Sequence[WordClue]
+            ) -> WordClue | None:
+                nonlocal replacement_requests, replacement_prompt_words
+                nonlocal used_canonical_words, restart_generation
+                canonical = _canonical_answer(word, language)
+                replacement_prompt_words.add(canonical)
+                other_letters: set[str] = set()
+                other_letter_sets: list[set[str]] = []
+                for clue in attempt_clues:
+                    if _canonical_answer(clue.word, language) == canonical:
                         continue
-                    candidate_letters = _canonical_letter_set(candidate.word, language)
-                    if other_letters and not (candidate_letters & other_letters):
-                        logger.debug(
-                            "Skipping replacement %s: no shared letters with current attempt",
-                            candidate.word,
-                        )
-                        continue
-                    score = (
-                        len(candidate_letters & other_letters)
-                        if other_letters
-                        else sum(
-                            len(candidate_letters & letters)
-                            for letters in other_letter_sets
-                        )
-                    )
-                    scored_candidates.append(
-                        (score, len(candidate_canonical), candidate.word, candidate)
-                    )
-
-                for score, _, _, candidate in sorted(
-                    scored_candidates,
-                    key=lambda item: (-item[0], -item[1], item[2]),
-                ):
-                    candidate_canonical = _canonical_answer(candidate.word, language)
-                    used_canonical_words.add(candidate_canonical)
-                    logger.debug(
-                        "Selected replacement %s with score %s",
-                        candidate.word,
-                        score,
-                    )
-                    return candidate
-                logger.warning(
-                    "Replacement attempt %s did not provide new unique words",
-                    replacement_requests,
-                )
-
-
-        fallback_component: list[WordClue] | None = None
-        if word_components:
-            largest_component = max(word_components, key=len)
-            fallback_size = min(len(largest_component), max_attempt_words)
-            fallback_component = list(largest_component[:fallback_size])
-
-        def attempt_generation(
-            candidate_clues: Sequence[WordClue], limit: int
-        ) -> tuple[Puzzle | CompositePuzzle, GameState] | None:
-            nonlocal attempted_component_split
-            puzzle_id = uuid4().hex
-            with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
-                attempt_clues = list(candidate_clues)
+                    letters = _canonical_letter_set(clue.word, language)
+                    other_letters.update(letters)
+                    other_letter_sets.append(letters)
+                other_letters_text = ", ".join(sorted(other_letters))
                 while True:
-                    try:
-                        puzzle = generate_fill_in_puzzle(
-                            puzzle_id=puzzle_id,
-                            theme=theme,
-                            language=language,
-                            words=[clue.word for clue in attempt_clues],
-                            max_size=MAX_PUZZLE_SIZE,
+                    if replacement_requests >= MAX_REPLACEMENT_REQUESTS:
+                        logger.warning(
+                            "Reached maximum replacement requests (%s) while trying to replace %s",
+                            MAX_REPLACEMENT_REQUESTS,
+                            word,
                         )
-                    except DisconnectedWordError as disconnected:
-                        logger.info(
-                            "Word %s could not be connected, requesting replacement",
-                            disconnected.word,
-                        )
-                        replacement = request_replacement(
-                            disconnected.word, attempt_clues
-                        )
-                        if replacement is None:
+                        replacement_prompt_words.clear()
+                        replacement_requests = 0
+                        refresh_clues()
+                        restart_generation = True
+                        return None
+                    replacement_requests += 1
+                    prompt_suffix = ", ".join(sorted(replacement_prompt_words))
+                    avoided_words_text = ", ".join(sorted(used_canonical_words))
+                    letter_clause = (
+                        f"Каждое слово должно содержать хотя бы одну букву из: {other_letters_text}."
+                        if other_letters_text
+                        else "Предложи новые слова без повторов."
+                    )
+                    replacement_theme = (
+                        f"{theme}. Подбери 6-8 новых слов для кроссворда вместо: {prompt_suffix}. "
+                        f"{letter_clause} Избегай слов: {avoided_words_text}."
+                    )
+                    logger.debug(
+                        "Replacement prompt letters: %s; avoiding words: %s",
+                        other_letters_text or "—",
+                        avoided_words_text or "—",
+                    )
+                    logger.info(
+                        "Requesting replacement clues (attempt %s) for: %s",
+                        replacement_requests,
+                        prompt_suffix,
+                    )
+                    new_clues = generate_clues(
+                        theme=replacement_theme,
+                        language=language,
+                        min_results=6,
+                        max_results=8,
+                    )
+                    new_validated = validate_word_list(language, new_clues, deduplicate=True)
+                    logger.info(
+                        "Validated %s replacement candidates", len(new_validated)
+                    )
+                    scored_candidates: list[tuple[int, int, str, WordClue]] = []
+                    for candidate in new_validated:
+                        candidate_canonical = _canonical_answer(candidate.word, language)
+                        if candidate_canonical in used_canonical_words:
+                            continue
+                        candidate_letters = _canonical_letter_set(candidate.word, language)
+                        if other_letters and not (candidate_letters & other_letters):
                             logger.debug(
-                                "No replacement available for %s, abandoning attempt",
+                                "Skipping replacement %s: no shared letters with current attempt",
+                                candidate.word,
+                            )
+                            continue
+                        score = (
+                            len(candidate_letters & other_letters)
+                            if other_letters
+                            else sum(
+                                len(candidate_letters & letters)
+                                for letters in other_letter_sets
+                            )
+                        )
+                        scored_candidates.append(
+                            (score, len(candidate_canonical), candidate.word, candidate)
+                        )
+
+                    for score, _, _, candidate in sorted(
+                        scored_candidates,
+                        key=lambda item: (-item[0], -item[1], item[2]),
+                    ):
+                        candidate_canonical = _canonical_answer(candidate.word, language)
+                        used_canonical_words.add(candidate_canonical)
+                        logger.debug(
+                            "Selected replacement %s with score %s",
+                            candidate.word,
+                            score,
+                        )
+                        return candidate
+                    logger.warning(
+                        "Replacement attempt %s did not provide new unique words",
+                        replacement_requests,
+                    )
+
+            def attempt_generation(
+                candidate_clues: Sequence[WordClue], limit: int
+            ) -> tuple[Puzzle | CompositePuzzle, GameState] | None:
+                nonlocal attempted_component_split, restart_generation
+                puzzle_id = uuid4().hex
+                with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
+                    attempt_clues = list(candidate_clues)
+                    while True:
+                        try:
+                            puzzle = generate_fill_in_puzzle(
+                                puzzle_id=puzzle_id,
+                                theme=theme,
+                                language=language,
+                                words=[clue.word for clue in attempt_clues],
+                                max_size=MAX_PUZZLE_SIZE,
+                            )
+                        except DisconnectedWordError as disconnected:
+                            logger.info(
+                                "Word %s could not be connected, requesting replacement",
                                 disconnected.word,
                             )
-                            break
-                        target_canonical = _canonical_answer(
-                            disconnected.word, language
-                        )
-                        for idx, clue in enumerate(attempt_clues):
-                            if (
-                                _canonical_answer(clue.word, language)
-                                == target_canonical
-                            ):
-                                attempt_clues[idx] = replacement
-                                break
-                        else:
-                            attempt_clues.append(replacement)
-                        continue
-                    except FillInGenerationError as error:
-                        logger.debug(
-                            "Attempt with %s words failed to build grid: %s",
-                            limit,
-                            error,
-                        )
-                        if (
-                            not attempted_component_split
-                            and limit == max_attempt_words
-                            and len(validated_clues) > 1
-                        ):
-                            components = word_components
-                            attempted_component_split = True
-                            if len(components) > 1:
-                                logger.info(
-                                    "Detected %s disconnected word clusters, generating composite puzzle",
-                                    len(components),
-                                )
-                                try:
-                                    composite, game_state = _generate_composite(
-                                        chat_id, language, theme, components
-                                    )
-                                except FillInGenerationError as composite_error:
+                            replacement = request_replacement(
+                                disconnected.word, attempt_clues
+                            )
+                            if replacement is None:
+                                if restart_generation:
                                     logger.debug(
-                                        "Composite generation failed: %s", composite_error
+                                        "Replacement attempts exhausted, restarting base clue generation",
                                     )
                                 else:
+                                    logger.debug(
+                                        "No replacement available for %s, abandoning attempt",
+                                        disconnected.word,
+                                    )
+                                break
+                            target_canonical = _canonical_answer(
+                                disconnected.word, language
+                            )
+                            for idx, clue in enumerate(attempt_clues):
+                                if (
+                                    _canonical_answer(clue.word, language)
+                                    == target_canonical
+                                ):
+                                    attempt_clues[idx] = replacement
+                                    break
+                            else:
+                                attempt_clues.append(replacement)
+                            continue
+                        except FillInGenerationError as error:
+                            logger.debug(
+                                "Attempt with %s words failed to build grid: %s",
+                                limit,
+                                error,
+                            )
+                            if (
+                                not attempted_component_split
+                                and limit == max_attempt_words
+                                and len(validated_clues) > 1
+                            ):
+                                components = word_components
+                                attempted_component_split = True
+                                if len(components) > 1:
                                     logger.info(
-                                        "Generated composite puzzle with %s components",
+                                        "Detected %s disconnected word clusters, generating composite puzzle",
                                         len(components),
                                     )
-                                    _store_state(game_state)
-                                    return composite, game_state
-                        break
-                    else:
-                        logger.info(
-                            "Constructed dynamic puzzle grid using %s candidate words",
-                            len(attempt_clues),
-                        )
-                        _assign_clues_to_slots(puzzle, attempt_clues)
-                        save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
-                        now = time.time()
-                        game_state = GameState(
-                            chat_id=chat_id,
-                            puzzle_id=puzzle.id,
-                            puzzle_ids=None,
-                            filled_cells={},
-                            solved_slots=set(),
-                            score=0,
-                            started_at=now,
-                            last_update=now,
-                            hinted_cells=set(),
-                            host_id=chat_id,
-                            game_id=str(chat_id),
-                            scoreboard={chat_id: 0},
-                        )
-                        _store_state(game_state)
-                        logger.info("Generated puzzle ready for delivery")
-                        return puzzle, game_state
-            return None
+                                    try:
+                                        composite, game_state = _generate_composite(
+                                            chat_id, language, theme, components
+                                        )
+                                    except FillInGenerationError as composite_error:
+                                        logger.debug(
+                                            "Composite generation failed: %s", composite_error
+                                        )
+                                    else:
+                                        logger.info(
+                                            "Generated composite puzzle with %s components",
+                                            len(components),
+                                        )
+                                        _store_state(game_state)
+                                        return composite, game_state
+                            break
+                        else:
+                            logger.info(
+                                "Constructed dynamic puzzle grid using %s candidate words",
+                                len(attempt_clues),
+                            )
+                            _assign_clues_to_slots(puzzle, attempt_clues)
+                            save_puzzle(puzzle.id, puzzle_to_dict(puzzle))
+                            now = time.time()
+                            game_state = GameState(
+                                chat_id=chat_id,
+                                puzzle_id=puzzle.id,
+                                puzzle_ids=None,
+                                filled_cells={},
+                                solved_slots=set(),
+                                score=0,
+                                started_at=now,
+                                last_update=now,
+                                hinted_cells=set(),
+                                host_id=chat_id,
+                                game_id=str(chat_id),
+                                scoreboard={chat_id: 0},
+                            )
+                            _store_state(game_state)
+                            logger.info("Generated puzzle ready for delivery")
+                            return puzzle, game_state
+                    if restart_generation:
+                        raise RestartGeneration
+                    return None
 
-        for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-            candidate_clues = _select_connected_clue_set(
-                word_components, language, limit
-            )
-            if not candidate_clues:
-                logger.debug(
-                    "Skipping attempt with %s words: no connected subset available",
-                    limit,
-                )
+            try:
+                for limit in range(max_attempt_words, min_attempt_words - 1, -1):
+                    candidate_clues = _select_connected_clue_set(
+                        word_components, language, limit
+                    )
+                    if not candidate_clues:
+                        logger.debug(
+                            "Skipping attempt with %s words: no connected subset available",
+                            limit,
+                        )
+                        continue
+                    result = attempt_generation(candidate_clues, limit)
+                    if result is not None:
+                        return result
+            except RestartGeneration:
                 continue
-            result = attempt_generation(candidate_clues, limit)
-            if result is not None:
-                return result
 
-        if fallback_component:
-            logger.debug(
-                "Falling back to largest connected component with %s words",
-                len(fallback_component),
-            )
-            result = attempt_generation(fallback_component, len(fallback_component))
-            if result is not None:
-                return result
+            if fallback_component:
+                logger.debug(
+                    "Falling back to largest connected component with %s words",
+                    len(fallback_component),
+                )
+                try:
+                    result = attempt_generation(
+                        fallback_component, len(fallback_component)
+                    )
+                except RestartGeneration:
+                    continue
+                if result is not None:
+                    return result
 
-        raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
+            raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
 
 # ---------------------------------------------------------------------------
