@@ -33,13 +33,14 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
 
     def fake_generate_clues(theme: str, language: str):
         if "вместо" in theme:
+            call_state["theme"] = theme
             return replacement_candidates
         return base_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
         return list(clues)
 
-    call_state: dict[str, object] = {"count": 0, "words": None}
+    call_state: dict[str, object] = {"count": 0, "words": None, "theme": None}
 
     def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
         call_state["count"] += 1
@@ -67,6 +68,10 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
     assert call_state["words"][0] == "BOLT"
     assert "ZZZZ" not in call_state["words"]
     assert len(call_state["words"]) == len(base_clues)
+    assert call_state["theme"] is not None
+    assert "Подбери 6-8 новых слов" in call_state["theme"]
+    assert "Избегай слов:" in call_state["theme"]
+    assert "Каждое слово должно содержать хотя бы одну букву" in call_state["theme"]
     assert puzzle.language == "en"
     assert game_state.chat_id == 1
 
@@ -87,11 +92,15 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
         WordClue(word="JJJJJ", clue="tenth"),
     ]
 
-    call_counts = {"base": 0, "replacement": 0}
+    call_counts = {"base": 0, "replacement": 0, "theme": None}
 
     def fake_generate_clues(theme: str, language: str):
         if "вместо" in theme:
             call_counts["replacement"] += 1
+            if call_counts["theme"] is None:
+                call_counts["theme"] = theme
+                assert "Подбери 6-8 новых слов" in theme
+                assert "Избегай слов:" in theme
             return [WordClue(word="AAAA", clue="duplicate")]
         call_counts["base"] += 1
         return base_clues
@@ -115,3 +124,4 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
 
     assert call_counts["base"] == 1
     assert call_counts["replacement"] == MAX_REPLACEMENT_REQUESTS
+    assert call_counts["theme"] is not None

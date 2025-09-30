@@ -2211,6 +2211,7 @@ def _generate_puzzle(
                 if _canonical_answer(clue.word, language) == canonical:
                     continue
                 other_letters.update(_canonical_letter_set(clue.word, language))
+            other_letters_text = ", ".join(sorted(other_letters))
             while True:
                 if replacement_requests >= MAX_REPLACEMENT_REQUESTS:
                     logger.warning(
@@ -2221,8 +2222,20 @@ def _generate_puzzle(
                     return None
                 replacement_requests += 1
                 prompt_suffix = ", ".join(sorted(replacement_prompt_words))
+                avoided_words_text = ", ".join(sorted(used_canonical_words))
+                letter_clause = (
+                    f"Каждое слово должно содержать хотя бы одну букву из: {other_letters_text}."
+                    if other_letters_text
+                    else "Предложи новые слова без повторов."
+                )
                 replacement_theme = (
-                    f"{theme}. Подбери альтернативные слова для кроссворда вместо: {prompt_suffix}."
+                    f"{theme}. Подбери 6-8 новых слов для кроссворда вместо: {prompt_suffix}. "
+                    f"{letter_clause} Избегай слов: {avoided_words_text}."
+                )
+                logger.debug(
+                    "Replacement prompt letters: %s; avoiding words: %s",
+                    other_letters_text or "—",
+                    avoided_words_text or "—",
                 )
                 logger.info(
                     "Requesting replacement clues (attempt %s) for: %s",
