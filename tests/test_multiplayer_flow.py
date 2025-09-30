@@ -894,6 +894,75 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_admin_test_game_recovers_from_stale_mapping(monkeypatch, fresh_state):
+    state.settings = SimpleNamespace(admin_id=700)
+    puzzle = _make_turn_puzzle()
+    base_state = _make_turn_state(-941, puzzle)
+    base_state.status = "lobby"
+    stale_game_id = f"admin:{base_state.chat_id}"
+    state.chat_to_game[base_state.chat_id] = stale_game_id
+
+    load_calls: list[str | int] = []
+
+    def fake_load(identifier):  # noqa: ANN001 - mimics utils.storage.load_state
+        load_calls.append(identifier)
+        if identifier == stale_game_id:
+            return None
+        if identifier == base_state.chat_id or str(identifier) == str(base_state.chat_id):
+            return base_state
+        return None
+
+    monkeypatch.setattr(app, "load_state", fake_load)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_clone_puzzle_for_test", lambda _p: (puzzle, "clone", None))
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: None)
+    cleanup_mock = MagicMock()
+    monkeypatch.setattr(app, "_cleanup_game_state", cleanup_mock)
+    monkeypatch.setattr(app, "_schedule_game_timers", lambda *args, **kwargs: None)
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+
+    stored_states: list[GameState] = []
+
+    def fake_store(gs: GameState) -> None:
+        stored_states.append(gs)
+        state.active_games[gs.game_id] = gs
+        state.chat_to_game[gs.chat_id] = gs.game_id
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+
+    job_queue = DummyJobQueue()
+    bot = SimpleNamespace(send_message=AsyncMock())
+    context = SimpleNamespace(bot=bot, job_queue=job_queue, chat_data={})
+    query_message = SimpleNamespace(
+        chat=SimpleNamespace(id=base_state.chat_id, type=ChatType.GROUP),
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    query = SimpleNamespace(
+        data=f"{app.ADMIN_TEST_GAME_CALLBACK_PREFIX}{base_state.chat_id}",
+        answer=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=700, full_name="Админ", username="admin"),
+        effective_chat=query_message.chat,
+        effective_message=query_message,
+    )
+
+    await app.admin_test_game_callback_handler(update, context)
+
+    assert load_calls and load_calls[0] == stale_game_id
+    assert len(load_calls) >= 2 and str(load_calls[1]) == str(base_state.chat_id)
+    assert state.active_games.get(base_state.game_id) is base_state
+    assert stored_states and stored_states[-1].game_id.startswith("admin:")
+    announce_mock.assert_awaited()
+    query.answer.assert_awaited_with("Тестовая игра запущена!")
+    cleanup_mock.assert_not_called()
+
+
+@pytest.mark.anyio
 async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog):
     puzzle = _make_turn_puzzle()
     puzzle.slots = puzzle.slots[:1]
