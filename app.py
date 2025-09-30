@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import html
 import os
+import random
 import re
 import secrets
+import string
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -241,6 +243,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         _cancel_job(game_state.turn_warn_job_id)
         _cancel_job(game_state.game_timer_job_id)
         _cancel_job(game_state.game_warn_job_id)
+        _cancel_job(game_state.dummy_job_id)
         state.generating_chats.discard(game_state.chat_id)
         state.chat_to_game.pop(game_state.chat_id, None)
         state.active_games.pop(game_state.game_id, None)
@@ -319,6 +322,46 @@ TURN_SLOT_CALLBACK_PREFIX = "turn_slot:"
 
 MAX_PUZZLE_SIZE = 15
 MAX_REPLACEMENT_REQUESTS = 30
+
+_ADMIN_FIRST_RAW = os.getenv("ADMIN_FIRST", "false").strip().lower()
+ADMIN_FIRST = _ADMIN_FIRST_RAW in {"1", "true", "yes", "on"}
+
+try:
+    DUMMY_ACCURACY = float(os.getenv("DUMMY_ACCURACY", "0.8"))
+except ValueError:
+    DUMMY_ACCURACY = 0.8
+DUMMY_ACCURACY = min(max(DUMMY_ACCURACY, 0.0), 1.0)
+
+_DEFAULT_DELAY_MIN = 3.0
+_DEFAULT_DELAY_MAX = 8.0
+delay_env = os.getenv("DUMMY_DELAY_RANGE")
+if delay_env:
+    parts = [part.strip() for part in delay_env.split(",") if part.strip()]
+    if len(parts) >= 2:
+        try:
+            delay_min = float(parts[0])
+            delay_max = float(parts[1])
+        except ValueError:
+            delay_min, delay_max = _DEFAULT_DELAY_MIN, _DEFAULT_DELAY_MAX
+    else:
+        try:
+            single = float(parts[0])
+            delay_min = max(0.1, single)
+            delay_max = delay_min
+        except (IndexError, ValueError):
+            delay_min, delay_max = _DEFAULT_DELAY_MIN, _DEFAULT_DELAY_MAX
+else:
+    delay_min, delay_max = _DEFAULT_DELAY_MIN, _DEFAULT_DELAY_MAX
+if delay_max < delay_min:
+    delay_min, delay_max = delay_max, delay_min
+delay_min = max(0.1, delay_min)
+delay_max = max(delay_min, delay_max)
+DUMMY_DELAY_RANGE = (delay_min, delay_max)
+
+DUMMY_USER_ID = -1
+DUMMY_NAME = "Dummy"
+
+ADMIN_TEST_GAME_CALLBACK_PREFIX = "admin_test:"
 
 
 def get_chat_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -620,6 +663,13 @@ def _cancel_game_timers(game_state: GameState) -> None:
     game_state.game_warn_job_id = None
 
 
+def _cancel_dummy_job(game_state: GameState) -> None:
+    _cancel_job(game_state.dummy_job_id)
+    game_state.dummy_job_id = None
+    game_state.dummy_turn_started_at = None
+    game_state.dummy_planned_delay = 0.0
+
+
 def _schedule_game_timers(
     context: ContextTypes.DEFAULT_TYPE, game_state: GameState
 ) -> None:
@@ -683,6 +733,240 @@ def _schedule_turn_timers(
     game_state.turn_timer_job_id = timeout_name
 
 
+def _schedule_dummy_turn(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    puzzle: Puzzle | CompositePuzzle,
+) -> None:
+    if not (game_state.test_mode and context.job_queue):
+        _cancel_dummy_job(game_state)
+        return
+    player = _current_player(game_state)
+    if (
+        player is None
+        or player.user_id != game_state.dummy_user_id
+        or not player.is_bot
+        or not _iter_available_slots(puzzle, game_state)
+    ):
+        _cancel_dummy_job(game_state)
+        return
+    _cancel_dummy_job(game_state)
+    delay = random.uniform(*DUMMY_DELAY_RANGE)
+    job_name = f"dummy-turn-{game_state.game_id}"
+    data = {"game_id": game_state.game_id, "planned_delay": delay}
+    job = context.job_queue.run_once(
+        _dummy_turn_job,
+        delay,
+        chat_id=game_state.chat_id,
+        name=job_name,
+        data=data,
+    )
+    _remember_job(job)
+    game_state.dummy_job_id = job_name
+    game_state.dummy_turn_started_at = time.time()
+    game_state.dummy_planned_delay = delay
+    logger.debug(
+        "Scheduled dummy response in %.2f seconds for game %s", delay, game_state.game_id
+    )
+
+
+def _alphabet_for_language(language: str | None) -> str:
+    if not language:
+        return string.ascii_uppercase
+    normalised = language.lower()
+    if normalised == "ru":
+        return "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+    if normalised == "it":
+        return "AÁÀBCDEÈÉFGHIÌÍJKLMNOÒÓPQRSTUÙÚVWXYZ"
+    if normalised == "es":
+        return "AÁBCDEÉFGHIÍJKLMNÑOÓPQRSTUÚÜVWXYZ"
+    return string.ascii_uppercase
+
+
+def _generate_dummy_incorrect_answer(
+    slot_ref: SlotRef, language: str | None
+) -> str:
+    answer = slot_ref.slot.answer or ""
+    if not answer:
+        alphabet = _alphabet_for_language(language)
+        return "".join(random.choice(alphabet) for _ in range(slot_ref.slot.length))
+    letters = list(answer)
+    index = random.randrange(len(letters))
+    alphabet = _alphabet_for_language(language)
+    current_letter = letters[index]
+    candidates = [
+        ch for ch in alphabet if ch.upper() != current_letter.upper()
+    ]
+    if not candidates:
+        candidates = list(alphabet) or [current_letter or "X"]
+    replacement = random.choice(candidates)
+    if current_letter.islower():
+        replacement = replacement.lower()
+    letters[index] = replacement
+    candidate_word = "".join(letters)
+    if candidate_word.upper() == (answer or "").upper():
+        letters[index] = replacement.lower() if replacement.isupper() else replacement.upper()
+        candidate_word = "".join(letters)
+    return candidate_word
+
+
+def _select_dummy_slot(
+    game_state: GameState, puzzle: Puzzle | CompositePuzzle
+) -> SlotRef | None:
+    candidates: list[tuple[int, int, int, str, SlotRef]] = []
+    for ref in _iter_available_slots(puzzle, game_state):
+        revealed = 0
+        for row, col in ref.slot.coordinates():
+            key = _coord_key(row, col, ref.component_index)
+            if key in game_state.filled_cells:
+                revealed += 1
+        candidates.append(
+            (
+                revealed,
+                ref.slot.length,
+                ref.slot.number,
+                f"{ref.slot.direction.value}:{ref.public_id}",
+                ref,
+            )
+        )
+    if not candidates:
+        return None
+    min_revealed = min(entry[0] for entry in candidates)
+    filtered = [entry for entry in candidates if entry[0] == min_revealed]
+    if game_state.dummy_failures > game_state.dummy_successes:
+        filtered.sort(key=lambda entry: (entry[1], entry[2], entry[3]))
+    else:
+        filtered.sort(key=lambda entry: (entry[0], entry[1], entry[2], entry[3]))
+    return filtered[0][4]
+
+
+async def _dummy_turn_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    state.scheduled_jobs.pop(job.name, None)
+    data = job.data or {}
+    game_id = data.get("game_id")
+    planned_delay = float(data.get("planned_delay", 0.0) or 0.0)
+    if not game_id:
+        return
+    game_state = _load_state_by_game_id(game_id)
+    if (
+        not game_state
+        or game_state.status != "running"
+        or not game_state.test_mode
+        or game_state.dummy_user_id is None
+    ):
+        return
+    if game_state.dummy_job_id == job.name:
+        game_state.dummy_job_id = None
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        return
+    current_player = _current_player(game_state)
+    if (
+        current_player is None
+        or current_player.user_id != game_state.dummy_user_id
+        or not current_player.is_bot
+    ):
+        return
+    slot_ref = _select_dummy_slot(game_state, puzzle)
+    if slot_ref is None:
+        await _finish_game(
+            context,
+            game_state,
+            reason="Все слова разгаданы. Тест завершён.",
+        )
+        return
+    normalised_slot = _normalise_slot_id(slot_ref.public_id)
+    actual_delay = 0.0
+    if game_state.dummy_turn_started_at is not None:
+        actual_delay = max(0.0, time.time() - game_state.dummy_turn_started_at)
+    else:
+        actual_delay = max(planned_delay, 0.0)
+    attempt_success = random.random() <= DUMMY_ACCURACY
+    attempt_answer = (
+        slot_ref.slot.answer
+        if attempt_success
+        else _generate_dummy_incorrect_answer(slot_ref, puzzle.language)
+    )
+    dummy_player = game_state.players.get(game_state.dummy_user_id)
+    game_state.dummy_turns += 1
+    game_state.dummy_total_delay += actual_delay
+    game_state.dummy_turn_started_at = None
+    game_state.dummy_planned_delay = 0.0
+    info_prefix = (
+        f"🤖 {DUMMY_NAME}"
+        if dummy_player is None or not dummy_player.name
+        else f"🤖 {dummy_player.name}"
+    )
+    message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
+    try:
+        await context.bot.send_message(chat_id=game_state.chat_id, text=message_text)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to announce dummy answer attempt in game %s", game_state.game_id
+        )
+    log_result = "success" if attempt_success else "fail"
+    points = slot_ref.slot.length if attempt_success else 0
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        logger.info(
+            "Dummy turn: slot=%s delay=%.2fs result=%s points=%s",
+            normalised_slot,
+            actual_delay,
+            log_result,
+            points,
+        )
+    game_state.last_update = time.time()
+    if attempt_success:
+        game_state.dummy_successes += 1
+        game_state.score += slot_ref.slot.length
+        _record_score(game_state, slot_ref.slot.length, user_id=game_state.dummy_user_id)
+        if dummy_player:
+            dummy_player.answers_ok += 1
+        _cancel_turn_timers(game_state)
+        game_state.active_slot_id = normalised_slot
+        _apply_answer_to_state(game_state, slot_ref, attempt_answer)
+        game_state.active_slot_id = None
+        _store_state(game_state)
+        success_text = (
+            f"{info_prefix} разгадал {slot_ref.public_id}! (+{slot_ref.slot.length} очков)"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id, text=success_text
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to notify about dummy success in game %s", game_state.game_id
+            )
+        if _all_slots_solved(puzzle, game_state):
+            await _finish_game(
+                context,
+                game_state,
+                reason="Все слова разгаданы. Тест завершён.",
+            )
+            return
+        _advance_turn(game_state)
+        _store_state(game_state)
+        await _announce_turn(context, game_state, puzzle)
+        return
+
+    # Failure branch
+    game_state.dummy_failures += 1
+    if dummy_player:
+        dummy_player.answers_fail += 1
+    _cancel_turn_timers(game_state)
+    failure_text = f"{info_prefix} ошибся на {slot_ref.public_id}."
+    try:
+        await context.bot.send_message(chat_id=game_state.chat_id, text=failure_text)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to notify about dummy failure in game %s", game_state.game_id
+        )
+    _advance_turn(game_state)
+    _store_state(game_state)
+    await _announce_turn(context, game_state, puzzle)
 def _advance_turn(game_state: GameState) -> int | None:
     if not game_state.turn_order:
         return None
@@ -786,6 +1070,8 @@ async def _announce_turn(
                 "Failed to send DM announcement to player %s", player.user_id
             )
     _schedule_turn_timers(context, game_state)
+    if game_state.test_mode:
+        _schedule_dummy_turn(context, game_state, puzzle)
     game_state.last_update = time.time()
     _store_state(game_state)
 
@@ -797,7 +1083,32 @@ async def _handle_turn_timeout(
     puzzle = _load_puzzle_for_state(game_state)
     if puzzle is None:
         return
-    if player:
+    dummy_timeout = (
+        game_state.test_mode
+        and player is not None
+        and player.user_id == game_state.dummy_user_id
+    )
+    if dummy_timeout:
+        elapsed = 0.0
+        if game_state.dummy_turn_started_at is not None:
+            elapsed = max(0.0, time.time() - game_state.dummy_turn_started_at)
+        elif game_state.dummy_planned_delay:
+            elapsed = max(0.0, game_state.dummy_planned_delay)
+        game_state.dummy_turns += 1
+        game_state.dummy_failures += 1
+        game_state.dummy_total_delay += elapsed
+        game_state.dummy_turn_started_at = None
+        game_state.dummy_planned_delay = 0.0
+        if player:
+            player.answers_fail += 1
+        with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+            logger.info(
+                "Dummy timeout: slot=%s delay=%.2fs",
+                game_state.active_slot_id or "-",
+                elapsed,
+            )
+        _cancel_dummy_job(game_state)
+    elif player:
         player.answers_fail += 1
     _cancel_turn_timers(game_state)
     message = "Ход пропущен по таймеру."
@@ -843,6 +1154,7 @@ async def _finish_game(
         return
     _cancel_turn_timers(game_state)
     _cancel_game_timers(game_state)
+    _cancel_dummy_job(game_state)
     game_state.status = "finished"
     game_state.active_slot_id = None
     game_state.last_update = time.time()
@@ -853,6 +1165,29 @@ async def _finish_game(
     lines.append("")
     lines.append("Итоги:")
     lines.append(summary)
+    dummy_summary: str | None = None
+    if game_state.test_mode:
+        turns = game_state.dummy_turns
+        successes = game_state.dummy_successes
+        failures = game_state.dummy_failures
+        accuracy = (successes / turns * 100) if turns else 0.0
+        average_delay = (game_state.dummy_total_delay / turns) if turns else 0.0
+        dummy_summary = (
+            "🤖 Статистика дамми — "
+            f"ходов: {turns}, верных: {successes}, ошибок: {failures}, "
+            f"точность: {accuracy:.0f}%, средняя задержка: {average_delay:.1f} с."
+        )
+        with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+            logger.info(
+                "Dummy summary: turns=%s successes=%s failures=%s accuracy=%.1f%% avg_delay=%.2fs",
+                turns,
+                successes,
+                failures,
+                accuracy,
+                average_delay,
+            )
+    if dummy_summary:
+        lines.append(dummy_summary)
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -920,7 +1255,22 @@ def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
     else:
         start_callback = f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}"
     start_button = InlineKeyboardButton(text="Старт", callback_data=start_callback)
-    return InlineKeyboardMarkup([[invite_button, link_button], [start_button]])
+    rows = [[invite_button, link_button], [start_button]]
+    settings = state.settings
+    if (
+        settings
+        and settings.admin_id is not None
+        and game_state.host_id == settings.admin_id
+    ):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "[адм.] Тестовая игра 1×1",
+                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{game_state.chat_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _format_lobby_text(game_state: GameState) -> str:
@@ -1618,6 +1968,32 @@ def _generate_composite(
         scoreboard={chat_id: 0},
     )
     return composite, game_state
+
+
+def _clone_puzzle_for_test(
+    puzzle: Puzzle | CompositePuzzle,
+) -> tuple[Puzzle | CompositePuzzle, str, list[str] | None]:
+    suffix = uuid4().hex[:8]
+    if isinstance(puzzle, CompositePuzzle):
+        payload = composite_to_dict(puzzle)
+        new_id = f"{puzzle.id}-adm-{suffix}"
+        payload["id"] = new_id
+        component_ids: list[str] = []
+        for index, component_payload in enumerate(payload.get("components", []), start=1):
+            puzzle_payload = component_payload.get("puzzle")
+            if isinstance(puzzle_payload, dict):
+                new_component_id = f"{new_id}-c{index}"
+                puzzle_payload["id"] = new_component_id
+                component_ids.append(new_component_id)
+        save_puzzle(new_id, payload)
+        cloned = puzzle_from_dict(dict(payload))
+        return cloned, new_id, component_ids or None
+    payload = puzzle_to_dict(puzzle)  # type: ignore[arg-type]
+    new_id = f"{puzzle.id}-adm-{suffix}"
+    payload["id"] = new_id
+    save_puzzle(new_id, payload)
+    cloned = puzzle_from_dict(dict(payload))
+    return cloned, new_id, None
 
 
 def _generate_puzzle(
@@ -2522,6 +2898,124 @@ async def lobby_start_callback_handler(
 
 
 @command_entrypoint()
+async def admin_test_game_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    if not query.data.startswith(ADMIN_TEST_GAME_CALLBACK_PREFIX):
+        return
+    settings = state.settings
+    if settings is None or settings.admin_id is None:
+        await query.answer("Режим недоступен.", show_alert=True)
+        return
+    user = update.effective_user
+    if user is None or user.id != settings.admin_id:
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
+    payload = query.data[len(ADMIN_TEST_GAME_CALLBACK_PREFIX) :]
+    target_chat_id: int | None = None
+    if payload:
+        with suppress(ValueError):
+            target_chat_id = int(payload)
+    if target_chat_id is None:
+        chat = query.message.chat if query.message else update.effective_chat
+        target_chat_id = chat.id if chat else None
+    if target_chat_id is None:
+        await query.answer()
+        return
+    base_state = _load_state_for_chat(target_chat_id)
+    if base_state is None:
+        await query.answer("Нет активной игры для теста.", show_alert=True)
+        return
+    if base_state.test_mode and base_state.status == "running":
+        await query.answer("Тестовая игра уже запущена.", show_alert=True)
+        return
+    puzzle = _load_puzzle_for_state(base_state)
+    if puzzle is None:
+        await query.answer("Кроссворд ещё не готов.", show_alert=True)
+        return
+    cloned_puzzle, puzzle_id, component_ids = _clone_puzzle_for_test(puzzle)
+    admin_game_id = f"admin:{target_chat_id}"
+    existing = _load_state_by_game_id(admin_game_id)
+    if existing is not None:
+        _cleanup_game_state(existing)
+    admin_id = settings.admin_id
+    now = time.time()
+    dm_chat_id = _lookup_player_chat(admin_id)
+    chat = query.message.chat if query.message else update.effective_chat
+    if chat and chat.type == ChatType.PRIVATE:
+        dm_chat_id = chat.id
+    admin_player = Player(
+        user_id=admin_id,
+        name=_user_display_name(user),
+        dm_chat_id=dm_chat_id,
+    )
+    dummy_player = Player(user_id=DUMMY_USER_ID, name=DUMMY_NAME, is_bot=True)
+    turn_order = [admin_id, DUMMY_USER_ID]
+    if not ADMIN_FIRST:
+        random.shuffle(turn_order)
+    scoreboard = {admin_id: 0, DUMMY_USER_ID: 0}
+    admin_state = GameState(
+        chat_id=target_chat_id,
+        puzzle_id=puzzle_id,
+        puzzle_ids=component_ids,
+        filled_cells={},
+        solved_slots=set(),
+        score=0,
+        started_at=now,
+        last_update=now,
+        hinted_cells=set(),
+        host_id=admin_id,
+        game_id=admin_game_id,
+        scoreboard=scoreboard,
+        mode="turn_based",
+        status="running",
+        players={admin_id: admin_player, DUMMY_USER_ID: dummy_player},
+        turn_order=turn_order,
+        turn_index=0,
+    )
+    admin_state.test_mode = True
+    admin_state.dummy_user_id = DUMMY_USER_ID
+    admin_state.language = cloned_puzzle.language
+    admin_state.theme = cloned_puzzle.theme
+    admin_state.active_slot_id = None
+    _register_player_chat(admin_id, dm_chat_id)
+    set_chat_mode(context, MODE_IN_GAME)
+    state.lobby_messages.pop(base_state.game_id, None)
+    _store_state(admin_state)
+    _schedule_game_timers(context, admin_state)
+    _store_state(admin_state)
+    await query.answer("Тестовая игра запущена!")
+    intro_lines = [
+        "[адм.] Тестовая игра 1×1 запущена!",
+        f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
+    ]
+    first_player = admin_state.players.get(admin_state.turn_order[0])
+    if first_player:
+        intro_lines.append(f"Первым ходит {first_player.name}.")
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text="\n".join(intro_lines),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to announce admin test game start for chat %s", target_chat_id
+        )
+    await _announce_turn(
+        context,
+        admin_state,
+        cloned_puzzle,
+        prefix=(
+            f"Первым ходит {first_player.name}!" if first_player else "Игра начинается!"
+        ),
+    )
+
+
+@command_entrypoint()
 async def turn_select_callback_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -3060,6 +3554,33 @@ async def _handle_answer_submission(
                 await _send_completion_options(context, chat.id, message, puzzle)
             else:
                 await refresh_clues_if_needed()
+
+
+@command_entrypoint()
+async def admin_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _normalise_thread_id(update)
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None or user is None:
+        return
+    settings = state.settings
+    if settings is None or settings.admin_id is None:
+        return
+    if user.id != settings.admin_id:
+        logger.debug("Ignoring /admin command from non-admin %s", user.id)
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "[адм.] Тестовая игра 1×1",
+                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{chat.id}",
+                )
+            ]
+        ]
+    )
+    await message.reply_text("Служебное меню:", reply_markup=keyboard)
 
 
 @command_entrypoint()
@@ -3715,6 +4236,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("quit", quit_command))
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(CommandHandler("join", join_command))
+    telegram_application.add_handler(CommandHandler("admin", admin_menu_command))
     telegram_application.add_handler(
         CallbackQueryHandler(
             completion_callback_handler,
@@ -3753,6 +4275,13 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         CallbackQueryHandler(
             turn_slot_callback_handler,
             pattern=fr"^{TURN_SLOT_CALLBACK_PREFIX}.*",
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            admin_test_game_callback_handler,
+            pattern=fr"^{ADMIN_TEST_GAME_CALLBACK_PREFIX}.*",
             block=False,
         )
     )

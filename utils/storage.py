@@ -115,6 +115,13 @@ class GameState:
     turn_warn_job_id: str | None = None
     game_timer_job_id: str | None = None
     game_warn_job_id: str | None = None
+    dummy_job_id: str | None = None
+    dummy_turn_started_at: float | None = None
+    dummy_planned_delay: float = 0.0
+    dummy_turns: int = 0
+    dummy_successes: int = 0
+    dummy_failures: int = 0
+    dummy_total_delay: float = 0.0
 
     def __post_init__(self) -> None:
         self.game_id = str(self.game_id or self.chat_id)
@@ -198,6 +205,20 @@ class GameState:
         self.game_warn_job_id = (
             str(self.game_warn_job_id) if self.game_warn_job_id else None
         )
+        self.dummy_job_id = str(self.dummy_job_id) if self.dummy_job_id else None
+        if self.dummy_turn_started_at is not None:
+            with suppress(TypeError, ValueError):
+                self.dummy_turn_started_at = float(self.dummy_turn_started_at)
+        with suppress(TypeError, ValueError):
+            self.dummy_planned_delay = float(self.dummy_planned_delay)
+        with suppress(TypeError, ValueError):
+            self.dummy_turns = int(self.dummy_turns)
+        with suppress(TypeError, ValueError):
+            self.dummy_successes = int(self.dummy_successes)
+        with suppress(TypeError, ValueError):
+            self.dummy_failures = int(self.dummy_failures)
+        with suppress(TypeError, ValueError):
+            self.dummy_total_delay = float(self.dummy_total_delay)
         if self.active_slot_id:
             self.active_slot_id = str(self.active_slot_id)
         self.join_codes = {
@@ -253,6 +274,13 @@ class GameState:
             "dummy_user_id": self.dummy_user_id,
             "language": self.language,
             "theme": self.theme,
+            "dummy_job_id": self.dummy_job_id,
+            "dummy_turn_started_at": self.dummy_turn_started_at,
+            "dummy_planned_delay": self.dummy_planned_delay,
+            "dummy_turns": self.dummy_turns,
+            "dummy_successes": self.dummy_successes,
+            "dummy_failures": self.dummy_failures,
+            "dummy_total_delay": self.dummy_total_delay,
         }
 
     @classmethod
@@ -369,6 +397,22 @@ class GameState:
         theme_raw = payload.get("theme")
         theme = str(theme_raw) if theme_raw not in (None, "") else None
 
+        dummy_job_raw = payload.get("dummy_job_id")
+        dummy_job_id = str(dummy_job_raw) if dummy_job_raw else None
+        dummy_turn_started_raw = payload.get("dummy_turn_started_at")
+        if dummy_turn_started_raw in (None, ""):
+            dummy_turn_started_at = None
+        else:
+            try:
+                dummy_turn_started_at = float(dummy_turn_started_raw)
+            except (TypeError, ValueError):
+                dummy_turn_started_at = None
+        dummy_planned_delay = float(payload.get("dummy_planned_delay", 0.0) or 0.0)
+        dummy_turns = int(payload.get("dummy_turns", 0) or 0)
+        dummy_successes = int(payload.get("dummy_successes", 0) or 0)
+        dummy_failures = int(payload.get("dummy_failures", 0) or 0)
+        dummy_total_delay = float(payload.get("dummy_total_delay", 0.0) or 0.0)
+
         hinted_cells_raw = payload.get("hinted_cells", [])
         hinted_cells_iter: Iterable[Any]
         if isinstance(hinted_cells_raw, Iterable) and not isinstance(
@@ -410,6 +454,13 @@ class GameState:
             dummy_user_id=dummy_user_id,
             language=language,
             theme=theme,
+            dummy_job_id=dummy_job_id,
+            dummy_turn_started_at=dummy_turn_started_at,
+            dummy_planned_delay=dummy_planned_delay,
+            dummy_turns=dummy_turns,
+            dummy_successes=dummy_successes,
+            dummy_failures=dummy_failures,
+            dummy_total_delay=dummy_total_delay,
         )
 
 
