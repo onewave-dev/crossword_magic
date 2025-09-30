@@ -20,7 +20,7 @@ from app import (
     state,
 )
 from utils.crossword import Puzzle
-from utils.storage import GameState
+from utils.storage import GameState, Player
 
 
 @pytest.fixture
@@ -62,6 +62,10 @@ async def test_button_theme_handler_generates_puzzle_via_completion_menu(monkeyp
         started_at=now,
         last_update=now,
         scoreboard={chat_id: 0},
+        players={chat_id: Player(user_id=chat_id, name="Player", dm_chat_id=chat_id)},
+        host_id=chat_id,
+        mode="single",
+        status="running",
     )
 
     generate_calls: list[tuple[int, str, str]] = []
