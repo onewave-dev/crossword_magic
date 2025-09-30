@@ -117,7 +117,7 @@ async def test_numeric_slot_answer_matches_across(monkeypatch, tmp_path, puzzle_
 
     await _handle_answer_submission(context, chat, message, "1", "шпиц")
 
-    assert game_state.score == puzzle_with_shared_number.slots[0].length
+    assert game_state.score == app.SCORE_PER_WORD
     assert game_state.solved_slots == {"A1"}
     assert message.reply_photo.await_count == 1
     assert "A1" in message.reply_photo.await_args.kwargs.get("caption", "")
@@ -142,7 +142,7 @@ async def test_numeric_slot_answer_matches_down(monkeypatch, tmp_path, puzzle_wi
 
     await _handle_answer_submission(context, chat, message, "1", "дог")
 
-    assert game_state.score == puzzle_with_shared_number.slots[1].length
+    assert game_state.score == app.SCORE_PER_WORD
     assert game_state.solved_slots == {"D1"}
     assert message.reply_photo.await_count == 1
     assert "D1" in message.reply_photo.await_args.kwargs.get("caption", "")

@@ -346,6 +346,7 @@ GAME_WARNING_SECONDS = 60
 TURN_TIME_LIMIT_SECONDS = 60
 TURN_WARNING_SECONDS = 15
 HINT_PENALTY = 1
+SCORE_PER_WORD = 2
 
 TURN_SELECT_CALLBACK_PREFIX = "turn_select:"
 TURN_SLOT_CALLBACK_PREFIX = "turn_slot:"
@@ -966,7 +967,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
             "Failed to announce dummy answer attempt in game %s", game_state.game_id
         )
     log_result = "success" if attempt_success else "fail"
-    points = slot_ref.slot.length if attempt_success else 0
+    points = SCORE_PER_WORD if attempt_success else 0
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         logger.info(
             "Dummy turn: slot=%s delay=%.2fs result=%s points=%s",
@@ -978,8 +979,8 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     game_state.last_update = time.time()
     if attempt_success:
         game_state.dummy_successes += 1
-        game_state.score += slot_ref.slot.length
-        _record_score(game_state, slot_ref.slot.length, user_id=game_state.dummy_user_id)
+        game_state.score += SCORE_PER_WORD
+        _record_score(game_state, SCORE_PER_WORD, user_id=game_state.dummy_user_id)
         if dummy_player:
             dummy_player.answers_ok += 1
         _cancel_turn_timers(game_state)
@@ -988,7 +989,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         game_state.active_slot_id = None
         _store_state(game_state)
         success_text = (
-            f"{info_prefix} разгадал {slot_ref.public_id}! (+{slot_ref.slot.length} очков)"
+            f"{info_prefix} разгадал {slot_ref.public_id}! (+{SCORE_PER_WORD} очков)"
         )
         try:
             await context.bot.send_message(
@@ -4669,13 +4670,13 @@ async def _handle_answer_submission(
             log_abort("answer_incorrect", slot_identifier=public_id)
             return
 
-        game_state.score += slot.length
+        game_state.score += SCORE_PER_WORD
         if in_turn_mode and player_id is not None:
-            _record_score(game_state, slot.length, user_id=player_id)
+            _record_score(game_state, SCORE_PER_WORD, user_id=player_id)
             if current_player:
                 current_player.answers_ok += 1
         else:
-            _record_score(game_state, slot.length)
+            _record_score(game_state, SCORE_PER_WORD)
         if in_turn_mode:
             game_state.active_slot_id = None
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
@@ -5115,10 +5116,11 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 slot_ref.public_id,
             )
 
-        if in_turn_mode and player_id is not None:
-            _record_score(game_state, -HINT_PENALTY, user_id=player_id)
-            game_state.last_update = time.time()
-            _store_state(game_state)
+        game_state.score -= HINT_PENALTY
+        hint_owner = player_id if in_turn_mode else None
+        _record_score(game_state, -HINT_PENALTY, user_id=hint_owner)
+        game_state.last_update = time.time()
+        _store_state(game_state)
 
         try:
             image_path = render_puzzle(puzzle, game_state)
