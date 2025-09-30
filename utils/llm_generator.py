@@ -59,7 +59,10 @@ _PROMPT = ChatPromptTemplate.from_messages(
             "Generate between 10 and 40 unique single-word crossword answers that fit the theme. "
             "Each answer must be between 3 and 15 letters long, consist only of letters of the target language, "
             "and must not contain spaces, hyphens or digits. Provide a concise clue for every word and an optional "
-            "direction preference (across, down, any).",
+            "direction preference (across, down, any). Aim for a mix of short (3–5 letters), medium (6–9 letters) "
+            "and long (10–15 letters) answers. Prefer base dictionary forms and avoid obscure or dialect spellings. "
+            "Ensure the overall set covers a broad range of starting letters and letter combinations to maximise "
+            "crossing opportunities.",
         ),
     ]
 ).partial(format_instructions=_PARSER.get_format_instructions())

@@ -37,8 +37,10 @@ class _DummyLLM:
     """Simple stub that returns a predefined JSON payload."""
 
     payload: str
+    captured_messages: list | None = None
 
     def invoke(self, messages):  # type: ignore[override]
+        self.captured_messages = messages
         return SimpleNamespace(content=self.payload)
 
 
@@ -98,6 +100,29 @@ class GenerateCluesTests(unittest.TestCase):
         self.assertEqual(40, len(generated))
         self.assertListEqual([word.upper() for word in words[:40]], [item.word for item in generated])
 
+    def test_prompt_includes_generation_guidance(self) -> None:
+        payload = _serialise_words(["alpha"] * 10)
+        dummy = _DummyLLM(payload)
+
+        with patch("utils.llm_generator._get_llm", return_value=dummy):
+            generate_clues(theme="Navigation", language="en")
+
+        self.assertIsNotNone(dummy.captured_messages)
+        human_message = dummy.captured_messages[1].content  # type: ignore[index]
+        self.assertIn(
+            "mix of short (3–5 letters), medium (6–9 letters) and long (10–15 letters)",
+            human_message,
+        )
+        self.assertIn(
+            "Prefer base dictionary forms and avoid obscure or dialect spellings",
+            human_message,
+        )
+        self.assertIn(
+            "covers a broad range of starting letters and letter combinations",
+            human_message,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
