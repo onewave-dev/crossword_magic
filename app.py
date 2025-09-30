@@ -321,6 +321,26 @@ MODE_AWAIT_THEME = "await_theme"
 MODE_IN_GAME = "in_game"
 
 REMINDER_DELAY_SECONDS = 10 * 60
+GENERATION_UPDATE_FIRST_DELAY_SECONDS = 60
+GENERATION_UPDATE_INTERVAL_SECONDS = 120
+GENERATION_TYPING_INITIAL_DELAY_SECONDS = 5
+GENERATION_TYPING_INTERVAL_SECONDS = 25
+GENERATION_NOTICE_TEMPLATES = [
+    "{base}",
+    "{base}\nУстраивайтесь поудобнее, скоро всё пришлю! ✨",
+    "Колдую над сеткой... {base}",
+    "Подбираю лучшие слова и подсказки. {base}",
+]
+GENERATION_UPDATE_TEMPLATES = [
+    "Подбираю пересечения, чтобы всё сошлось идеально. Спасибо за ожидание!",
+    "Проверяю подсказки и ответы — уже почти готово!",
+    "Ещё пара штрихов, и кроссворд окажется у вас. Спасибо, что ждёте!",
+    "Сверяю сетку и шлифую вопросы. Финальный рывок!",
+]
+GENERATION_TYPING_ACTIONS = (
+    constants.ChatAction.TYPING,
+    constants.ChatAction.CHOOSE_STICKER,
+)
 GAME_TIME_LIMIT_SECONDS = 10 * 60
 GAME_WARNING_SECONDS = 60
 TURN_TIME_LIMIT_SECONDS = 60
@@ -1713,23 +1733,54 @@ async def _send_generation_notice(
 ) -> None:
     """Send a single informational message about puzzle generation per chat."""
 
-    notice = context.chat_data.get(GENERATION_NOTICE_KEY)
-    if notice and notice.get("active") and notice.get("text") == text:
+    chat_data = getattr(context, "chat_data", None)
+    getter = getattr(chat_data, "get", None)
+    existing_notice = getter(GENERATION_NOTICE_KEY) if callable(getter) else None
+    reason = text
+    if (
+        isinstance(existing_notice, dict)
+        and existing_notice.get("active")
+        and existing_notice.get("reason") == reason
+    ):
         logger.debug(
             "Skipping duplicate generation notice for chat %s", chat_id
         )
         return
 
-    context.chat_data[GENERATION_NOTICE_KEY] = {
+    _cancel_generation_updates(context, chat_id)
+    remover = getattr(chat_data, "pop", None)
+    if callable(remover):
+        remover(GENERATION_NOTICE_KEY, None)
+
+    base_text = text or "Готовлю кроссворд, это может занять немного времени..."
+    variations: list[str] = []
+    for template in GENERATION_NOTICE_TEMPLATES:
+        try:
+            formatted = template.format(base=base_text)
+        except Exception:  # noqa: BLE001
+            formatted = base_text
+        variations.append(formatted)
+    if base_text not in variations:
+        variations.append(base_text)
+    unique_options = list(dict.fromkeys(variations))
+    chosen_text = random.choice(unique_options) if unique_options else base_text
+
+    notice_state = {
         "active": True,
-        "text": text,
+        "text": chosen_text,
+        "reason": reason,
         "started_at": time.monotonic(),
+        "update_cycle": list(GENERATION_UPDATE_TEMPLATES),
+        "update_index": 0,
     }
+    random.shuffle(notice_state["update_cycle"])
+    context.chat_data[GENERATION_NOTICE_KEY] = notice_state
+    _schedule_generation_updates(context, chat_id)
 
     if message is not None:
-        await message.reply_text(text)
+        await message.reply_text(chosen_text)
     else:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=chosen_text)
 
 
 def _clear_generation_notice(
@@ -1737,7 +1788,9 @@ def _clear_generation_notice(
 ) -> None:
     """Clear generation notice tracking for the chat."""
 
-    if context.chat_data.pop(GENERATION_NOTICE_KEY, None) is not None and chat_id is not None:
+    _cancel_generation_updates(context, chat_id)
+    removed = context.chat_data.pop(GENERATION_NOTICE_KEY, None)
+    if removed is not None and chat_id is not None:
         logger.debug("Cleared generation notice flag for chat %s", chat_id)
 
 
@@ -1753,6 +1806,151 @@ async def _send_completion_options(
         await message.reply_text(text, reply_markup=keyboard)
         return
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+def _schedule_generation_updates(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    chat_data = getattr(context, "chat_data", None)
+    get_chat_data = getattr(chat_data, "get", None)
+    if not callable(get_chat_data):
+        return
+    notice = get_chat_data(GENERATION_NOTICE_KEY)
+    if not isinstance(notice, dict):
+        return
+    updates = list(GENERATION_UPDATE_TEMPLATES)
+    random.shuffle(updates)
+    notice["update_cycle"] = updates
+    notice["update_index"] = 0
+    notice.pop("last_update_text", None)
+    notice.pop("last_typing_action", None)
+    job_queue = getattr(context, "job_queue", None)
+    if not job_queue or not hasattr(job_queue, "run_repeating"):
+        return
+    update_job_name = f"generation-update-{chat_id}"
+    _cancel_job(update_job_name)
+    update_job = job_queue.run_repeating(
+        _generation_update_job,
+        interval=GENERATION_UPDATE_INTERVAL_SECONDS,
+        first=GENERATION_UPDATE_FIRST_DELAY_SECONDS,
+        chat_id=chat_id,
+        name=update_job_name,
+    )
+    if update_job is not None:
+        _remember_job(update_job)
+        notice["update_job_id"] = update_job_name
+    typing_job_name = f"generation-typing-{chat_id}"
+    _cancel_job(typing_job_name)
+    typing_job = job_queue.run_repeating(
+        _generation_typing_job,
+        interval=GENERATION_TYPING_INTERVAL_SECONDS,
+        first=GENERATION_TYPING_INITIAL_DELAY_SECONDS,
+        chat_id=chat_id,
+        name=typing_job_name,
+    )
+    if typing_job is not None:
+        _remember_job(typing_job)
+        notice["typing_job_id"] = typing_job_name
+
+
+def _cancel_generation_updates(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+) -> None:
+    chat_data = getattr(context, "chat_data", None)
+    get_chat_data = getattr(chat_data, "get", None)
+    if not callable(get_chat_data):
+        return
+    notice = get_chat_data(GENERATION_NOTICE_KEY)
+    if not isinstance(notice, dict):
+        return
+    update_job_id = notice.pop("update_job_id", None)
+    typing_job_id = notice.pop("typing_job_id", None)
+    _cancel_job(update_job_id)
+    _cancel_job(typing_job_id)
+    notice.pop("update_cycle", None)
+    notice.pop("update_index", None)
+    notice.pop("last_update_text", None)
+    notice.pop("last_typing_action", None)
+
+
+async def _generation_update_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    chat_id = job.chat_id
+    chat_data = getattr(context, "chat_data", None)
+    notice = None
+    if chat_data is not None:
+        getter = getattr(chat_data, "get", None)
+        if callable(getter):
+            notice = getter(GENERATION_NOTICE_KEY)
+    if not isinstance(notice, dict) or not notice.get("active"):
+        if isinstance(notice, dict):
+            notice.pop("update_job_id", None)
+        _cancel_job(job.name)
+        return
+    updates = notice.get("update_cycle") or []
+    if not updates:
+        updates = list(GENERATION_UPDATE_TEMPLATES)
+        random.shuffle(updates)
+    index = int(notice.get("update_index", 0))
+    if index >= len(updates):
+        random.shuffle(updates)
+        index = 0
+    message = updates[index]
+    last_message = notice.get("last_update_text")
+    if last_message == message and len(updates) > 1:
+        index = (index + 1) % len(updates)
+        message = updates[index]
+    next_index = index + 1
+    if next_index >= len(updates):
+        random.shuffle(updates)
+        if len(updates) > 1 and updates[0] == message:
+            updates.append(updates.pop(0))
+        next_index = 0
+    notice["update_cycle"] = updates
+    notice["update_index"] = next_index
+    notice["last_update_text"] = message
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to send generation status update to chat %s", chat_id
+        )
+
+
+async def _generation_typing_job(context: CallbackContext) -> None:
+    job = context.job
+    if job is None:
+        return
+    chat_id = job.chat_id
+    chat_data = getattr(context, "chat_data", None)
+    notice = None
+    if chat_data is not None:
+        getter = getattr(chat_data, "get", None)
+        if callable(getter):
+            notice = getter(GENERATION_NOTICE_KEY)
+    if not isinstance(notice, dict) or not notice.get("active"):
+        if isinstance(notice, dict):
+            notice.pop("typing_job_id", None)
+        _cancel_job(job.name)
+        return
+    actions = list(GENERATION_TYPING_ACTIONS)
+    if not actions:
+        return
+    action = random.choice(actions)
+    last_action = notice.get("last_typing_action")
+    if len(actions) > 1 and action == last_action:
+        alternatives = [item for item in actions if item != last_action]
+        if alternatives:
+            action = random.choice(alternatives)
+    notice["last_typing_action"] = action
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=action)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to send generation typing action to chat %s", chat_id
+        )
 
 
 async def _deliver_puzzle_via_bot(

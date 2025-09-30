@@ -33,9 +33,10 @@
 - служебные маршруты: `/healthz`, `/set_webhook`, `/reset_webhook`.  
 
 ### python-telegram-bot v20
-- создаём `Application` в lifecycle FastAPI;  
-- принимаем апдейты через `application.process_update(update)`;  
-- используем job queue для таймеров и подсказок.  
+- создаём `Application` в lifecycle FastAPI;
+- принимаем апдейты через `application.process_update(update)`;
+- используем job queue для таймеров и подсказок.
+- при генерации кроссворда не забываем про минутные и би-минутные уведомления о прогрессе и лёгкую «анимацию» (typing/choose_sticker) — поддерживайте текущую механику в `app.py`.
 
 ### Игра
 - пользователь взаимодействует в **личном чате** с ботом;  
