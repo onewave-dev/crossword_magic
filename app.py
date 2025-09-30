@@ -4782,6 +4782,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel_new_game)],
         name="new_game_conversation",
+        block=False,
     )
     telegram_application.add_handler(conversation)
     telegram_application.add_handler(
