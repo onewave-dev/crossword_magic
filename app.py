@@ -2191,7 +2191,11 @@ def _generate_puzzle(
             raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
 
         max_attempt_words = min(len(validated_clues), 80)
-        min_attempt_words = max(10, min(30, max_attempt_words))
+        dynamic_floor = int(max_attempt_words * 0.6)
+        min_attempt_words = min(
+            max_attempt_words,
+            max(8, min(30, dynamic_floor)),
+        )
 
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
@@ -2297,31 +2301,16 @@ def _generate_puzzle(
                 )
 
 
-        for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-            candidate_clues = _select_connected_clue_set(
-                word_components, language, limit
-            )
-            if not candidate_clues:
-                if limit == min_attempt_words and word_components:
-                    fallback = list(word_components[0][:limit]) or list(word_components[0])
-                    if fallback:
-                        logger.debug(
-                            "Falling back to largest connected component with %s words",
-                            len(fallback),
-                        )
-                        candidate_clues = fallback
-                    else:
-                        logger.debug(
-                            "Skipping attempt with %s words: no connected subset available",
-                            limit,
-                        )
-                        continue
-                else:
-                    logger.debug(
-                        "Skipping attempt with %s words: no connected subset available",
-                        limit,
-                    )
-                    continue
+        fallback_component: list[WordClue] | None = None
+        if word_components:
+            largest_component = max(word_components, key=len)
+            fallback_size = min(len(largest_component), max_attempt_words)
+            fallback_component = list(largest_component[:fallback_size])
+
+        def attempt_generation(
+            candidate_clues: Sequence[WordClue], limit: int
+        ) -> tuple[Puzzle | CompositePuzzle, GameState] | None:
+            nonlocal attempted_component_split
             puzzle_id = uuid4().hex
             with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
                 attempt_clues = list(candidate_clues)
@@ -2420,6 +2409,30 @@ def _generate_puzzle(
                         _store_state(game_state)
                         logger.info("Generated puzzle ready for delivery")
                         return puzzle, game_state
+            return None
+
+        for limit in range(max_attempt_words, min_attempt_words - 1, -1):
+            candidate_clues = _select_connected_clue_set(
+                word_components, language, limit
+            )
+            if not candidate_clues:
+                logger.debug(
+                    "Skipping attempt with %s words: no connected subset available",
+                    limit,
+                )
+                continue
+            result = attempt_generation(candidate_clues, limit)
+            if result is not None:
+                return result
+
+        if fallback_component:
+            logger.debug(
+                "Falling back to largest connected component with %s words",
+                len(fallback_component),
+            )
+            result = attempt_generation(fallback_component, len(fallback_component))
+            if result is not None:
+                return result
 
         raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
