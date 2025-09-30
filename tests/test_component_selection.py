@@ -43,7 +43,14 @@ def test_generate_puzzle_uses_connected_subset(monkeypatch: pytest.MonkeyPatch) 
     target_component = {clue.word for clue in connected_cluster}
     captured_words: list[str] = []
 
-    def fake_generate_clues(theme: str, language: str) -> list[WordClue]:
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ) -> list[WordClue]:
+        assert (min_results, max_results) == (10, 40)
         return disconnected_order
 
     def fake_validate_word_list(

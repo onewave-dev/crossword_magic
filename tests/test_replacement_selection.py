@@ -27,20 +27,38 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
         WordClue(word="COPPER", clue="tenth"),
     ]
     replacement_candidates = [
-        WordClue(word="ZZZZ", clue="no overlap"),
+        WordClue(word="ZZZZ", clue="no overlap 1"),
+        WordClue(word="YYYY", clue="no overlap 2"),
+        WordClue(word="XXXX", clue="no overlap 3"),
         WordClue(word="BOLT", clue="shares letters"),
+        WordClue(word="VVVV", clue="no overlap 4"),
+        WordClue(word="MMMM", clue="no overlap 5"),
     ]
 
-    def fake_generate_clues(theme: str, language: str):
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
         if "вместо" in theme:
             call_state["theme"] = theme
+            call_state["replacement_args"] = (min_results, max_results)
             return replacement_candidates
+        call_state["base_args"] = (min_results, max_results)
         return base_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
         return list(clues)
 
-    call_state: dict[str, object] = {"count": 0, "words": None, "theme": None}
+    call_state: dict[str, object] = {
+        "count": 0,
+        "words": None,
+        "theme": None,
+        "replacement_args": None,
+        "base_args": None,
+    }
 
     def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
         call_state["count"] += 1
@@ -72,6 +90,8 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
     assert "Подбери 6-8 новых слов" in call_state["theme"]
     assert "Избегай слов:" in call_state["theme"]
     assert "Каждое слово должно содержать хотя бы одну букву" in call_state["theme"]
+    assert call_state["replacement_args"] == (6, 8)
+    assert call_state["base_args"] == (10, 40)
     assert puzzle.language == "en"
     assert game_state.chat_id == 1
 
@@ -95,13 +115,24 @@ def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
         WordClue(word="ROAD", clue="path"),
         WordClue(word="BOARD", clue="panel"),
         WordClue(word="TILE", clue="cover"),
+        WordClue(word="GATE", clue="entry"),
+        WordClue(word="RIDGE", clue="crest"),
+        WordClue(word="WALL", clue="divider"),
     ]
 
     call_state: dict[str, object] = {"attempts": 0, "final_words": None}
 
-    def fake_generate_clues(theme: str, language: str):
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
         if "вместо" in theme:
+            assert (min_results, max_results) == (6, 8)
             return replacement_candidates
+        assert (min_results, max_results) == (10, 40)
         return base_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
@@ -154,8 +185,15 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
 
     call_counts = {"base": 0, "replacement": 0, "theme": None}
 
-    def fake_generate_clues(theme: str, language: str):
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
         if "вместо" in theme:
+            assert (min_results, max_results) == (6, 8)
             call_counts["replacement"] += 1
             if call_counts["theme"] is None:
                 call_counts["theme"] = theme
@@ -163,6 +201,7 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
                 assert "Избегай слов:" in theme
             return [WordClue(word="AAAA", clue="duplicate")]
         call_counts["base"] += 1
+        assert (min_results, max_results) == (10, 40)
         return base_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
