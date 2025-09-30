@@ -2786,7 +2786,161 @@ async def lobby_invite_callback_handler(
             show_alert=True,
         )
         return
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        user_data = {}
+        setattr(context, "user_data", user_data)
+    pending_invite = {"game_id": game_state.game_id}
+    for existing_code, target in game_state.join_codes.items():
+        if target == game_state.game_id:
+            pending_invite["code"] = existing_code
+            break
+    user_data["pending_invite"] = pending_invite
     await query.answer("Открыл меню приглашений в личном чате.")
+
+
+@command_entrypoint()
+async def lobby_contact_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    if chat.type != ChatType.PRIVATE or message.contact is None:
+        return
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        pending = user_data.pop("pending_invite", None)
+    else:
+        pending = None
+    if not isinstance(pending, dict):
+        await message.reply_text(
+            "Приглашение не найдено. Откройте меню лобби ещё раз.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    game_id = pending.get("game_id")
+    code_hint = pending.get("code")
+    if not game_id:
+        await message.reply_text(
+            "Не удалось определить игру для приглашения. Попробуйте снова из лобби.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state or game_state.status != "lobby":
+        await message.reply_text(
+            "Лобби больше недоступно. Создайте новое приглашение.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    if user.id != game_state.host_id:
+        await message.reply_text(
+            "Только создатель комнаты может отправлять приглашения.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    if len(game_state.players) >= MAX_LOBBY_PLAYERS:
+        await message.reply_text(
+            "Достигнут лимит игроков в этой комнате (6).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    contact = message.contact
+    target_user_id = contact.user_id
+    if target_user_id == user.id:
+        await message.reply_text(
+            "Нельзя отправить приглашение самому себе.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    if target_user_id and target_user_id in game_state.players:
+        await message.reply_text(
+            "Этот игрок уже участвует в игре.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    join_code: str | None = None
+    if isinstance(code_hint, str) and game_state.join_codes.get(code_hint) == game_state.game_id:
+        join_code = code_hint
+    if join_code is None:
+        for existing_code, target in game_state.join_codes.items():
+            if target == game_state.game_id:
+                join_code = existing_code
+                break
+    generated_code = False
+    if join_code is None:
+        try:
+            join_code = _assign_join_code(game_state)
+            generated_code = True
+        except RuntimeError:
+            await message.reply_text(
+                "Не удалось сгенерировать код присоединения. Попробуйте ещё раз позже.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+    needs_store = generated_code or state.join_codes.get(join_code) != game_state.game_id
+    if needs_store:
+        game_state.join_codes[join_code] = game_state.game_id
+        _store_state(game_state)
+    link = await _build_join_link(context, join_code)
+    inviter_name = _user_display_name(user)
+    lobby_theme = game_state.theme or "без темы"
+    language = (game_state.language or "").upper()
+    invite_lines = [
+        f"{inviter_name} приглашает вас сыграть в кроссворд!",
+    ]
+    if language:
+        invite_lines.append(f"Язык: {language}")
+    invite_lines.append(f"Тема: {lobby_theme}")
+    invite_lines.append(f"Код для присоединения: {join_code}")
+    if link:
+        invite_lines.append(f"Присоединяйтесь по ссылке: {link}")
+    invite_text = "\n".join(invite_lines)
+    contact_name_parts = [contact.first_name or "", contact.last_name or ""]
+    contact_name = " ".join(part for part in contact_name_parts if part).strip()
+    if not contact_name:
+        contact_name = contact.phone_number or "игрок"
+    sent_successfully = False
+    error_message: str | None = None
+    if target_user_id:
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=invite_text,
+            )
+            sent_successfully = True
+        except Forbidden:
+            error_message = (
+                "Не удалось отправить приглашение: бот ещё не общался с этим пользователем."
+            )
+        except TelegramError:
+            logger.exception(
+                "Failed to deliver contact invite for game %s", game_state.game_id
+            )
+            error_message = "Возникла ошибка при отправке приглашения."
+    else:
+        error_message = (
+            "У контакта нет Telegram-аккаунта. Передайте код вручную."
+        )
+    host_reply_lines = []
+    if sent_successfully:
+        host_reply_lines.append(f"Приглашение отправлено {contact_name}.")
+    else:
+        if not error_message:
+            error_message = "Не удалось отправить приглашение."
+        host_reply_lines.append(error_message)
+        host_reply_lines.append("Передайте код вручную, чтобы игрок смог подключиться.")
+    host_reply_lines.append(f"Код для подключения: {join_code}")
+    if link:
+        host_reply_lines.append(f"Ссылка: {link}")
+    await message.reply_text(
+        "\n".join(host_reply_lines),
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @command_entrypoint()
@@ -4224,6 +4378,13 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         MessageHandler(
             filters.TEXT & filters.REPLY & ~filters.COMMAND,
             join_name_response_handler,
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.CONTACT,
+            lobby_contact_handler,
             block=False,
         )
     )
