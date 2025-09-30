@@ -1,14 +1,26 @@
 """Tests for inline answer parsing."""
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import app
 import pytest
 from telegram.constants import ChatType
 
 from telegram.ext import ConversationHandler
 
-from app import _parse_inline_answer, handle_theme, inline_answer_handler, state
+from app import (
+    GENERATION_NOTICE_KEY,
+    GENERATION_TOKEN_KEY,
+    _parse_inline_answer,
+    handle_theme,
+    inline_answer_handler,
+    quit_command,
+    state,
+)
+from utils.crossword import Puzzle
+from utils.storage import GameState
 
 
 @pytest.mark.parametrize(
@@ -178,3 +190,88 @@ async def test_inline_handler_silent_when_no_game_and_parse_fails():
 
     handler_mock.assert_not_awaited()
     message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_handle_theme_skips_delivery_after_quit_during_generation(monkeypatch):
+    chat_id = 901
+    chat = SimpleNamespace(id=chat_id, type=ChatType.PRIVATE)
+    theme_message = SimpleNamespace(
+        text="История",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=theme_message)
+    quit_message = SimpleNamespace(
+        text="/quit",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    quit_update = SimpleNamespace(effective_chat=chat, effective_message=quit_message)
+    context = SimpleNamespace(
+        user_data={"new_game_language": "ru"},
+        chat_data={},
+        bot=SimpleNamespace(send_message=AsyncMock()),
+        job_queue=None,
+    )
+
+    state.generating_chats.clear()
+
+    puzzle = Puzzle.from_size("test-puzzle", "История", "ru", 3, 3)
+    game_state = GameState(chat_id=chat_id, puzzle_id=puzzle.id)
+
+    def fake_generate(request_chat_id: int, language: str, theme: str):
+        assert request_chat_id == chat_id
+        return puzzle, game_state
+
+    class DummyLoop:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def run_in_executor(self, executor, func, *args):  # noqa: ANN001 - signature parity
+            self.started.set()
+            await self.resume.wait()
+            return func(*args)
+
+    dummy_loop = DummyLoop()
+
+    monkeypatch.setattr(app, "_generate_puzzle", fake_generate)
+    deliver_mock = AsyncMock()
+    monkeypatch.setattr(app, "_deliver_puzzle_via_bot", deliver_mock)
+    cleanup_mock = MagicMock()
+    monkeypatch.setattr(app, "_cleanup_game_state", cleanup_mock)
+    cleanup_chat_mock = MagicMock()
+    monkeypatch.setattr(app, "_cleanup_chat_resources", cleanup_chat_mock)
+    cancel_mock = MagicMock()
+    monkeypatch.setattr(app, "_cancel_reminder", cancel_mock)
+    load_state_mock = MagicMock(return_value=None)
+    monkeypatch.setattr(app, "_load_state_for_chat", load_state_mock)
+    reject_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "_reject_group_chat", reject_mock)
+    monkeypatch.setattr(app.asyncio, "get_running_loop", lambda: dummy_loop)
+
+    generation_task = asyncio.create_task(handle_theme(update, context))
+    await dummy_loop.started.wait()
+
+    assert context.chat_data.get(GENERATION_NOTICE_KEY)
+    assert context.chat_data.get(GENERATION_TOKEN_KEY)
+
+    await quit_command(quit_update, context)
+
+    cleanup_chat_mock.assert_called_once_with(chat_id)
+    quit_message.reply_text.assert_awaited_once()
+    assert context.chat_data.get(GENERATION_TOKEN_KEY) is None
+    assert context.chat_data.get(GENERATION_NOTICE_KEY) is None
+
+    dummy_loop.resume.set()
+    result = await generation_task
+
+    assert result == ConversationHandler.END
+    deliver_mock.assert_not_awaited()
+    cleanup_mock.assert_called_once_with(game_state)
+    assert chat_id not in state.generating_chats
+    assert context.chat_data.get(GENERATION_TOKEN_KEY) is None
+    assert context.chat_data.get(GENERATION_NOTICE_KEY) is None
+    assert context.chat_data.get("chat_mode") is None
+    assert context.user_data.get("new_game_language") is None
