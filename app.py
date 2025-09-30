@@ -495,6 +495,7 @@ BUTTON_STEP_LANGUAGE = "language"
 BUTTON_STEP_THEME = "theme"
 
 GENERATION_NOTICE_KEY = "puzzle_generation_notice"
+GENERATION_TOKEN_KEY = "puzzle_generation_token"
 
 ADMIN_COMMAND_PATTERN = re.compile(r"(?i)^\s*adm key")
 ADMIN_KEYS_ONLY_PATTERN = re.compile(r"(?i)^\s*adm keys\s*$")
@@ -3093,6 +3094,8 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         message=message,
     )
     loop = asyncio.get_running_loop()
+    generation_token = secrets.token_hex(16)
+    context.chat_data[GENERATION_TOKEN_KEY] = generation_token
     try:
         puzzle: Puzzle | CompositePuzzle | None = None
         game_state: GameState | None = None
@@ -3108,11 +3111,26 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await message.reply_text(
                 "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
             )
+            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
             set_chat_mode(context, MODE_IDLE)
             return ConversationHandler.END
         finally:
             state.generating_chats.discard(chat.id)
 
+        stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
+        if stored_token != generation_token:
+            logger.info(
+                "Skipping delivery for chat %s because generation was cancelled",
+                chat.id,
+            )
+            set_chat_mode(context, MODE_IDLE)
+            if game_state is not None:
+                _cleanup_game_state(game_state)
+            _clear_generation_notice(context, chat.id)
+            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
+            return ConversationHandler.END
+
+        context.chat_data.pop(GENERATION_TOKEN_KEY, None)
         set_chat_mode(context, MODE_IN_GAME)
         delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
         if not delivered:
@@ -3186,6 +3204,8 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     puzzle: Puzzle | CompositePuzzle | None = None
     game_state: GameState | None = None
     state.generating_chats.add(chat.id)
+    generation_token = secrets.token_hex(16)
+    context.chat_data[GENERATION_TOKEN_KEY] = generation_token
     try:
         puzzle, game_state = await loop.run_in_executor(
             None, _generate_puzzle, chat.id, language, theme
@@ -3198,10 +3218,24 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(
             "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
         )
+        context.chat_data.pop(GENERATION_TOKEN_KEY, None)
         return
     finally:
         state.generating_chats.discard(chat.id)
+    stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
     context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+    if stored_token != generation_token:
+        logger.info(
+            "Skipping button flow delivery for chat %s due to cancellation",
+            chat.id,
+        )
+        set_chat_mode(context, MODE_IDLE)
+        if game_state is not None:
+            _cleanup_game_state(game_state)
+        _clear_generation_notice(context, chat.id)
+        context.chat_data.pop(GENERATION_TOKEN_KEY, None)
+        return
+    context.chat_data.pop(GENERATION_TOKEN_KEY, None)
     set_chat_mode(context, MODE_IN_GAME)
     delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
     if not delivered:
@@ -4777,6 +4811,8 @@ async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     game_state = _load_state_for_chat(chat.id)
 
     _cancel_reminder(context)
+    context.chat_data.pop(GENERATION_TOKEN_KEY, None)
+    _clear_generation_notice(context, chat.id)
 
     if game_state is not None:
         _cleanup_game_state(game_state)
@@ -4862,6 +4898,8 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         new_puzzle: Puzzle | CompositePuzzle | None = None
         new_state: GameState | None = None
         state.generating_chats.add(chat.id)
+        generation_token = secrets.token_hex(16)
+        context.chat_data[GENERATION_TOKEN_KEY] = generation_token
         try:
             new_puzzle, new_state = await loop.run_in_executor(
                 None, _generate_puzzle, chat.id, language, theme
@@ -4876,9 +4914,23 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
                 chat_id=chat.id,
                 text="Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже.",
             )
+            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
             return
         finally:
             state.generating_chats.discard(chat.id)
+        stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
+        if stored_token != generation_token:
+            logger.info(
+                "Skipping completion delivery for chat %s due to cancellation",
+                chat.id,
+            )
+            set_chat_mode(context, MODE_IDLE)
+            if new_state is not None:
+                _cleanup_game_state(new_state)
+            _clear_generation_notice(context, chat.id)
+            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
+            return
+        context.chat_data.pop(GENERATION_TOKEN_KEY, None)
         set_chat_mode(context, MODE_IN_GAME)
         delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
         if not delivered:
