@@ -327,8 +327,8 @@ def test_rejected_word_can_return_in_followup_attempt(monkeypatch) -> None:
     assert "BETA" in call_state["final_words"]
 
 
-def test_replacement_attempt_cap(monkeypatch) -> None:
-    """Abort replacement requests after hitting the configured cap."""
+def test_replacement_attempts_trigger_regeneration(monkeypatch) -> None:
+    """Regenerate the clue list after exhausting replacement attempts."""
 
     base_clues = [
         WordClue(word="AAAA", clue="first"),
@@ -342,8 +342,12 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
         WordClue(word="IIIII", clue="ninth"),
         WordClue(word="JJJJJ", clue="tenth"),
     ]
+    refreshed_clues = [
+        WordClue(word=f"NEW{i}", clue=f"clue {i}") for i in range(1, 11)
+    ]
 
-    call_counts = {"base": 0, "replacement": 0, "theme": None}
+    call_counts = {"base": 0, "replacement": 0, "generate": 0}
+    final_words: list[list[str]] = []
 
     def fake_generate_clues(
         theme: str,
@@ -355,32 +359,54 @@ def test_replacement_attempt_cap(monkeypatch) -> None:
         if "вместо" in theme:
             assert (min_results, max_results) == (6, 8)
             call_counts["replacement"] += 1
-            if call_counts["theme"] is None:
-                call_counts["theme"] = theme
-                assert "Подбери 6-8 новых слов" in theme
-                assert "Избегай слов:" in theme
             return [WordClue(word="AAAA", clue="duplicate")]
         call_counts["base"] += 1
         assert (min_results, max_results) == (10, 40)
-        return base_clues
+        if call_counts["base"] == 1:
+            return base_clues
+        assert call_counts["base"] == 2
+        return refreshed_clues
 
     def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
         return list(clues)
 
+    def fake_build_word_components(clues, language):
+        return [list(clues)]
+
+    def fake_select_connected_clue_set(components, language, size):
+        if not components:
+            return None
+        return list(components[0][:size])
+
     def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
-        raise DisconnectedWordError("AAAA")
+        call_counts["generate"] += 1
+        if call_counts["generate"] == 1:
+            raise DisconnectedWordError("AAAA")
+        words_list = list(words)
+        final_words.append(words_list)
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
 
     monkeypatch.setattr("app.generate_clues", fake_generate_clues)
     monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app._build_word_components", fake_build_word_components)
+    monkeypatch.setattr("app._select_connected_clue_set", fake_select_connected_clue_set)
     monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
     monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
     monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
     monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
     monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
 
-    with pytest.raises(RuntimeError):
-        _generate_puzzle(chat_id=1, language="en", theme="Space")
+    puzzle, state = _generate_puzzle(chat_id=1, language="en", theme="Space")
 
-    assert call_counts["base"] == 1
+    assert puzzle.language == "en"
+    assert state.chat_id == 1
+    assert call_counts["base"] == 2
     assert call_counts["replacement"] == MAX_REPLACEMENT_REQUESTS
-    assert call_counts["theme"] is not None
+    assert call_counts["generate"] >= 2
+    assert final_words, "Expected successful generation after refresh"
+    assert set(final_words[-1]) == {clue.word for clue in refreshed_clues}

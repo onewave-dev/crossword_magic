@@ -2178,30 +2178,71 @@ def _generate_puzzle(
             language,
             theme,
         )
-        clues = generate_clues(theme=theme, language=language)
-        logger.info("Received %s raw clues from LLM", len(clues))
-        validated_clues = validate_word_list(language, clues, deduplicate=True)
-        logger.info("Validated %s clues for placement", len(validated_clues))
-        word_components = _build_word_components(validated_clues, language)
-        logger.debug(
-            "Identified %s connected word components after validation",
-            len(word_components),
-        )
-        if not validated_clues:
-            raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
-
-        max_attempt_words = min(len(validated_clues), 80)
-        dynamic_floor = int(max_attempt_words * 0.6)
-        min_attempt_words = min(
-            max_attempt_words,
-            max(8, min(30, dynamic_floor)),
-        )
-
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
         used_canonical_words: set[str] = set()
         rejected_canonical_words: dict[str, int] = {}
+        replacement_requests = 0
         current_attempt_index = 0
+        clues: Sequence[WordClue] | None = None
+        validated_clues: list[WordClue] = []
+        word_components: list[list[WordClue]] = []
+        fallback_component: list[WordClue] | None = None
+        max_attempt_words = 0
+        min_attempt_words = 0
+
+        def _refresh_clues(*, initial: bool) -> None:
+            """Pull a fresh list of clues and reset tracking structures."""
+
+            nonlocal clues
+            nonlocal validated_clues
+            nonlocal word_components
+            nonlocal fallback_component
+            nonlocal max_attempt_words
+            nonlocal min_attempt_words
+            nonlocal attempted_component_split
+            nonlocal replacement_requests
+            nonlocal current_attempt_index
+
+            if not initial:
+                logger.info(
+                    "Regenerating clue list after exhausting replacement attempts"
+                )
+
+            replacement_prompt_words.clear()
+            used_canonical_words.clear()
+            rejected_canonical_words.clear()
+            replacement_requests = 0
+            current_attempt_index = 0
+            attempted_component_split = False
+
+            clues = generate_clues(theme=theme, language=language)
+            logger.info("Received %s raw clues from LLM", len(clues))
+            validated_clues = validate_word_list(language, clues, deduplicate=True)
+            logger.info("Validated %s clues for placement", len(validated_clues))
+            if not validated_clues:
+                raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
+
+            word_components = _build_word_components(validated_clues, language)
+            logger.debug(
+                "Identified %s connected word components after validation",
+                len(word_components),
+            )
+
+            max_attempt_words = min(len(validated_clues), 80)
+            dynamic_floor = int(max_attempt_words * 0.6)
+            min_attempt_words = min(
+                max_attempt_words,
+                max(8, min(30, dynamic_floor)),
+            )
+
+            fallback_component = None
+            if word_components:
+                largest_component = max(word_components, key=len)
+                fallback_size = min(len(largest_component), max_attempt_words)
+                fallback_component = list(largest_component[:fallback_size])
+
+        _refresh_clues(initial=True)
 
         def _start_new_attempt(clues: Sequence[WordClue]) -> None:
             """Reset tracking sets for a new attempt candidate list."""
@@ -2215,8 +2256,6 @@ def _generate_puzzle(
             for canonical in list(rejected_canonical_words):
                 if canonical in used_canonical_words:
                     rejected_canonical_words.pop(canonical, None)
-        replacement_requests = 0
-
         def request_replacement(
             word: str, attempt_clues: Sequence[WordClue]
         ) -> WordClue | None:
@@ -2241,6 +2280,7 @@ def _generate_puzzle(
                         MAX_REPLACEMENT_REQUESTS,
                         word,
                     )
+                    _refresh_clues(initial=False)
                     return None
                 replacement_requests += 1
                 prompt_suffix = ", ".join(sorted(replacement_prompt_words))
@@ -2334,11 +2374,7 @@ def _generate_puzzle(
                 )
 
 
-        fallback_component: list[WordClue] | None = None
-        if word_components:
-            largest_component = max(word_components, key=len)
-            fallback_size = min(len(largest_component), max_attempt_words)
-            fallback_component = list(largest_component[:fallback_size])
+        restart_marker = object()
 
         def attempt_generation(
             candidate_clues: Sequence[WordClue], limit: int
@@ -2367,10 +2403,10 @@ def _generate_puzzle(
                         )
                         if replacement is None:
                             logger.debug(
-                                "No replacement available for %s, abandoning attempt",
+                                "No replacement available for %s, restarting with new clues",
                                 disconnected.word,
                             )
-                            break
+                            return restart_marker
                         target_canonical = _canonical_answer(
                             disconnected.word, language
                         )
@@ -2445,30 +2481,44 @@ def _generate_puzzle(
                         return puzzle, game_state
             return None
 
-        for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-            candidate_clues = _select_connected_clue_set(
-                word_components, language, limit
-            )
-            if not candidate_clues:
-                logger.debug(
-                    "Skipping attempt with %s words: no connected subset available",
-                    limit,
+        while True:
+            restarted = False
+            for limit in range(max_attempt_words, min_attempt_words - 1, -1):
+                candidate_clues = _select_connected_clue_set(
+                    word_components, language, limit
                 )
+                if not candidate_clues:
+                    logger.debug(
+                        "Skipping attempt with %s words: no connected subset available",
+                        limit,
+                    )
+                    continue
+                result = attempt_generation(candidate_clues, limit)
+                if result is restart_marker:
+                    restarted = True
+                    break
+                if result is not None:
+                    return result
+
+            if restarted:
                 continue
-            result = attempt_generation(candidate_clues, limit)
-            if result is not None:
-                return result
 
-        if fallback_component:
-            logger.debug(
-                "Falling back to largest connected component with %s words",
-                len(fallback_component),
+            if fallback_component:
+                logger.debug(
+                    "Falling back to largest connected component with %s words",
+                    len(fallback_component),
+                )
+                result = attempt_generation(
+                    fallback_component, len(fallback_component)
+                )
+                if result is restart_marker:
+                    continue
+                if result is not None:
+                    return result
+
+            raise RuntimeError(
+                "Не удалось сформировать кроссворд из сгенерированных слов"
             )
-            result = attempt_generation(fallback_component, len(fallback_component))
-            if result is not None:
-                return result
-
-        raise RuntimeError("Не удалось сформировать кроссворд из сгенерированных слов")
 
 
 # ---------------------------------------------------------------------------
