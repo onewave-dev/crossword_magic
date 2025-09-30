@@ -440,11 +440,13 @@ def test_replacement_attempts_trigger_regeneration(monkeypatch) -> None:
         WordClue(word="JJJJJ", clue="tenth"),
     ]
     refreshed_clues = [
-        WordClue(word=f"NEW{i}", clue=f"clue {i}") for i in range(1, 11)
+        WordClue(word="ZZZZ", clue="avoid me"),
+        *[WordClue(word=f"NEW{i}", clue=f"clue {i}") for i in range(1, 10)],
     ]
 
     call_counts = {"base": 0, "replacement": 0, "generate": 0}
     final_words: list[list[str]] = []
+    base_prompts: list[str] = []
 
     def fake_generate_clues(
         theme: str,
@@ -456,9 +458,10 @@ def test_replacement_attempts_trigger_regeneration(monkeypatch) -> None:
         if "вместо" in theme:
             assert (min_results, max_results) == (6, 8)
             call_counts["replacement"] += 1
-            return [WordClue(word="AAAA", clue="duplicate")]
+            return [WordClue(word="ZZZZ", clue="no overlap")]
         call_counts["base"] += 1
         assert (min_results, max_results) == (10, 40)
+        base_prompts.append(theme)
         if call_counts["base"] == 1:
             return base_clues
         assert call_counts["base"] == 2
@@ -506,4 +509,10 @@ def test_replacement_attempts_trigger_regeneration(monkeypatch) -> None:
     assert call_counts["replacement"] == MAX_REPLACEMENT_REQUESTS
     assert call_counts["generate"] >= 2
     assert final_words, "Expected successful generation after refresh"
-    assert set(final_words[-1]) == {clue.word for clue in refreshed_clues}
+    assert "ZZZZ" not in final_words[-1]
+    assert set(final_words[-1]) == {
+        clue.word for clue in refreshed_clues if clue.word != "ZZZZ"
+    }
+    assert len(base_prompts) == 2
+    assert base_prompts[0] == "Space"
+    assert "Избегай слов: ZZZZ" in base_prompts[1]
