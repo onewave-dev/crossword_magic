@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import MAX_REPLACEMENT_REQUESTS, _generate_puzzle
+from app import (
+    MAX_REPLACEMENT_REQUESTS,
+    SOFT_REPLACEMENT_RELAXATION_THRESHOLD,
+    _generate_puzzle,
+)
 from utils.fill_in_generator import DisconnectedWordError, FillInGenerationError
 from utils.llm_generator import WordClue
 
@@ -129,7 +133,7 @@ def test_generation_descends_to_smaller_word_sets(monkeypatch) -> None:
 
     def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
         attempts.append(len(list(words)))
-        if len(words) > 10:
+        if len(words) > 8:
             raise FillInGenerationError("too many words")
         return SimpleNamespace(
             id=puzzle_id,
@@ -153,9 +157,9 @@ def test_generation_descends_to_smaller_word_sets(monkeypatch) -> None:
     assert isinstance(puzzle, SimpleNamespace)
     assert state.chat_id == 99
     assert attempts[0] == len(base_clues)
-    assert min(attempts) == 10
-    assert min(attempts) < len(base_clues)
-    assert min(requested_sizes) <= 10
+    assert min(attempts) == 8
+    assert min(attempts) <= len(base_clues) // 2 + 1
+    assert min(requested_sizes) == 8
 
 
 def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
@@ -325,6 +329,99 @@ def test_rejected_word_can_return_in_followup_attempt(monkeypatch) -> None:
     assert "BETA" not in call_state["generate_calls"][2]
     assert isinstance(call_state["final_words"], list)
     assert "BETA" in call_state["final_words"]
+
+
+def test_replacement_relaxes_letter_intersection(monkeypatch) -> None:
+    """Enter relaxed mode after repeated failures and accept target-overlap word."""
+
+    base_clues = [
+        WordClue(word="QUAD", clue="target"),
+        WordClue(word="BEEE", clue="one"),
+        WordClue(word="CCCC", clue="two"),
+        WordClue(word="FFFF", clue="three"),
+        WordClue(word="GGGG", clue="four"),
+        WordClue(word="HHHH", clue="five"),
+        WordClue(word="IIII", clue="six"),
+        WordClue(word="JJJJ", clue="seven"),
+        WordClue(word="KKKK", clue="eight"),
+        WordClue(word="LLLL", clue="nine"),
+    ]
+
+    replacement_batches = [
+        [
+            WordClue(word="BEEE", clue="duplicate"),
+            WordClue(word="CCCC", clue="duplicate"),
+        ],
+        [WordClue(word="MMMM", clue="no overlap 1")],
+        [WordClue(word="NNNN", clue="no overlap 2")],
+        [WordClue(word="QURU", clue="relaxed success")],
+    ]
+
+    call_state: dict[str, object] = {
+        "replacement_themes": [],
+        "final_words": None,
+        "replacement_calls": 0,
+    }
+
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
+        if "вместо" in theme:
+            batch_index = call_state["replacement_calls"]
+            call_state["replacement_calls"] += 1
+            call_state["replacement_themes"].append(theme)
+            if batch_index < len(replacement_batches):
+                return replacement_batches[batch_index]
+            return replacement_batches[-1]
+        return base_clues
+
+    def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
+        return list(clues)
+
+    def fake_build_word_components(clues, language):
+        return [list(clues)]
+
+    def fake_select_connected_clue_set(components, language, size):
+        if not components:
+            return None
+        return list(components[0][:size])
+
+    def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
+        words_list = list(words)
+        if not call_state.get("disconnected_once"):
+            call_state["disconnected_once"] = True
+            raise DisconnectedWordError("QUAD")
+        call_state["final_words"] = words_list
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
+
+    monkeypatch.setattr("app.generate_clues", fake_generate_clues)
+    monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app._build_word_components", fake_build_word_components)
+    monkeypatch.setattr("app._select_connected_clue_set", fake_select_connected_clue_set)
+    monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
+    monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
+    monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
+
+    puzzle, state = _generate_puzzle(chat_id=7, language="en", theme="Relax")
+
+    assert puzzle.language == "en"
+    assert state.chat_id == 7
+    assert call_state["replacement_calls"] >= SOFT_REPLACEMENT_RELAXATION_THRESHOLD + 1
+    assert any("Старайся использовать буквы из" in theme for theme in call_state["replacement_themes"])
+    assert isinstance(call_state["final_words"], list)
+    assert "QURU" in call_state["final_words"]
+    assert not any(letter in {"B", "C", "F", "G", "H", "I", "J", "K", "L"} for letter in set("QURU"))
 
 
 def test_replacement_attempts_trigger_regeneration(monkeypatch) -> None:
