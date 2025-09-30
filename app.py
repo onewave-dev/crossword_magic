@@ -1570,6 +1570,7 @@ async def _run_lobby_puzzle_generation(
                     "Failed to update lobby message after generation error for %s",
                     game_id,
                 )
+        _clear_generation_notice(context, chat_id)
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -1615,14 +1616,17 @@ async def _run_lobby_puzzle_generation(
     refreshed.last_update = time.time()
     refreshed.status = "lobby"
     _store_state(refreshed)
+    update_succeeded = True
     try:
         if game_id in state.lobby_messages:
             await _update_lobby_message(context, refreshed)
         else:
             await _publish_lobby_message(context, refreshed)
     except TelegramError:
+        update_succeeded = False
         logger.exception("Failed to publish lobby update for game %s", game_id)
-    else:
+    _clear_generation_notice(context, chat_id)
+    if update_succeeded:
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -3443,8 +3447,11 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         _store_state(game_state)
         _clear_pending_language(context, chat)
         set_chat_mode(context, MODE_IDLE)
-        await message.reply_text(
-            "Тема сохранена! Готовим кроссворд, это может занять немного времени."
+        await _send_generation_notice(
+            context,
+            chat.id,
+            "Тема сохранена! Готовим кроссворд, это может занять немного времени.",
+            message=message,
         )
         existing_task = state.lobby_generation_tasks.get(game_state.game_id)
         if existing_task:
@@ -4007,6 +4014,12 @@ async def lobby_start_callback_handler(
             state.lobby_generation_tasks.pop(game_state.game_id, None)
             generation_task = None
         if generation_task is None:
+            await _send_generation_notice(
+                context,
+                game_state.chat_id,
+                "Готовим кроссворд, это может занять немного времени...",
+                message=query.message,
+            )
             generation_task = asyncio.create_task(
                 _run_lobby_puzzle_generation(context, game_state.game_id, language, theme)
             )
