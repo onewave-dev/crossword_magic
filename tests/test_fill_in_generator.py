@@ -78,6 +78,23 @@ def test_generate_fill_in_puzzle_requires_intersections() -> None:
         )
 
 
+def test_generate_fill_in_puzzle_reorders_words_when_needed() -> None:
+    words = ["OMEGA", "TURF", "FOAM"]
+    puzzle = generate_fill_in_puzzle(
+        puzzle_id="reordered",
+        theme="Test",
+        language="en",
+        words=words,
+    )
+
+    answers = {slot.answer for slot in puzzle.slots}
+    for word in words:
+        assert _canonical(word, "en") in answers
+
+    assert puzzle.size_rows <= 15
+    assert puzzle.size_cols <= 15
+
+
 def test_generate_fill_in_puzzle_respects_max_size() -> None:
     with pytest.raises(FillInGenerationError):
         generate_fill_in_puzzle(
