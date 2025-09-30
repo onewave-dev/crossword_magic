@@ -2199,9 +2199,22 @@ def _generate_puzzle(
 
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
-        used_canonical_words: set[str] = {
-            _canonical_answer(clue.word, language) for clue in validated_clues
-        }
+        used_canonical_words: set[str] = set()
+        rejected_canonical_words: dict[str, int] = {}
+        current_attempt_index = 0
+
+        def _start_new_attempt(clues: Sequence[WordClue]) -> None:
+            """Reset tracking sets for a new attempt candidate list."""
+
+            nonlocal current_attempt_index
+            current_attempt_index += 1
+            used_canonical_words.clear()
+            used_canonical_words.update(
+                _canonical_answer(clue.word, language) for clue in clues
+            )
+            for canonical in list(rejected_canonical_words):
+                if canonical in used_canonical_words:
+                    rejected_canonical_words.pop(canonical, None)
         replacement_requests = 0
 
         def request_replacement(
@@ -2210,6 +2223,8 @@ def _generate_puzzle(
             nonlocal replacement_requests
             canonical = _canonical_answer(word, language)
             replacement_prompt_words.add(canonical)
+            used_canonical_words.discard(canonical)
+            rejected_canonical_words[canonical] = current_attempt_index
             other_letters: set[str] = set()
             other_letter_sets: list[set[str]] = []
             for clue in attempt_clues:
@@ -2229,7 +2244,13 @@ def _generate_puzzle(
                     return None
                 replacement_requests += 1
                 prompt_suffix = ", ".join(sorted(replacement_prompt_words))
-                avoided_words_text = ", ".join(sorted(used_canonical_words))
+                avoided_words = set(used_canonical_words)
+                avoided_words.update(
+                    canonical_word
+                    for canonical_word, attempt_marker in rejected_canonical_words.items()
+                    if attempt_marker == current_attempt_index
+                )
+                avoided_words_text = ", ".join(sorted(avoided_words))
                 letter_clause = (
                     f"Каждое слово должно содержать хотя бы одну букву из: {other_letters_text}."
                     if other_letters_text
@@ -2263,12 +2284,23 @@ def _generate_puzzle(
                 for candidate in new_validated:
                     candidate_canonical = _canonical_answer(candidate.word, language)
                     if candidate_canonical in used_canonical_words:
+                        rejected_canonical_words[candidate_canonical] = (
+                            current_attempt_index
+                        )
+                        continue
+                    candidate_rejected_attempt = rejected_canonical_words.get(
+                        candidate_canonical
+                    )
+                    if candidate_rejected_attempt == current_attempt_index:
                         continue
                     candidate_letters = _canonical_letter_set(candidate.word, language)
                     if other_letters and not (candidate_letters & other_letters):
                         logger.debug(
                             "Skipping replacement %s: no shared letters with current attempt",
                             candidate.word,
+                        )
+                        rejected_canonical_words[candidate_canonical] = (
+                            current_attempt_index
                         )
                         continue
                     score = (
@@ -2288,6 +2320,7 @@ def _generate_puzzle(
                     key=lambda item: (-item[0], -item[1], item[2]),
                 ):
                     candidate_canonical = _canonical_answer(candidate.word, language)
+                    rejected_canonical_words.pop(candidate_canonical, None)
                     used_canonical_words.add(candidate_canonical)
                     logger.debug(
                         "Selected replacement %s with score %s",
@@ -2314,6 +2347,7 @@ def _generate_puzzle(
             puzzle_id = uuid4().hex
             with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
                 attempt_clues = list(candidate_clues)
+                _start_new_attempt(attempt_clues)
                 while True:
                     try:
                         puzzle = generate_fill_in_puzzle(
