@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import MAX_REPLACEMENT_REQUESTS, _generate_puzzle
-from utils.fill_in_generator import DisconnectedWordError
+from utils.fill_in_generator import DisconnectedWordError, FillInGenerationError
 from utils.llm_generator import WordClue
 
 
@@ -94,6 +94,68 @@ def test_replacement_prefers_intersecting_words(monkeypatch) -> None:
     assert call_state["base_args"] == (10, 40)
     assert puzzle.language == "en"
     assert game_state.chat_id == 1
+
+
+def test_generation_descends_to_smaller_word_sets(monkeypatch) -> None:
+    """Ensure generation loop reduces word count before failing entirely."""
+
+    base_clues = [
+        WordClue(word=f"WORD{i:02}", clue=f"clue {i}") for i in range(1, 16)
+    ]
+    attempts: list[int] = []
+    requested_sizes: list[int] = []
+
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
+        assert (min_results, max_results) == (10, 40)
+        return base_clues
+
+    def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
+        return list(clues)
+
+    def fake_build_word_components(clues, language):
+        return [list(clues)]
+
+    def fake_select_connected_clue_set(components, language, size):
+        requested_sizes.append(size)
+        if size > len(base_clues) or size <= 0:
+            return None
+        return list(base_clues[:size])
+
+    def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
+        attempts.append(len(list(words)))
+        if len(words) > 10:
+            raise FillInGenerationError("too many words")
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
+
+    monkeypatch.setattr("app.generate_clues", fake_generate_clues)
+    monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app._build_word_components", fake_build_word_components)
+    monkeypatch.setattr("app._select_connected_clue_set", fake_select_connected_clue_set)
+    monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
+    monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
+    monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
+
+    puzzle, state = _generate_puzzle(chat_id=99, language="en", theme="Test")
+
+    assert isinstance(puzzle, SimpleNamespace)
+    assert state.chat_id == 99
+    assert attempts[0] == len(base_clues)
+    assert min(attempts) == 10
+    assert min(attempts) < len(base_clues)
+    assert min(requested_sizes) <= 10
 
 
 def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
