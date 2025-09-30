@@ -2552,6 +2552,7 @@ def _generate_puzzle(
         )
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
+        persistent_rejected_words: set[str] = set()
         used_canonical_words: set[str] = set()
 
         @dataclass(slots=True)
@@ -2599,9 +2600,31 @@ def _generate_puzzle(
             attempted_component_split = False
             replacement_failure_streak = 0
 
-            clues = generate_clues(theme=theme, language=language)
+            avoid_text = ""
+            if persistent_rejected_words:
+                avoided_words_text = ", ".join(sorted(persistent_rejected_words))
+                avoid_text = f". Избегай слов: {avoided_words_text}."
+                logger.debug(
+                    "Regeneration avoid list contains %s words",
+                    len(persistent_rejected_words),
+                )
+
+            clues = generate_clues(theme=f"{theme}{avoid_text}", language=language)
             logger.info("Received %s raw clues from LLM", len(clues))
             validated_clues = validate_word_list(language, clues, deduplicate=True)
+            if persistent_rejected_words:
+                filtered_clues = [
+                    clue
+                    for clue in validated_clues
+                    if _canonical_answer(clue.word, language)
+                    not in persistent_rejected_words
+                ]
+                if len(filtered_clues) != len(validated_clues):
+                    logger.info(
+                        "Filtered %s clues due to persistent rejections",
+                        len(validated_clues) - len(filtered_clues),
+                    )
+                validated_clues = filtered_clues
             logger.info("Validated %s clues for placement", len(validated_clues))
             if not validated_clues:
                 raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
@@ -2686,6 +2709,7 @@ def _generate_puzzle(
                     for canonical_word, info in rejected_canonical_words.items()
                     if info.last_attempt == current_attempt_index
                 )
+                avoided_words.update(persistent_rejected_words)
                 avoided_words_text = ", ".join(sorted(avoided_words))
                 soft_mode = (
                     replacement_failure_streak
@@ -2731,6 +2755,12 @@ def _generate_puzzle(
                 scored_candidates: list[tuple[int, int, str, WordClue]] = []
                 for candidate in new_validated:
                     candidate_canonical = _canonical_answer(candidate.word, language)
+                    if candidate_canonical in persistent_rejected_words:
+                        logger.debug(
+                            "Skipping replacement %s due to persistent avoidance",
+                            candidate.word,
+                        )
+                        continue
                     if candidate_canonical in used_canonical_words:
                         rejected_canonical_words[candidate_canonical] = RejectionInfo(
                             last_attempt=current_attempt_index,
@@ -2757,6 +2787,7 @@ def _generate_puzzle(
                             last_attempt=current_attempt_index,
                             reasons={"no_intersection"},
                         )
+                        persistent_rejected_words.add(candidate_canonical)
                         continue
                     if soft_mode and not (
                         candidate_letters & other_letters
@@ -2770,6 +2801,7 @@ def _generate_puzzle(
                             last_attempt=current_attempt_index,
                             reasons={"relaxed_no_target"},
                         )
+                        persistent_rejected_words.add(candidate_canonical)
                         continue
                     score = (
                         len(candidate_letters & other_letters)
