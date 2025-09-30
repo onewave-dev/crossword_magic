@@ -440,6 +440,17 @@ def _normalise_thread_id(update: Update) -> int:
     return thread_id
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds to a human-friendly HH:MM:SS string."""
+
+    total_seconds = int(max(0, round(seconds)))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
 def _get_new_game_storage(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> dict:
     if chat and chat.type in GROUP_CHAT_TYPES:
         data = getattr(context, "chat_data", None)
@@ -684,6 +695,15 @@ def _count_hints_for_player(game_state: GameState, player_id: int) -> int:
     total = 0
     for usage in game_state.hints_used.values():
         total += usage.get(player_id, 0)
+    return total
+
+
+def _total_hint_usage(game_state: GameState) -> int:
+    """Return the total number of hints used across all players."""
+
+    total = 0
+    for usage in game_state.hints_used.values():
+        total += sum(usage.values())
     return total
 
 
@@ -1162,21 +1182,38 @@ async def _handle_turn_timeout(
 
 
 def _format_leaderboard(game_state: GameState) -> str:
-    entries: list[tuple[int, int, int, str]] = []
-    for player_id, player in game_state.players.items():
-        score = game_state.scoreboard.get(player_id, 0)
-        solved = player.answers_ok
+    entries: list[tuple[int, int, int, str, int]] = []
+    seen: set[int] = set()
+    for player_id, score in game_state.scoreboard.items():
+        player = game_state.players.get(player_id)
+        name = player.name if player else str(player_id)
+        solved = player.answers_ok if player else 0
         hints = _count_hints_for_player(game_state, player_id)
-        entries.append((score, solved, hints, player.name))
+        entries.append((score, solved, hints, name, player_id))
+        seen.add(player_id)
+    for player_id, player in game_state.players.items():
+        if player_id in seen:
+            continue
+        hints = _count_hints_for_player(game_state, player_id)
+        entries.append(
+            (
+                game_state.scoreboard.get(player_id, 0),
+                player.answers_ok,
+                hints,
+                player.name,
+                player_id,
+            )
+        )
     if not entries:
-        return "Нет результатов."
+        return "<i>Нет результатов.</i>"
     entries.sort(key=lambda item: (-item[0], -item[1], item[2], item[3].lower()))
     lines = []
-    for index, (score, solved, hints, name) in enumerate(entries, start=1):
+    for index, (score, solved, hints, name, _) in enumerate(entries, start=1):
+        display_name = html.escape(name or f"Игрок {index}")
         lines.append(
-            f"{index}. {name} — {score} очков, решено: {solved}, подсказки: {hints}"
+            f"{index}. <b>{display_name}</b> — {score} очков • ✅ {solved} • 💡 {hints}"
         )
-    return "\n".join(lines)
+    return "<br/>".join(lines)
 
 
 async def _finish_game(
@@ -1193,15 +1230,41 @@ async def _finish_game(
     _cancel_turn_timers(game_state)
     _cancel_game_timers(game_state)
     _cancel_dummy_job(game_state)
+    solved_before = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+    total_slots = sum(1 for ref in iter_slot_refs(puzzle) if ref.slot.answer)
+    solved_before_count = len(solved_before)
+    revealed_now = _solve_remaining_slots(game_state, puzzle)
+    unsolved_count = len(revealed_now)
+    total_hints = _total_hint_usage(game_state)
+    duration_seconds = max(0.0, time.time() - game_state.started_at)
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        logger.info(
+            "Game finished: solved=%s/%s unsolved=%s hints=%s",
+            solved_before_count,
+            total_slots,
+            unsolved_count,
+            total_hints,
+        )
     game_state.status = "finished"
     game_state.active_slot_id = None
     game_state.last_update = time.time()
     summary = _format_leaderboard(game_state)
-    lines = ["Игра завершена!"]
+    language_text = html.escape((puzzle.language or "?").upper())
+    theme_text = html.escape(puzzle.theme or "Без темы")
+    lines = [
+        "🏁 <b>Игра завершена!</b>",
+        f"🧩 <b>Язык:</b> {language_text} • <b>Тема:</b> {theme_text}",
+    ]
     if reason:
-        lines.append(reason)
+        lines.append(f"📝 {html.escape(reason)}")
     lines.append("")
-    lines.append("Итоги:")
+    lines.append("📊 <b>Статистика</b>")
+    lines.append(f"• Слов разгадано: <b>{solved_before_count}</b> из {total_slots}")
+    lines.append(f"• Осталось без ответа: <b>{unsolved_count}</b>")
+    lines.append(f"• Подсказок использовано: <b>{total_hints}</b>")
+    lines.append(f"• Время: <b>{_format_duration(duration_seconds)}</b>")
+    lines.append("")
+    lines.append("🏆 <b>Лидерборд</b>")
     lines.append(summary)
     dummy_summary: str | None = None
     if game_state.test_mode:
@@ -1224,8 +1287,18 @@ async def _finish_game(
                 accuracy,
                 average_delay,
             )
+    if revealed_now:
+        lines.append("")
+        lines.append("🔐 <b>Неразгаданные ответы</b>")
+        for slot_id, answer in revealed_now:
+            lines.append(
+                f"<code>{html.escape(slot_id)}</code> — <b>{html.escape(answer)}</b>"
+            )
     if dummy_summary:
-        lines.append(dummy_summary)
+        lines.append("")
+        lines.append(f"<i>{html.escape(dummy_summary)}</i>")
+    lines.append("")
+    lines.append("Спасибо за игру! Хотите реванш? Используйте кнопки ниже или команду /new.")
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -1246,11 +1319,94 @@ async def _finish_game(
         await context.bot.send_message(
             chat_id=game_state.chat_id,
             text="\n".join(lines),
+            parse_mode=constants.ParseMode.HTML,
             reply_markup=keyboard,
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send finish summary for game %s", game_state.game_id)
     _store_state(game_state)
+
+
+async def _finish_single_game(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    game_state: GameState,
+    *,
+    reason: str | None = None,
+) -> None:
+    chat = message.chat
+    chat_id = chat.id if chat else game_state.chat_id
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        _cancel_reminder(context)
+        set_chat_mode(context, MODE_IDLE)
+        await message.reply_text("Кроссворд не найден. Запустите /new.")
+        _cleanup_game_state(game_state)
+        return
+
+    solved_before = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
+    total_slots = sum(1 for ref in iter_slot_refs(puzzle) if ref.slot.answer)
+    solved_before_count = len(solved_before)
+    revealed_now = _solve_remaining_slots(game_state, puzzle)
+    unsolved_count = len(revealed_now)
+    total_hints = _total_hint_usage(game_state)
+    player_id = _resolve_player_id(game_state)
+    score_value = (
+        game_state.scoreboard.get(player_id, game_state.score)
+        if player_id is not None
+        else game_state.score
+    )
+    duration_seconds = max(0.0, time.time() - game_state.started_at)
+    language_text = html.escape((puzzle.language or "?").upper())
+    theme_text = html.escape(puzzle.theme or "Без темы")
+    reason_line = (
+        f"<i>{html.escape(reason)}</i>"
+        if reason
+        else "<i>Игра завершена по вашей команде.</i>"
+    )
+
+    with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
+        logger.info(
+            "Single game finished: solved=%s/%s unsolved=%s hints=%s",
+            solved_before_count,
+            total_slots,
+            unsolved_count,
+            total_hints,
+        )
+
+    lines = [
+        "🏁 <b>Игра завершена.</b>",
+        f"🧩 <b>Язык:</b> {language_text} • <b>Тема:</b> {theme_text}",
+        reason_line,
+        "",
+        "📊 <b>Ваш результат</b>",
+        f"• Очки: <b>{score_value}</b>",
+        f"• Слов разгадано: <b>{solved_before_count}</b> из {total_slots}",
+        f"• Осталось без ответа: <b>{unsolved_count}</b>",
+        f"• Подсказок использовано: <b>{total_hints}</b>",
+        f"• Время: <b>{_format_duration(duration_seconds)}</b>",
+    ]
+    if revealed_now:
+        lines.append("")
+        lines.append("🔐 <b>Неразгаданные ответы</b>")
+        for slot_id, answer in revealed_now:
+            lines.append(
+                f"<code>{html.escape(slot_id)}</code> — <b>{html.escape(answer)}</b>"
+            )
+    lines.append("")
+    lines.append("🔁 Готовы к новому раунду? Используйте кнопки ниже или отправьте /new.")
+
+    text = "\n".join(lines)
+
+    _cancel_reminder(context)
+    set_chat_mode(context, MODE_IDLE)
+    game_state.status = "finished"
+    game_state.active_slot_id = None
+    game_state.last_update = time.time()
+    _store_state(game_state)
+
+    await message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+    await _send_completion_options(context, chat_id, message, puzzle)
 
 
 def _user_display_name(user: User | None) -> str:
@@ -4919,25 +5075,76 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
 
+def _find_turn_game_for_private_chat(
+    chat_id: int, user_id: int | None
+) -> GameState | None:
+    if user_id is None:
+        return None
+    for candidate in state.active_games.values():
+        if candidate.mode != "turn_based":
+            continue
+        player = candidate.players.get(user_id)
+        if player is None:
+            continue
+        if player.dm_chat_id == chat_id or player.user_id == chat_id:
+            return candidate
+    return None
+
+
 @command_entrypoint()
 async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
-    if chat is None or message is None or user is None:
+    if chat is None or message is None:
         return
+    user_id = user.id if user else None
     game_state = _load_state_for_chat(chat.id)
-    if not game_state or game_state.mode != "turn_based":
-        await message.reply_text("В этом чате нет мультиплеерной игры.")
+    if game_state is None and chat.type == ChatType.PRIVATE:
+        game_state = _find_turn_game_for_private_chat(chat.id, user_id)
+    if not game_state:
+        if chat.type in GROUP_CHAT_TYPES:
+            await message.reply_text("В этом чате нет активной игры.")
+        else:
+            await message.reply_text("Нет активного кроссворда. Используйте /new.")
         return
-    if user.id != game_state.host_id:
-        await message.reply_text("Завершить игру может только хост.")
+
+    logger.info(
+        "Processing /finish request (mode=%s, chat=%s, game=%s)",
+        game_state.mode,
+        chat.id,
+        game_state.game_id,
+    )
+
+    if game_state.mode == "turn_based":
+        if game_state.status == "finished":
+            await message.reply_text("Игра уже завершена.")
+            return
+        if game_state.status != "running":
+            await message.reply_text("Игра ещё не запущена.")
+            return
+        if game_state.host_id is not None and user_id != game_state.host_id:
+            await message.reply_text("Завершить игру может только хост.")
+            return
+        reason_text = "Игроки решили завершить игру. 🤝"
+        await _finish_game(context, game_state, reason=reason_text)
+        if chat.id != game_state.chat_id:
+            await message.reply_text("Итоги опубликованы в групповом чате.")
+        return
+
+    if chat.type in GROUP_CHAT_TYPES:
+        await message.reply_text("Эта команда доступна только в личной игре.")
         return
     if game_state.status == "finished":
         await message.reply_text("Игра уже завершена.")
         return
-    await _finish_game(context, game_state, reason="Игра завершена хостом.")
+    await _finish_single_game(
+        context,
+        message,
+        game_state,
+        reason="Вы решили завершить игру. 🤝",
+    )
 
 
 @command_entrypoint()
