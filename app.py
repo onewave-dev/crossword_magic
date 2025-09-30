@@ -2207,10 +2207,13 @@ def _generate_puzzle(
             canonical = _canonical_answer(word, language)
             replacement_prompt_words.add(canonical)
             other_letters: set[str] = set()
+            other_letter_sets: list[set[str]] = []
             for clue in attempt_clues:
                 if _canonical_answer(clue.word, language) == canonical:
                     continue
-                other_letters.update(_canonical_letter_set(clue.word, language))
+                letters = _canonical_letter_set(clue.word, language)
+                other_letters.update(letters)
+                other_letter_sets.append(letters)
             other_letters_text = ", ".join(sorted(other_letters))
             while True:
                 if replacement_requests >= MAX_REPLACEMENT_REQUESTS:
@@ -2247,6 +2250,7 @@ def _generate_puzzle(
                 logger.info(
                     "Validated %s replacement candidates", len(new_validated)
                 )
+                scored_candidates: list[tuple[int, int, str, WordClue]] = []
                 for candidate in new_validated:
                     candidate_canonical = _canonical_answer(candidate.word, language)
                     if candidate_canonical in used_canonical_words:
@@ -2258,7 +2262,29 @@ def _generate_puzzle(
                             candidate.word,
                         )
                         continue
+                    score = (
+                        len(candidate_letters & other_letters)
+                        if other_letters
+                        else sum(
+                            len(candidate_letters & letters)
+                            for letters in other_letter_sets
+                        )
+                    )
+                    scored_candidates.append(
+                        (score, len(candidate_canonical), candidate.word, candidate)
+                    )
+
+                for score, _, _, candidate in sorted(
+                    scored_candidates,
+                    key=lambda item: (-item[0], -item[1], item[2]),
+                ):
+                    candidate_canonical = _canonical_answer(candidate.word, language)
                     used_canonical_words.add(candidate_canonical)
+                    logger.debug(
+                        "Selected replacement %s with score %s",
+                        candidate.word,
+                        score,
+                    )
                     return candidate
                 logger.warning(
                     "Replacement attempt %s did not provide new unique words",
