@@ -2037,9 +2037,51 @@ def _build_word_components(clues: Sequence[WordClue], language: str) -> list[lis
             component_indices.append(current)
             stack.extend(graph[current])
         if component_indices:
+            component_indices.sort()
             components.append([clues[i] for i in component_indices])
     components.sort(key=len, reverse=True)
     return components
+
+
+def _select_connected_clue_set(
+    components: Sequence[Sequence[WordClue]], language: str, size: int
+) -> list[WordClue] | None:
+    """Return a connected subset of clues with the requested size if available."""
+
+    if size <= 0:
+        return []
+
+    def _extract_from_component(component: Sequence[WordClue]) -> list[WordClue] | None:
+        if len(component) < size:
+            return None
+        letter_sets = [
+            _canonical_letter_set(clue.word, language) for clue in component
+        ]
+        indices = list(range(len(component)))
+        for start_pos, start_idx in enumerate(indices):
+            selected = [start_idx]
+            remaining = indices[:start_pos] + indices[start_pos + 1 :]
+            current_letters = set(letter_sets[start_idx])
+            while len(selected) < size and remaining:
+                found = False
+                for pos, idx in enumerate(remaining):
+                    if letter_sets[idx] & current_letters:
+                        selected.append(idx)
+                        current_letters.update(letter_sets[idx])
+                        remaining.pop(pos)
+                        found = True
+                        break
+                if not found:
+                    break
+            if len(selected) == size:
+                return [component[i] for i in sorted(selected)]
+        return None
+
+    for component in components:
+        subset = _extract_from_component(component)
+        if subset is not None:
+            return subset
+    return None
 
 
 def _generate_composite(
@@ -2136,6 +2178,11 @@ def _generate_puzzle(
         logger.info("Received %s raw clues from LLM", len(clues))
         validated_clues = validate_word_list(language, clues, deduplicate=True)
         logger.info("Validated %s clues for placement", len(validated_clues))
+        word_components = _build_word_components(validated_clues, language)
+        logger.debug(
+            "Identified %s connected word components after validation",
+            len(word_components),
+        )
         if not validated_clues:
             raise RuntimeError("Не удалось подобрать ни одного подходящего слова")
 
@@ -2203,7 +2250,30 @@ def _generate_puzzle(
 
 
         for limit in range(max_attempt_words, min_attempt_words - 1, -1):
-            candidate_clues = list(validated_clues[:limit])
+            candidate_clues = _select_connected_clue_set(
+                word_components, language, limit
+            )
+            if not candidate_clues:
+                if limit == min_attempt_words and word_components:
+                    fallback = list(word_components[0][:limit]) or list(word_components[0])
+                    if fallback:
+                        logger.debug(
+                            "Falling back to largest connected component with %s words",
+                            len(fallback),
+                        )
+                        candidate_clues = fallback
+                    else:
+                        logger.debug(
+                            "Skipping attempt with %s words: no connected subset available",
+                            limit,
+                        )
+                        continue
+                else:
+                    logger.debug(
+                        "Skipping attempt with %s words: no connected subset available",
+                        limit,
+                    )
+                    continue
             puzzle_id = uuid4().hex
             with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
                 attempt_clues = list(candidate_clues)
@@ -2252,11 +2322,9 @@ def _generate_puzzle(
                         if (
                             not attempted_component_split
                             and limit == max_attempt_words
-                            and len(validated_clues[:limit]) > 1
+                            and len(validated_clues) > 1
                         ):
-                            components = _build_word_components(
-                                validated_clues[:limit], language
-                            )
+                            components = word_components
                             attempted_component_split = True
                             if len(components) > 1:
                                 logger.info(
