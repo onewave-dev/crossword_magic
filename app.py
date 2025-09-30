@@ -332,6 +332,9 @@ TURN_SLOT_CALLBACK_PREFIX = "turn_slot:"
 
 MAX_PUZZLE_SIZE = 15
 MAX_REPLACEMENT_REQUESTS = 30
+# After this many consecutive replacement attempts without a usable word we
+# temporarily relax the intersection requirement for LLM suggestions.
+SOFT_REPLACEMENT_RELAXATION_THRESHOLD = 3
 
 _ADMIN_FIRST_RAW = os.getenv("ADMIN_FIRST", "false").strip().lower()
 ADMIN_FIRST = _ADMIN_FIRST_RAW in {"1", "true", "yes", "on"}
@@ -2181,9 +2184,18 @@ def _generate_puzzle(
         attempted_component_split = False
         replacement_prompt_words: set[str] = set()
         used_canonical_words: set[str] = set()
-        rejected_canonical_words: dict[str, int] = {}
+
+        @dataclass(slots=True)
+        class RejectionInfo:
+            """Metadata describing why a candidate was skipped in an attempt."""
+
+            last_attempt: int
+            reasons: set[str]
+
+        rejected_canonical_words: dict[str, RejectionInfo] = {}
         replacement_requests = 0
         current_attempt_index = 0
+        replacement_failure_streak = 0
         clues: Sequence[WordClue] | None = None
         validated_clues: list[WordClue] = []
         word_components: list[list[WordClue]] = []
@@ -2203,6 +2215,7 @@ def _generate_puzzle(
             nonlocal attempted_component_split
             nonlocal replacement_requests
             nonlocal current_attempt_index
+            nonlocal replacement_failure_streak
 
             if not initial:
                 logger.info(
@@ -2215,6 +2228,7 @@ def _generate_puzzle(
             replacement_requests = 0
             current_attempt_index = 0
             attempted_component_split = False
+            replacement_failure_streak = 0
 
             clues = generate_clues(theme=theme, language=language)
             logger.info("Received %s raw clues from LLM", len(clues))
@@ -2230,7 +2244,10 @@ def _generate_puzzle(
             )
 
             max_attempt_words = min(len(validated_clues), 80)
-            dynamic_floor = int(max_attempt_words * 0.6)
+            # Allow attempts that use roughly half of the validated pool while
+            # preserving the legacy absolute minimum so difficult topics remain
+            # feasible without forcing extremely sparse grids.
+            dynamic_floor = int(max_attempt_words * 0.5)
             min_attempt_words = min(
                 max_attempt_words,
                 max(8, min(30, dynamic_floor)),
@@ -2248,24 +2265,34 @@ def _generate_puzzle(
             """Reset tracking sets for a new attempt candidate list."""
 
             nonlocal current_attempt_index
+            nonlocal replacement_failure_streak
             current_attempt_index += 1
             used_canonical_words.clear()
             used_canonical_words.update(
                 _canonical_answer(clue.word, language) for clue in clues
             )
-            for canonical in list(rejected_canonical_words):
+            replacement_failure_streak = 0
+            for canonical, info in list(rejected_canonical_words.items()):
                 if canonical in used_canonical_words:
                     rejected_canonical_words.pop(canonical, None)
+                    continue
+                if info.last_attempt < current_attempt_index:
+                    info.reasons.clear()
         def request_replacement(
             word: str, attempt_clues: Sequence[WordClue]
         ) -> WordClue | None:
             nonlocal replacement_requests
+            nonlocal replacement_failure_streak
             canonical = _canonical_answer(word, language)
             replacement_prompt_words.add(canonical)
             used_canonical_words.discard(canonical)
-            rejected_canonical_words[canonical] = current_attempt_index
+            rejected_canonical_words[canonical] = RejectionInfo(
+                last_attempt=current_attempt_index,
+                reasons={"original"},
+            )
             other_letters: set[str] = set()
             other_letter_sets: list[set[str]] = []
+            target_letter_set = _canonical_letter_set(word, language)
             for clue in attempt_clues:
                 if _canonical_answer(clue.word, language) == canonical:
                     continue
@@ -2287,15 +2314,27 @@ def _generate_puzzle(
                 avoided_words = set(used_canonical_words)
                 avoided_words.update(
                     canonical_word
-                    for canonical_word, attempt_marker in rejected_canonical_words.items()
-                    if attempt_marker == current_attempt_index
+                    for canonical_word, info in rejected_canonical_words.items()
+                    if info.last_attempt == current_attempt_index
                 )
                 avoided_words_text = ", ".join(sorted(avoided_words))
-                letter_clause = (
-                    f"Каждое слово должно содержать хотя бы одну букву из: {other_letters_text}."
-                    if other_letters_text
-                    else "Предложи новые слова без повторов."
+                soft_mode = (
+                    replacement_failure_streak
+                    >= SOFT_REPLACEMENT_RELAXATION_THRESHOLD
                 )
+                if other_letters_text:
+                    if soft_mode:
+                        letter_clause = (
+                            "Старайся использовать буквы из: "
+                            f"{other_letters_text}, допускаются редкие исключения."
+                        )
+                    else:
+                        letter_clause = (
+                            "Каждое слово должно содержать хотя бы одну букву из: "
+                            f"{other_letters_text}."
+                        )
+                else:
+                    letter_clause = "Предложи новые слова без повторов."
                 replacement_theme = (
                     f"{theme}. Подбери 6-8 новых слов для кроссворда вместо: {prompt_suffix}. "
                     f"{letter_clause} Избегай слов: {avoided_words_text}."
@@ -2324,23 +2363,43 @@ def _generate_puzzle(
                 for candidate in new_validated:
                     candidate_canonical = _canonical_answer(candidate.word, language)
                     if candidate_canonical in used_canonical_words:
-                        rejected_canonical_words[candidate_canonical] = (
-                            current_attempt_index
+                        rejected_canonical_words[candidate_canonical] = RejectionInfo(
+                            last_attempt=current_attempt_index,
+                            reasons={"duplicate"},
                         )
                         continue
-                    candidate_rejected_attempt = rejected_canonical_words.get(
+                    candidate_record = rejected_canonical_words.get(
                         candidate_canonical
                     )
-                    if candidate_rejected_attempt == current_attempt_index:
+                    if (
+                        candidate_record is not None
+                        and candidate_record.last_attempt == current_attempt_index
+                    ):
                         continue
                     candidate_letters = _canonical_letter_set(candidate.word, language)
-                    if other_letters and not (candidate_letters & other_letters):
+                    if other_letters and not soft_mode and not (
+                        candidate_letters & other_letters
+                    ):
                         logger.debug(
                             "Skipping replacement %s: no shared letters with current attempt",
                             candidate.word,
                         )
-                        rejected_canonical_words[candidate_canonical] = (
-                            current_attempt_index
+                        rejected_canonical_words[candidate_canonical] = RejectionInfo(
+                            last_attempt=current_attempt_index,
+                            reasons={"no_intersection"},
+                        )
+                        continue
+                    if soft_mode and not (
+                        candidate_letters & other_letters
+                        or candidate_letters & target_letter_set
+                    ):
+                        logger.debug(
+                            "Skipping %s even in relaxed mode: no overlap with target letters",
+                            candidate.word,
+                        )
+                        rejected_canonical_words[candidate_canonical] = RejectionInfo(
+                            last_attempt=current_attempt_index,
+                            reasons={"relaxed_no_target"},
                         )
                         continue
                     score = (
@@ -2362,6 +2421,7 @@ def _generate_puzzle(
                     candidate_canonical = _canonical_answer(candidate.word, language)
                     rejected_canonical_words.pop(candidate_canonical, None)
                     used_canonical_words.add(candidate_canonical)
+                    replacement_failure_streak = 0
                     logger.debug(
                         "Selected replacement %s with score %s",
                         candidate.word,
@@ -2372,6 +2432,7 @@ def _generate_puzzle(
                     "Replacement attempt %s did not provide new unique words",
                     replacement_requests,
                 )
+                replacement_failure_streak += 1
 
 
         restart_marker = object()
