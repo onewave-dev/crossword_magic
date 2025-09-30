@@ -229,6 +229,104 @@ def test_replacement_prefers_highest_scoring_candidate(monkeypatch) -> None:
     assert len(call_state["final_words"]) == len(base_clues)
 
 
+def test_rejected_word_can_return_in_followup_attempt(monkeypatch) -> None:
+    """Allow previously rejected word to reappear after attempt reset."""
+
+    base_clues = [
+        WordClue(word="ALPHA", clue="first"),
+        WordClue(word="BETA", clue="second"),
+        WordClue(word="GAMMA", clue="third"),
+        WordClue(word="DELTA", clue="fourth"),
+        WordClue(word="EPSILON", clue="fifth"),
+        WordClue(word="ZETA", clue="sixth"),
+        WordClue(word="ETA", clue="seventh"),
+        WordClue(word="THETA", clue="eighth"),
+        WordClue(word="IOTA", clue="ninth"),
+        WordClue(word="KAPPA", clue="tenth"),
+    ]
+
+    call_state: dict[str, object] = {
+        "replacement_calls": 0,
+        "generate_calls": [],
+        "final_words": None,
+        "selection_sizes": [],
+    }
+
+    def fake_generate_clues(
+        theme: str,
+        language: str,
+        *,
+        min_results: int = 10,
+        max_results: int = 40,
+    ):
+        if "вместо" in theme:
+            call_state["replacement_calls"] = int(call_state["replacement_calls"]) + 1
+            if call_state["replacement_calls"] == 1:
+                return [
+                    WordClue(word="BETA", clue="duplicate"),
+                    WordClue(word="OMEGA", clue="alt"),
+                ]
+            return [WordClue(word="BETA", clue="retry")]
+        return base_clues
+
+    def fake_validate_word_list(language: str, clues, deduplicate: bool = True):
+        return list(clues)
+
+    def fake_build_word_components(clues, language):
+        return [list(clues)]
+
+    def fake_select_connected_clue_set(components, language, size):
+        call_state["selection_sizes"].append(size)
+        if size > len(base_clues) or size <= 0:
+            return None
+        if len(call_state["selection_sizes"]) == 1:
+            return list(base_clues[:size])
+        subset = [base_clues[0]]
+        idx = 2
+        while len(subset) < size and idx < len(base_clues):
+            subset.append(base_clues[idx])
+            idx += 1
+        return subset
+
+    def fake_generate_fill_in_puzzle(puzzle_id, theme, language, words, max_size=15):
+        call_state["generate_calls"].append(list(words))
+        call_number = len(call_state["generate_calls"])
+        if call_number == 1:
+            raise DisconnectedWordError("ALPHA")
+        if call_number == 2:
+            raise FillInGenerationError("attempt failed")
+        if call_number == 3:
+            raise DisconnectedWordError("ALPHA")
+        call_state["final_words"] = list(words)
+        return SimpleNamespace(
+            id=puzzle_id,
+            language=language,
+            theme=theme,
+            slots=[],
+        )
+
+    monkeypatch.setattr("app.generate_clues", fake_generate_clues)
+    monkeypatch.setattr("app.validate_word_list", fake_validate_word_list)
+    monkeypatch.setattr("app._build_word_components", fake_build_word_components)
+    monkeypatch.setattr("app._select_connected_clue_set", fake_select_connected_clue_set)
+    monkeypatch.setattr("app.generate_fill_in_puzzle", fake_generate_fill_in_puzzle)
+    monkeypatch.setattr("app._assign_clues_to_slots", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.save_puzzle", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.puzzle_to_dict", lambda puzzle: {})
+    monkeypatch.setattr("app._store_state", lambda *args, **kwargs: None)
+
+    puzzle, state = _generate_puzzle(chat_id=5, language="en", theme="Retry")
+
+    assert puzzle.language == "en"
+    assert state.chat_id == 5
+    assert call_state["replacement_calls"] == 2
+    assert len(call_state["generate_calls"]) >= 4
+    assert any("OMEGA" in words for words in call_state["generate_calls"][:2])
+    assert "BETA" not in call_state["generate_calls"][2]
+    assert isinstance(call_state["final_words"], list)
+    assert "BETA" in call_state["final_words"]
+
+
 def test_replacement_attempt_cap(monkeypatch) -> None:
     """Abort replacement requests after hitting the configured cap."""
 
