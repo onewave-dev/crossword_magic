@@ -666,7 +666,8 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert game_state.scoreboard[1] == puzzle.slots[0].length
+    assert game_state.scoreboard[1] == app.SCORE_PER_WORD
+    assert game_state.score == app.SCORE_PER_WORD
     assert game_state.turn_index == 1
     assert game_state.players[1].answers_ok == 1
     assert initial_warn_job.cancelled is True
@@ -717,6 +718,7 @@ async def test_turn_based_hint_penalises_current_player(monkeypatch, tmp_path, f
     await hint_command(update, context)
 
     assert game_state.scoreboard[1] == -HINT_PENALTY
+    assert game_state.score == -HINT_PENALTY
     assert game_state.hints_used
     message.reply_photo.assert_awaited()
 
@@ -738,7 +740,10 @@ async def test_finish_command_triggers_finish(monkeypatch, fresh_state):
     await finish_command(update, context)
 
     finish_mock.assert_awaited_once()
-    assert "хостом" in finish_mock.await_args.kwargs.get("reason", "")
+    assert (
+        finish_mock.await_args.kwargs.get("reason")
+        == "Игроки решили завершить игру. 🤝"
+    )
 
 
 @pytest.mark.anyio
@@ -790,10 +795,10 @@ def test_format_leaderboard_orders_players(fresh_state):
 
     text = app._format_leaderboard(game_state)
 
-    lines = text.splitlines()
-    assert lines[0].startswith("1. Игрок 3")
-    assert lines[1].startswith("2. Игрок 2")
-    assert "подсказки: 2" in lines[0]
+    lines = text.split("<br/>")
+    assert lines[0].startswith("1. <b>Игрок 3")
+    assert lines[1].startswith("2. <b>Игрок 2")
+    assert "💡 2" in lines[0]
 
 
 @pytest.mark.anyio
@@ -1004,7 +1009,7 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     caplog.set_level("INFO")
     await app._dummy_turn_job(context)
 
-    assert game_state.scoreboard[app.DUMMY_USER_ID] == puzzle.slots[0].length
+    assert game_state.scoreboard[app.DUMMY_USER_ID] == app.SCORE_PER_WORD
     assert game_state.dummy_successes == 1
     assert dummy_player.answers_ok == 1
     finish_mock.assert_awaited()
