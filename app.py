@@ -1560,12 +1560,26 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
         game_id = state.chat_to_game.get(chat_id)
         if game_id and game_id in state.active_games:
             return state.active_games[game_id]
-        identifier = game_id if game_id is not None else chat_id
-        restored = load_state(identifier)
+        identifiers_to_try: list[str | int] = []
+        if game_id is not None:
+            identifiers_to_try.append(game_id)
+        identifiers_to_try.append(chat_id)
+        restored: Optional[GameState] = None
+        for identifier in identifiers_to_try:
+            restored = load_state(identifier)
+            if restored is not None:
+                if identifier == chat_id and game_id is not None:
+                    logger.info(
+                        "Recovered state for chat %s using raw chat id after stale mapping",
+                        chat_id,
+                    )
+                break
         if restored is None:
             if game_id is not None:
                 state.chat_to_game.pop(chat_id, None)
             return None
+        if game_id is not None and game_id != restored.game_id:
+            state.active_games.pop(game_id, None)
         state.active_games[restored.game_id] = restored
         state.chat_to_game[restored.chat_id] = restored.game_id
         for code, target in list(state.join_codes.items()):
