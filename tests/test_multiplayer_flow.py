@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram import InlineKeyboardMarkup
 from telegram.constants import ChatType
 from telegram.ext import ConversationHandler
 
@@ -13,11 +14,17 @@ from app import (
     LOBBY_START_CALLBACK_PREFIX,
     LOBBY_WAIT_CALLBACK_PREFIX,
     MAX_LOBBY_PLAYERS,
+    MENU_STATE,
+    NEW_GAME_MODE_GROUP,
+    NEW_GAME_MODE_SOLO,
+    Settings,
     finish_command,
     hint_command,
     join_command,
     lobby_link_callback_handler,
     lobby_start_callback_handler,
+    new_game_menu_admin_proxy_handler,
+    new_game_menu_callback_handler,
     start_new_game,
     state,
 )
@@ -240,6 +247,210 @@ async def test_start_command_with_join_code(monkeypatch, fresh_state):
 
     assert result == ConversationHandler.END
     process_mock.assert_awaited_once_with(update, context, "ABCDEF")
+
+
+@pytest.mark.anyio
+async def test_start_new_game_shows_menu_private(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=101, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=55)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(args=[], chat_data={}, user_data={}, bot=SimpleNamespace())
+
+    result = await start_new_game(update, context)
+
+    assert result == MENU_STATE
+    message.reply_text.assert_awaited()
+    call = message.reply_text.await_args
+    assert "Выберите, как хотите играть" in call.args[0]
+    markup = call.kwargs["reply_markup"]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert markup.inline_keyboard[0][0].callback_data == NEW_GAME_MODE_SOLO
+    assert markup.inline_keyboard[1][0].callback_data == NEW_GAME_MODE_GROUP
+
+
+@pytest.mark.anyio
+async def test_start_new_game_adds_admin_button_for_admin(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=303, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=999)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    state.settings = Settings(
+        telegram_bot_token="token",
+        public_url="https://example.com",
+        webhook_secret="secret",
+        admin_id=user.id,
+    )
+    context = SimpleNamespace(args=[], chat_data={}, user_data={}, bot=SimpleNamespace())
+
+    result = await start_new_game(update, context)
+
+    assert result == MENU_STATE
+    call = message.reply_text.await_args
+    markup = call.kwargs["reply_markup"]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert len(markup.inline_keyboard) == 3
+    assert (
+        markup.inline_keyboard[-1][0].callback_data
+        == f"{app.ADMIN_TEST_GAME_CALLBACK_PREFIX}{chat.id}"
+    )
+    assert "[адм.] Тестовая сессия" in call.args[0]
+
+
+@pytest.mark.anyio
+async def test_new_game_menu_solo_starts_private_flow(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=404, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None)
+    job = DummyJob(chat.id, "reminder")
+    context = SimpleNamespace(
+        chat_data={
+            "reminder_job": job,
+            app.GENERATION_NOTICE_KEY: {"active": True},
+            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
+            "lobby_message_id": 123,
+        },
+        user_data={"new_game_language": "ru", "pending_join": object()},
+        bot=SimpleNamespace(),
+    )
+    query = SimpleNamespace(
+        data=NEW_GAME_MODE_SOLO,
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=1),
+        callback_query=query,
+    )
+    private_mock = AsyncMock(return_value=LANGUAGE_STATE)
+    monkeypatch.setattr(app, "_start_new_private_game", private_mock)
+
+    result = await new_game_menu_callback_handler(update, context)
+
+    assert result == LANGUAGE_STATE
+    private_mock.assert_awaited_once_with(update, context)
+    query.answer.assert_awaited_once()
+    assert job.cancelled is True
+    assert "reminder_job" not in context.chat_data
+    assert app.BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert app.GENERATION_NOTICE_KEY not in context.chat_data
+    assert "lobby_message_id" not in context.chat_data
+    assert "new_game_language" not in context.user_data
+    assert "pending_join" not in context.user_data
+
+
+@pytest.mark.anyio
+async def test_new_game_menu_group_starts_group_flow(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=-505, type=ChatType.GROUP)
+    message = SimpleNamespace(message_thread_id=None)
+    job = DummyJob(chat.id, "reminder")
+    context = SimpleNamespace(
+        chat_data={
+            "reminder_job": job,
+            app.GENERATION_NOTICE_KEY: {"active": True},
+            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
+        },
+        user_data={"pending_join": object()},
+        bot=SimpleNamespace(),
+    )
+    query = SimpleNamespace(
+        data=NEW_GAME_MODE_GROUP,
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=2),
+        callback_query=query,
+    )
+    group_mock = AsyncMock(return_value=ConversationHandler.END)
+    monkeypatch.setattr(app, "_start_new_group_game", group_mock)
+
+    result = await new_game_menu_callback_handler(update, context)
+
+    assert result == ConversationHandler.END
+    group_mock.assert_awaited_once_with(update, context)
+    query.answer.assert_awaited_once()
+    assert job.cancelled is True
+    assert "reminder_job" not in context.chat_data
+    assert app.BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert app.GENERATION_NOTICE_KEY not in context.chat_data
+    assert "pending_join" not in context.user_data
+
+
+@pytest.mark.anyio
+async def test_new_game_menu_group_requires_group_chat(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=808, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None)
+    context = SimpleNamespace(chat_data={}, user_data={}, bot=SimpleNamespace())
+    query = SimpleNamespace(
+        data=NEW_GAME_MODE_GROUP,
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=3),
+        callback_query=query,
+    )
+    group_mock = AsyncMock()
+    monkeypatch.setattr(app, "_start_new_group_game", group_mock)
+
+    result = await new_game_menu_callback_handler(update, context)
+
+    assert result == MENU_STATE
+    group_mock.assert_not_called()
+    query.answer.assert_awaited_once()
+    call = query.answer.await_args
+    assert call.kwargs.get("show_alert") is True
+
+
+@pytest.mark.anyio
+async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=909, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None)
+    job = DummyJob(chat.id, "reminder")
+    context = SimpleNamespace(
+        chat_data={
+            "reminder_job": job,
+            app.GENERATION_NOTICE_KEY: {"active": True},
+            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
+        },
+        user_data={"pending_join": object(), "new_game_language": "en"},
+        bot=SimpleNamespace(),
+    )
+    query = SimpleNamespace(
+        data=f"{app.ADMIN_TEST_GAME_CALLBACK_PREFIX}{chat.id}",
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=4),
+        callback_query=query,
+    )
+
+    result = await new_game_menu_admin_proxy_handler(update, context)
+
+    assert result == ConversationHandler.END
+    assert job.cancelled is True
+    assert "reminder_job" not in context.chat_data
+    assert app.BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert app.GENERATION_NOTICE_KEY not in context.chat_data
+    assert "pending_join" not in context.user_data
+    assert "new_game_language" not in context.user_data
 
 
 def test_lobby_keyboard_start_activation(fresh_state):

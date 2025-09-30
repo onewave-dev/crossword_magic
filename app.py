@@ -313,7 +313,7 @@ def register_webhook_route(path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-LANGUAGE_STATE, THEME_STATE = range(2)
+MENU_STATE, LANGUAGE_STATE, THEME_STATE = range(3)
 
 MODE_IDLE = "idle"
 MODE_AWAIT_LANGUAGE = "await_language"
@@ -480,6 +480,10 @@ INLINE_ANSWER_PATTERN = re.compile(
 COMPLETION_CALLBACK_PREFIX = "complete:"
 SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
 NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
+
+NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
+NEW_GAME_MODE_SOLO = f"{NEW_GAME_MENU_CALLBACK_PREFIX}solo"
+NEW_GAME_MODE_GROUP = f"{NEW_GAME_MENU_CALLBACK_PREFIX}group"
 
 BUTTON_NEW_GAME_KEY = "button_new_game_flow"
 BUTTON_STEP_KEY = "step"
@@ -2511,20 +2515,123 @@ async def _process_join_code(
     )
 
 
+def _reset_new_game_context(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Clear chat and user state before launching a new game flow."""
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    _cancel_reminder(context)
+    _clear_generation_notice(context, chat_id)
+    _clear_pending_language(context, chat)
+    if isinstance(getattr(context, "chat_data", None), dict):
+        context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+        context.chat_data.pop("lobby_message_id", None)
+    set_chat_mode(context, MODE_IDLE)
+    if isinstance(getattr(context, "user_data", None), dict):
+        context.user_data.pop("pending_join", None)
+
+
 @command_entrypoint(fallback=ConversationHandler.END)
 async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
     chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
     if chat and chat.type == ChatType.PRIVATE and context.args:
         first_arg = context.args[0]
         if first_arg and first_arg.lower().startswith("join_"):
             await _process_join_code(update, context, first_arg[5:])
             return ConversationHandler.END
 
-    if chat and chat.type in GROUP_CHAT_TYPES:
+    if message is None:
+        return ConversationHandler.END
+
+    settings = state.settings
+    admin_id = settings.admin_id if settings else None
+    is_admin = user is not None and admin_id is not None and user.id == admin_id
+
+    keyboard_rows = [
+        [InlineKeyboardButton("Отгадывать одному", callback_data=NEW_GAME_MODE_SOLO)],
+        [InlineKeyboardButton("Играть с друзьями", callback_data=NEW_GAME_MODE_GROUP)],
+    ]
+    if is_admin:
+        target_chat_id = chat.id if chat else 0
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "[адм.] Тестовая сессия",
+                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{target_chat_id}",
+                )
+            ]
+        )
+
+    description_lines = [
+        "Привет! Это бот «Кроссворды».",
+        "Выберите, как хотите играть:",
+        "• Отгадывать одному — бот подготовит личный кроссворд.",
+        "• Играть с друзьями — создадим комнату для совместной игры.",
+    ]
+    if is_admin:
+        description_lines.append("• [адм.] Тестовая сессия — копия текущей игры для проверки.")
+
+    await message.reply_text(
+        "\n".join(description_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        disable_web_page_preview=True,
+    )
+
+    return MENU_STATE
+
+
+@command_entrypoint()
+async def new_game_menu_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    if query is None or not query.data:
+        return MENU_STATE
+
+    data = query.data
+    if not data.startswith(NEW_GAME_MENU_CALLBACK_PREFIX):
+        return MENU_STATE
+
+    chat = update.effective_chat
+    mode = data[len(NEW_GAME_MENU_CALLBACK_PREFIX) :]
+
+    if mode == "solo":
+        if chat is None or chat.type != ChatType.PRIVATE:
+            await query.answer(
+                "Одиночный режим доступен только в личном чате.", show_alert=True
+            )
+            return MENU_STATE
+        await query.answer()
+        _reset_new_game_context(update, context)
+        return await _start_new_private_game(update, context)
+
+    if mode == "group":
+        if chat is None or chat.type not in GROUP_CHAT_TYPES:
+            await query.answer(
+                "Режим для друзей запускается в групповом чате.", show_alert=True
+            )
+            return MENU_STATE
+        await query.answer()
+        _reset_new_game_context(update, context)
         return await _start_new_group_game(update, context)
 
-    return await _start_new_private_game(update, context)
+    await query.answer()
+    return MENU_STATE
+
+
+@command_entrypoint()
+async def new_game_menu_admin_proxy_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    _normalise_thread_id(update)
+    _reset_new_game_context(update, context)
+    return ConversationHandler.END
 
 
 @command_entrypoint(fallback=ConversationHandler.END)
@@ -4535,6 +4642,17 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     conversation = ConversationHandler(
         entry_points=[CommandHandler(["new", "start"], start_new_game)],
         states={
+            MENU_STATE: [
+                CallbackQueryHandler(
+                    new_game_menu_callback_handler,
+                    pattern=fr"^{NEW_GAME_MENU_CALLBACK_PREFIX}.*$",
+                ),
+                CallbackQueryHandler(
+                    new_game_menu_admin_proxy_handler,
+                    pattern=fr"^{ADMIN_TEST_GAME_CALLBACK_PREFIX}.*$",
+                    block=False,
+                ),
+            ],
             LANGUAGE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_language)],
             THEME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_theme)],
         },
