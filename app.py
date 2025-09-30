@@ -2245,7 +2245,12 @@ def _generate_puzzle(
                     replacement_requests,
                     prompt_suffix,
                 )
-                new_clues = generate_clues(theme=replacement_theme, language=language)
+                new_clues = generate_clues(
+                    theme=replacement_theme,
+                    language=language,
+                    min_results=6,
+                    max_results=8,
+                )
                 new_validated = validate_word_list(language, new_clues, deduplicate=True)
                 logger.info(
                     "Validated %s replacement candidates", len(new_validated)

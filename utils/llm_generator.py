@@ -144,11 +144,31 @@ def _normalise_payload(clues: Iterable[_WordClueSchema]) -> list[WordClue]:
     return normalised
 
 
-def generate_clues(theme: str, language: str) -> list[WordClue]:
-    """Generate 10–40 crossword clues for the provided theme and language."""
+def generate_clues(
+    theme: str,
+    language: str,
+    *,
+    min_results: int = 10,
+    max_results: int = 40,
+) -> list[WordClue]:
+    """Generate crossword clues for the provided theme and language.
+
+    Args:
+        theme: Topic description for the crossword.
+        language: Target language code.
+        min_results: Minimum number of validated entries required for a full
+            success. Defaults to 10.
+        max_results: Maximum number of entries to keep from the validated set.
+            Defaults to 40.
+    """
 
     if not theme or not language:
         raise ValueError("Theme and language must be provided")
+
+    if min_results < 1:
+        raise ValueError("min_results must be a positive integer")
+    if max_results < min_results:
+        raise ValueError("max_results must be greater than or equal to min_results")
 
     llm = _get_llm()
     best_partial: list[WordClue] = []
@@ -162,12 +182,14 @@ def generate_clues(theme: str, language: str) -> list[WordClue]:
             parsed = _parse_response(raw_content)
             normalised = _normalise_payload(parsed.clues)
             validated = validate_word_list(language, normalised)
-            usable = validated[:40]
+            usable = validated[:max_results]
 
-            if len(validated) >= 10:
-                if len(validated) > 40:
+            if len(validated) >= min_results:
+                if len(validated) > max_results:
                     logger.info(
-                        "Generated %s validated clues, using first %s entries", len(validated), len(usable)
+                        "Generated %s validated clues, using first %s entries",
+                        len(validated),
+                        len(usable),
                     )
                 else:
                     logger.info("Generated %s validated clues", len(validated))
@@ -176,9 +198,10 @@ def generate_clues(theme: str, language: str) -> list[WordClue]:
             if len(usable) > len(best_partial):
                 best_partial = usable
             logger.warning(
-                "Received only %s valid clues on attempt %s (expected >= 10)",
+                "Received only %s valid clues on attempt %s (expected >= %s)",
                 len(validated),
                 attempt,
+                min_results,
             )
         except Exception:  # noqa: BLE001 - logging and retry strategy
             logger.exception("LLM generation attempt %s failed", attempt)
