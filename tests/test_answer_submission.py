@@ -14,7 +14,7 @@ from telegram.constants import ChatType
 import app
 from app import _handle_answer_submission, state
 from utils.crossword import Direction, Puzzle, Slot
-from utils.storage import GameState
+from utils.storage import GameState, Player
 
 
 @pytest.fixture
@@ -54,6 +54,7 @@ def puzzle_with_shared_number() -> Puzzle:
 
 def _build_game_state(puzzle: Puzzle) -> GameState:
     now = time.time()
+    player = Player(user_id=777, name="Tester", dm_chat_id=777)
     return GameState(
         chat_id=777,
         puzzle_id=puzzle.id,
@@ -63,6 +64,10 @@ def _build_game_state(puzzle: Puzzle) -> GameState:
         started_at=now,
         last_update=now,
         scoreboard={777: 0},
+        players={777: player},
+        host_id=777,
+        mode="single",
+        status="running",
     )
 
 
@@ -81,6 +86,7 @@ def _prepare_context(
         reply_photo=reply_photo,
         message_thread_id=None,
         message_id=1,
+        from_user=SimpleNamespace(id=777),
     )
     chat = SimpleNamespace(id=777, type=ChatType.PRIVATE)
     bot = SimpleNamespace(send_chat_action=AsyncMock())
