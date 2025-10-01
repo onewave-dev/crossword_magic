@@ -461,6 +461,41 @@ async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
     assert "new_game_language" not in context.user_data
 
 
+@pytest.mark.anyio
+async def test_admin_proxy_restarts_after_finished_game(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=1111, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"{app.ADMIN_TEST_GAME_CALLBACK_PREFIX}{chat.id}",
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        callback_query=query,
+    )
+    context = SimpleNamespace(chat_data={}, user_data={}, bot=SimpleNamespace())
+
+    puzzle = _make_turn_puzzle()
+    base_state = _make_turn_state(chat.id, puzzle)
+    base_state.status = "finished"
+    state.active_games[base_state.game_id] = base_state
+    state.chat_to_game[chat.id] = base_state.game_id
+
+    start_group_mock = AsyncMock(return_value=LANGUAGE_STATE)
+    monkeypatch.setattr(app, "_start_new_group_game", start_group_mock)
+
+    result = await new_game_menu_admin_proxy_handler(update, context)
+
+    assert result == LANGUAGE_STATE
+    start_group_mock.assert_awaited_once_with(update, context)
+    assert context.chat_data.get(app.PENDING_ADMIN_TEST_KEY) == chat.id
+    assert base_state.game_id not in state.active_games
+    assert chat.id not in state.chat_to_game
+    query.answer.assert_awaited_once()
+
+
 def test_lobby_keyboard_start_activation(fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(-400, puzzle)

@@ -3537,6 +3537,17 @@ async def new_game_menu_admin_proxy_handler(
             await query.answer()
         return ConversationHandler.END
     base_state = _load_state_for_chat(chat.id)
+    if base_state is not None:
+        invalid_state = False
+        if base_state.status != "running":
+            invalid_state = True
+        elif not base_state.puzzle_id:
+            invalid_state = True
+        elif load_puzzle(base_state.puzzle_id) is None:
+            invalid_state = True
+        if invalid_state:
+            _cleanup_game_state(base_state)
+            base_state = None
     if base_state is None:
         reply_method = getattr(message, "reply_text", None)
         if not callable(reply_method):
@@ -4568,6 +4579,12 @@ async def admin_test_game_callback_handler(
     base_state = _load_state_for_chat(target_chat_id)
     if base_state is None:
         await query.answer("Нет активной игры для теста.", show_alert=True)
+        return
+    if base_state.status == "finished":
+        await query.answer("Игра завершена, создайте новую.", show_alert=True)
+        return
+    if not base_state.puzzle_id:
+        await query.answer("Кроссворд ещё не готов.", show_alert=True)
         return
     _clear_pending_admin_test(context)
     if base_state.test_mode and base_state.status == "running":
