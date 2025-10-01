@@ -490,6 +490,36 @@ def _clear_pending_language(context: ContextTypes.DEFAULT_TYPE, chat: Chat | Non
     storage.pop("new_game_language", None)
 
 
+def _get_pending_admin_test(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, dict):
+        return None
+    pending = chat_data.get(PENDING_ADMIN_TEST_KEY)
+    if pending is None:
+        return None
+    try:
+        return int(pending)
+    except (TypeError, ValueError):
+        return None
+
+
+def _set_pending_admin_test(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+) -> None:
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, dict):
+        chat_data = {}
+        setattr(context, "chat_data", chat_data)
+    if chat_id is None:
+        chat_data.pop(PENDING_ADMIN_TEST_KEY, None)
+    else:
+        chat_data[PENDING_ADMIN_TEST_KEY] = int(chat_id)
+
+
+def _clear_pending_admin_test(context: ContextTypes.DEFAULT_TYPE) -> None:
+    _set_pending_admin_test(context, None)
+
+
 def _coord_key(row: int, col: int, component: int | None = None) -> str:
     base = f"{row},{col}"
     if component is None:
@@ -526,6 +556,7 @@ BUTTON_STEP_KEY = "step"
 BUTTON_LANGUAGE_KEY = "language"
 BUTTON_STEP_LANGUAGE = "language"
 BUTTON_STEP_THEME = "theme"
+PENDING_ADMIN_TEST_KEY = "pending_admin_test"
 
 GENERATION_NOTICE_KEY = "puzzle_generation_notice"
 GENERATION_TOKEN_KEY = "puzzle_generation_token"
@@ -1414,11 +1445,16 @@ async def _finish_single_game(
 def _user_display_name(user: User | None) -> str:
     if user is None:
         return "Игрок"
-    if user.full_name:
-        return user.full_name
-    if user.username:
-        return f"@{user.username}"
-    return str(user.id)
+    full_name = getattr(user, "full_name", None)
+    if full_name:
+        return str(full_name)
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        return str(user_id)
+    return "Игрок"
 
 
 def _player_display_name(player: Player) -> str:
@@ -1692,14 +1728,14 @@ async def _build_join_link(context: ContextTypes.DEFAULT_TYPE, code: str) -> str
 
 async def track_player_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     if chat and user and chat.type == ChatType.PRIVATE:
         _register_player_chat(user.id, chat.id)
 
 
 async def track_player_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     if chat and user and chat.type == ChatType.PRIVATE:
         _register_player_chat(user.id, chat.id)
 
@@ -3248,6 +3284,7 @@ def _reset_new_game_context(
     if isinstance(getattr(context, "chat_data", None), dict):
         context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
         context.chat_data.pop("lobby_message_id", None)
+        context.chat_data.pop(PENDING_ADMIN_TEST_KEY, None)
     set_chat_mode(context, MODE_IDLE)
     if isinstance(getattr(context, "user_data", None), dict):
         context.user_data.pop("pending_join", None)
@@ -3363,6 +3400,29 @@ async def new_game_menu_admin_proxy_handler(
 ) -> int:
     _normalise_thread_id(update)
     _reset_new_game_context(update, context)
+    chat = update.effective_chat
+    query = update.callback_query
+    message = update.effective_message
+    if chat is None:
+        if query is not None:
+            await query.answer()
+        return ConversationHandler.END
+    base_state = _load_state_for_chat(chat.id)
+    if base_state is None:
+        reply_method = getattr(message, "reply_text", None)
+        if not callable(reply_method):
+            _clear_pending_admin_test(context)
+            if query is not None:
+                await query.answer()
+            return ConversationHandler.END
+        _set_pending_admin_test(context, chat.id)
+        if query is not None:
+            await query.answer()
+        result = await _start_new_group_game(update, context)
+        if result == ConversationHandler.END:
+            _clear_pending_admin_test(context)
+        return result
+    _clear_pending_admin_test(context)
     await admin_test_game_callback_handler(update, context)
     return ConversationHandler.END
 
@@ -3389,19 +3449,27 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat.id if chat else "<unknown>",
         language,
     )
+    pending_admin_chat = _get_pending_admin_test(context)
+    is_admin_flow = chat is not None and pending_admin_chat == chat.id
     if chat.type in GROUP_CHAT_TYPES:
         game_state = _load_state_for_chat(chat.id)
         if not game_state or game_state.status != "lobby":
             await message.reply_text("Создайте новую игру командой /new в этом чате.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
+            _clear_pending_admin_test(context)
             return ConversationHandler.END
         game_state.language = language
         game_state.last_update = time.time()
         _store_state(game_state)
         _set_pending_language(context, chat, language)
         set_chat_mode(context, MODE_AWAIT_THEME)
-        await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+        if is_admin_flow:
+            await message.reply_text(
+                "Отлично! Теперь укажите тему для тестовой игры.",
+            )
+        else:
+            await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
         return THEME_STATE
 
     _set_pending_language(context, chat, language)
@@ -3465,12 +3533,16 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return THEME_STATE
 
+    user = getattr(update, "effective_user", None)
+    pending_admin_chat = _get_pending_admin_test(context)
+    is_admin_flow = chat is not None and pending_admin_chat == chat.id
     if chat.type in GROUP_CHAT_TYPES:
         game_state = _load_state_for_chat(chat.id)
         if not game_state or game_state.status != "lobby":
             await message.reply_text("Создайте новую игру командой /new в этом чате.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
+            _clear_pending_admin_test(context)
             return ConversationHandler.END
         theme = message.text.strip()
         if not theme:
@@ -3481,6 +3553,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await message.reply_text("Сначала выберите язык через команду /new.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
+            _clear_pending_admin_test(context)
             return ConversationHandler.END
         game_state.language = language
         game_state.theme = theme
@@ -3502,12 +3575,6 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         _store_state(game_state)
         _clear_pending_language(context, chat)
         set_chat_mode(context, MODE_IDLE)
-        await _send_generation_notice(
-            context,
-            chat.id,
-            "Тема сохранена! Готовим кроссворд, это может занять немного времени.",
-            message=message,
-        )
         existing_task = state.lobby_generation_tasks.get(game_state.game_id)
         if existing_task:
             state.lobby_generation_tasks.pop(game_state.game_id, None)
@@ -3515,6 +3582,88 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 existing_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await existing_task
+        if is_admin_flow:
+            state.lobby_generation_tasks.pop(game_state.game_id, None)
+            await message.reply_text(
+                "[адм.] Подбираю тестовую игру, это может занять немного времени.",
+            )
+            loop = asyncio.get_running_loop()
+            puzzle: Puzzle | CompositePuzzle | None = None
+            generated_state: GameState | None = None
+            state.generating_chats.add(chat.id)
+            try:
+                puzzle, generated_state = await loop.run_in_executor(
+                    None, _generate_puzzle, chat.id, language, theme
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to generate admin test puzzle for chat %s", chat.id
+                )
+                await message.reply_text(
+                    "Не удалось подготовить тестовую игру. Попробуйте снова через /admin.",
+                )
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            finally:
+                state.generating_chats.discard(chat.id)
+            if generated_state is None or puzzle is None:
+                await message.reply_text(
+                    "Не удалось подготовить тестовую игру. Попробуйте снова через /admin.",
+                )
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            game_state.puzzle_id = generated_state.puzzle_id
+            game_state.puzzle_ids = generated_state.puzzle_ids
+            game_state.last_update = time.time()
+            _store_state(game_state)
+            if user is None:
+                logger.warning(
+                    "Admin test flow missing user context for chat %s", chat.id
+                )
+                await message.reply_text(
+                    "Не удалось определить администратора для тестовой игры.",
+                )
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            try:
+                await _launch_admin_test_game(
+                    context,
+                    base_state=game_state,
+                    puzzle=puzzle,
+                    admin_user=user,
+                    source_chat=chat,
+                )
+            except PermissionError:
+                await message.reply_text(
+                    "Недостаточно прав для запуска тестовой игры.",
+                )
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            except RuntimeError:
+                await message.reply_text("Режим тестовой игры недоступен.")
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to start admin test game from theme flow for chat %s",
+                    chat.id,
+                )
+                await message.reply_text(
+                    "Не удалось запустить тестовую игру. Попробуйте снова через /admin.",
+                )
+                _clear_pending_admin_test(context)
+                return ConversationHandler.END
+            _clear_pending_admin_test(context)
+            await message.reply_text(
+                "[адм.] Тестовая игра запущена! Следите за ходами и командами в этом чате.",
+            )
+            return ConversationHandler.END
+        await _send_generation_notice(
+            context,
+            chat.id,
+            "Тема сохранена! Готовим кроссворд, это может занять немного времени.",
+            message=message,
+        )
         if game_state.game_id not in state.lobby_messages:
             await _publish_lobby_message(context, game_state)
         else:
@@ -4142,6 +4291,109 @@ async def lobby_start_callback_handler(
     )
 
 
+async def _launch_admin_test_game(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    base_state: GameState,
+    puzzle: Puzzle | CompositePuzzle,
+    admin_user: User,
+    source_chat: Chat | None = None,
+) -> tuple[GameState, Puzzle | CompositePuzzle]:
+    """Prepare and start an admin test game derived from an existing puzzle."""
+
+    settings = state.settings
+    if settings is None or settings.admin_id is None:
+        raise RuntimeError("Admin test mode is not configured")
+    admin_id = settings.admin_id
+    if admin_user.id != admin_id:
+        raise PermissionError("User is not allowed to start admin test games")
+
+    cloned_puzzle, puzzle_id, component_ids = _clone_puzzle_for_test(puzzle)
+    admin_game_id = f"admin:{base_state.chat_id}"
+    existing = _load_state_by_game_id(admin_game_id)
+    if existing is not None:
+        _cleanup_game_state(existing)
+
+    now = time.time()
+    dm_chat_id = _lookup_player_chat(admin_id)
+    if source_chat and source_chat.type == ChatType.PRIVATE:
+        dm_chat_id = source_chat.id
+
+    admin_player = Player(
+        user_id=admin_id,
+        name=_user_display_name(admin_user),
+        dm_chat_id=dm_chat_id,
+    )
+    dummy_player = Player(user_id=DUMMY_USER_ID, name=DUMMY_NAME, is_bot=True)
+    turn_order = [admin_id, DUMMY_USER_ID]
+    if not ADMIN_FIRST:
+        random.shuffle(turn_order)
+    scoreboard = {admin_id: 0, DUMMY_USER_ID: 0}
+
+    admin_state = GameState(
+        chat_id=base_state.chat_id,
+        puzzle_id=puzzle_id,
+        puzzle_ids=component_ids,
+        filled_cells={},
+        solved_slots=set(),
+        score=0,
+        started_at=now,
+        last_update=now,
+        hinted_cells=set(),
+        host_id=admin_id,
+        game_id=admin_game_id,
+        scoreboard=scoreboard,
+        mode="turn_based",
+        status="running",
+        players={admin_id: admin_player, DUMMY_USER_ID: dummy_player},
+        turn_order=turn_order,
+        turn_index=0,
+    )
+    admin_state.test_mode = True
+    admin_state.dummy_user_id = DUMMY_USER_ID
+    admin_state.language = cloned_puzzle.language
+    admin_state.theme = cloned_puzzle.theme
+    admin_state.active_slot_id = None
+
+    _register_player_chat(admin_id, dm_chat_id)
+    set_chat_mode(context, MODE_IN_GAME)
+    state.lobby_messages.pop(base_state.game_id, None)
+    _store_state(admin_state)
+    _schedule_game_timers(context, admin_state)
+    _store_state(admin_state)
+
+    intro_lines = [
+        "[адм.] Тестовая игра 1×1 запущена!",
+        f"Игроки: {_user_display_name(admin_user)} и {DUMMY_NAME}.",
+    ]
+    first_player = admin_state.players.get(admin_state.turn_order[0])
+    if first_player:
+        intro_lines.append(f"Первым ходит {first_player.name}.")
+    try:
+        await context.bot.send_message(
+            chat_id=base_state.chat_id,
+            text="\n".join(intro_lines),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to announce admin test game start for chat %s",
+            base_state.chat_id,
+        )
+
+    await _announce_turn(
+        context,
+        admin_state,
+        cloned_puzzle,
+        prefix=(
+            f"Первым ходит {first_player.name}!"
+            if first_player
+            else "Игра начинается!"
+        ),
+    )
+
+    return admin_state, cloned_puzzle
+
+
 @command_entrypoint()
 async def admin_test_game_callback_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -4175,6 +4427,7 @@ async def admin_test_game_callback_handler(
     if base_state is None:
         await query.answer("Нет активной игры для теста.", show_alert=True)
         return
+    _clear_pending_admin_test(context)
     if base_state.test_mode and base_state.status == "running":
         await query.answer("Тестовая игра уже запущена.", show_alert=True)
         return
@@ -4182,82 +4435,27 @@ async def admin_test_game_callback_handler(
     if puzzle is None:
         await query.answer("Кроссворд ещё не готов.", show_alert=True)
         return
-    cloned_puzzle, puzzle_id, component_ids = _clone_puzzle_for_test(puzzle)
-    admin_game_id = f"admin:{target_chat_id}"
-    existing = _load_state_by_game_id(admin_game_id)
-    if existing is not None:
-        _cleanup_game_state(existing)
-    admin_id = settings.admin_id
-    now = time.time()
-    dm_chat_id = _lookup_player_chat(admin_id)
-    chat = query.message.chat if query.message else update.effective_chat
-    if chat and chat.type == ChatType.PRIVATE:
-        dm_chat_id = chat.id
-    admin_player = Player(
-        user_id=admin_id,
-        name=_user_display_name(user),
-        dm_chat_id=dm_chat_id,
-    )
-    dummy_player = Player(user_id=DUMMY_USER_ID, name=DUMMY_NAME, is_bot=True)
-    turn_order = [admin_id, DUMMY_USER_ID]
-    if not ADMIN_FIRST:
-        random.shuffle(turn_order)
-    scoreboard = {admin_id: 0, DUMMY_USER_ID: 0}
-    admin_state = GameState(
-        chat_id=target_chat_id,
-        puzzle_id=puzzle_id,
-        puzzle_ids=component_ids,
-        filled_cells={},
-        solved_slots=set(),
-        score=0,
-        started_at=now,
-        last_update=now,
-        hinted_cells=set(),
-        host_id=admin_id,
-        game_id=admin_game_id,
-        scoreboard=scoreboard,
-        mode="turn_based",
-        status="running",
-        players={admin_id: admin_player, DUMMY_USER_ID: dummy_player},
-        turn_order=turn_order,
-        turn_index=0,
-    )
-    admin_state.test_mode = True
-    admin_state.dummy_user_id = DUMMY_USER_ID
-    admin_state.language = cloned_puzzle.language
-    admin_state.theme = cloned_puzzle.theme
-    admin_state.active_slot_id = None
-    _register_player_chat(admin_id, dm_chat_id)
-    set_chat_mode(context, MODE_IN_GAME)
-    state.lobby_messages.pop(base_state.game_id, None)
-    _store_state(admin_state)
-    _schedule_game_timers(context, admin_state)
-    _store_state(admin_state)
-    await query.answer("Тестовая игра запущена!")
-    intro_lines = [
-        "[адм.] Тестовая игра 1×1 запущена!",
-        f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
-    ]
-    first_player = admin_state.players.get(admin_state.turn_order[0])
-    if first_player:
-        intro_lines.append(f"Первым ходит {first_player.name}.")
     try:
-        await context.bot.send_message(
-            chat_id=target_chat_id,
-            text="\n".join(intro_lines),
+        await _launch_admin_test_game(
+            context,
+            base_state=base_state,
+            puzzle=puzzle,
+            admin_user=user,
+            source_chat=query.message.chat if query.message else update.effective_chat,
         )
-    except Exception:  # noqa: BLE001
+    except PermissionError:
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
+    except RuntimeError:
+        await query.answer("Режим недоступен.", show_alert=True)
+        return
+    except Exception:
         logger.exception(
-            "Failed to announce admin test game start for chat %s", target_chat_id
+            "Failed to start admin test game for chat %s", target_chat_id
         )
-    await _announce_turn(
-        context,
-        admin_state,
-        cloned_puzzle,
-        prefix=(
-            f"Первым ходит {first_player.name}!" if first_player else "Игра начинается!"
-        ),
-    )
+        await query.answer("Не удалось запустить тестовую игру.", show_alert=True)
+        return
+    await query.answer("Тестовая игра запущена!")
 
 
 @command_entrypoint()
