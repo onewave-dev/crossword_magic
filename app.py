@@ -1117,7 +1117,7 @@ async def _announce_turn(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to announce turn in group for game %s", game_state.game_id)
-    if player.dm_chat_id:
+    if player.dm_chat_id and player.dm_chat_id != game_state.chat_id:
         try:
             await context.bot.send_message(
                 chat_id=player.dm_chat_id,
@@ -2351,7 +2351,7 @@ async def _turn_warning_job(context: CallbackContext) -> None:
     warning = f"{player.name}, осталось {TURN_WARNING_SECONDS} секунд на ход!"
     try:
         await context.bot.send_message(chat_id=game_state.chat_id, text=warning)
-        if player.dm_chat_id:
+        if player.dm_chat_id and player.dm_chat_id != game_state.chat_id:
             await context.bot.send_message(chat_id=player.dm_chat_id, text=warning)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send turn warning for game %s", game_id)
@@ -4313,7 +4313,7 @@ async def turn_slot_callback_handler(
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to announce selected slot in game %s", game_state.game_id)
-    if current_player.dm_chat_id:
+    if current_player.dm_chat_id and current_player.dm_chat_id != game_state.chat_id:
         try:
             await context.bot.send_message(
                 chat_id=current_player.dm_chat_id,

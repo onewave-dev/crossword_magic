@@ -679,6 +679,67 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
 
 
 @pytest.mark.anyio
+async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    chat_id = 555
+    game_state = _make_turn_state(chat_id, puzzle)
+    for player in game_state.players.values():
+        player.dm_chat_id = chat_id
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
+    monkeypatch.setattr(
+        app, "_load_state_by_game_id", lambda gid: game_state if gid == game_state.game_id else None
+    )
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _gs: puzzle)
+
+    announce_mock = AsyncMock()
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_message=announce_mock), job_queue=DummyJobQueue()
+    )
+
+    await app._announce_turn(context, game_state, puzzle)
+
+    assert announce_mock.await_count == 1
+    assert announce_mock.await_args.kwargs["chat_id"] == chat_id
+
+    warning_mock = AsyncMock()
+    job_name = "turn-warn-test"
+    state.scheduled_jobs[job_name] = object()
+    job = SimpleNamespace(
+        name=job_name,
+        data={"game_id": game_state.game_id, "player_id": game_state.turn_order[game_state.turn_index]},
+    )
+    warning_context = SimpleNamespace(bot=SimpleNamespace(send_message=warning_mock), job=job)
+
+    await app._turn_warning_job(warning_context)
+
+    assert warning_mock.await_count == 1
+    assert warning_mock.await_args.kwargs["chat_id"] == chat_id
+
+    slot_mock = AsyncMock()
+    query = SimpleNamespace(
+        data=f"{app.TURN_SLOT_CALLBACK_PREFIX}{game_state.game_id}|A1",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=game_state.turn_order[game_state.turn_index]),
+        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id, type=ChatType.PRIVATE)),
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id, type=ChatType.PRIVATE),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        effective_user=query.from_user,
+    )
+    slot_context = SimpleNamespace(bot=SimpleNamespace(send_message=slot_mock))
+
+    await app.turn_slot_callback_handler(update, slot_context)
+
+    assert slot_mock.await_count == 1
+    assert slot_mock.await_args.kwargs["chat_id"] == chat_id
+
+
+@pytest.mark.anyio
 async def test_turn_based_hint_limits_players(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(-800, puzzle)
