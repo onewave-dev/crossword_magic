@@ -209,11 +209,57 @@ DEFAULT_FILLER_WORDS: Dict[str, Sequence[str]] = {
 }
 
 
+def _apply_directional_numbering(puzzle: Puzzle) -> Dict[str, str]:
+    """Assign sequential slot numbers based on row-major traversal."""
+
+    across_slots = sorted(
+        (slot for slot in puzzle.slots if slot.direction is Direction.ACROSS),
+        key=lambda slot: (slot.start_row, slot.start_col),
+    )
+    down_slots = sorted(
+        (slot for slot in puzzle.slots if slot.direction is Direction.DOWN),
+        key=lambda slot: (slot.start_row, slot.start_col),
+    )
+
+    mapping: Dict[str, str] = {}
+
+    for index, slot in enumerate(across_slots, start=1):
+        new_id = f"A{index}"
+        old_id = slot.slot_id
+        slot.number = index
+        if old_id != new_id:
+            if old_id:
+                mapping[old_id.upper()] = new_id.upper()
+            slot.slot_id = new_id
+        else:
+            slot.slot_id = new_id.upper()
+
+    for index, slot in enumerate(down_slots, start=1):
+        new_id = f"D{index}"
+        old_id = slot.slot_id
+        slot.number = index
+        if old_id != new_id:
+            if old_id:
+                mapping[old_id.upper()] = new_id.upper()
+            slot.slot_id = new_id
+        else:
+            slot.slot_id = new_id.upper()
+
+    if mapping:
+        for row_cells in puzzle.grid:
+            for cell in row_cells:
+                if not cell.source_slots:
+                    continue
+                updated = {mapping.get(name.upper(), name.upper()) for name in cell.source_slots}
+                cell.source_slots = {name.upper() for name in updated}
+
+    puzzle.slots = [*across_slots, *down_slots]
+    return mapping
+
+
 def calculate_slots(puzzle: Puzzle) -> List[Slot]:
     """Calculate crossword slots and assign numbers for across and down directions."""
 
-    across_number = 1
-    down_number = 1
     slots: List[Slot] = []
 
     for row in range(puzzle.size_rows):
@@ -229,50 +275,72 @@ def calculate_slots(puzzle: Puzzle) -> List[Slot]:
                 while col + length < puzzle.size_cols and not puzzle.grid[row][col + length].is_block:
                     length += 1
                 if length > 1:
-                    slot = Slot(
-                        slot_id=f"A{across_number}",
-                        direction=Direction.ACROSS,
-                        number=across_number,
-                        start_row=row,
-                        start_col=col,
-                        length=length,
+                    slots.append(
+                        Slot(
+                            slot_id="",
+                            direction=Direction.ACROSS,
+                            number=0,
+                            start_row=row,
+                            start_col=col,
+                            length=length,
+                        )
                     )
-                    slots.append(slot)
-                    across_number += 1
                 col += length
             else:
                 col += 1
 
-    for col in range(puzzle.size_cols):
-        row = 0
-        while row < puzzle.size_rows:
+    for row in range(puzzle.size_rows):
+        for col in range(puzzle.size_cols):
             cell = puzzle.grid[row][col]
             if cell.is_block:
-                row += 1
                 continue
             is_start = row == 0 or puzzle.grid[row - 1][col].is_block
-            if is_start:
-                length = 0
-                while row + length < puzzle.size_rows and not puzzle.grid[row + length][col].is_block:
-                    length += 1
-                if length > 1:
-                    slot = Slot(
-                        slot_id=f"D{down_number}",
+            if not is_start:
+                continue
+            length = 0
+            while row + length < puzzle.size_rows and not puzzle.grid[row + length][col].is_block:
+                length += 1
+            if length > 1:
+                slots.append(
+                    Slot(
+                        slot_id="",
                         direction=Direction.DOWN,
-                        number=down_number,
+                        number=0,
                         start_row=row,
                         start_col=col,
                         length=length,
                     )
-                    slots.append(slot)
-                    down_number += 1
-                row += length
-            else:
-                row += 1
+                )
 
-    slots.sort(key=lambda s: (s.direction.value, s.number))
-    logger.debug("Calculated %d slots for puzzle %s", len(slots), puzzle.id)
-    return slots
+    puzzle.slots = slots
+    _apply_directional_numbering(puzzle)
+    logger.debug("Calculated %d slots for puzzle %s", len(puzzle.slots), puzzle.id)
+    return puzzle.slots
+
+
+def renumber_slots(puzzle: Puzzle | CompositePuzzle) -> Dict[str, str]:
+    """Reassign slot numbers according to the row-major rule.
+
+    Returns a mapping from previous public identifiers (upper-case) to the
+    updated identifiers. The function also refreshes ``cell.source_slots`` to
+    reflect the new identifiers.
+    """
+
+    mapping: Dict[str, str] = {}
+
+    if isinstance(puzzle, CompositePuzzle):
+        for component in puzzle.components:
+            component_mapping = _apply_directional_numbering(component.puzzle)
+            if not component_mapping:
+                continue
+            for old_id, new_id in component_mapping.items():
+                mapping[f"{old_id}-{component.index}".upper()] = (
+                    f"{new_id}-{component.index}".upper()
+                )
+    else:
+        mapping = _apply_directional_numbering(puzzle)
+
+    return mapping
 
 
 def _normalise_word(word: str, language: str) -> str:
@@ -644,6 +712,7 @@ __all__ = [
     "is_composite_puzzle",
     "iter_slot_refs",
     "parse_slot_public_id",
+    "renumber_slots",
     "puzzle_from_dict",
     "puzzle_from_json",
     "puzzle_to_dict",

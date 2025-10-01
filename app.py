@@ -13,7 +13,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -64,6 +64,7 @@ from utils.crossword import (
     CompositePuzzle,
     Direction,
     Puzzle,
+    renumber_slots,
     SlotRef,
     composite_to_dict,
     find_slot_ref,
@@ -1752,6 +1753,41 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
         return restored
 
 
+def _apply_slot_mapping_to_state(
+    game_state: GameState, mapping: Mapping[str, str]
+) -> None:
+    """Update stored identifiers in ``game_state`` after slot renumbering."""
+
+    if not mapping:
+        return
+
+    normalised_mapping = {
+        _normalise_slot_id(old): _normalise_slot_id(new) for old, new in mapping.items()
+    }
+
+    def translate(identifier: Optional[str]) -> Optional[str]:
+        if not identifier:
+            return identifier
+        normalised = _normalise_slot_id(identifier)
+        return normalised_mapping.get(normalised, normalised)
+
+    game_state.solved_slots = {
+        translate(identifier) or _normalise_slot_id(identifier)
+        for identifier in game_state.solved_slots
+    }
+
+    if game_state.active_slot_id:
+        game_state.active_slot_id = translate(game_state.active_slot_id)
+
+    updated_hints: dict[str, dict[int, int]] = {}
+    for slot_key, usage in game_state.hints_used.items():
+        new_key = translate(slot_key) or _normalise_slot_id(slot_key)
+        merged = updated_hints.setdefault(new_key, {})
+        for user_id, count in usage.items():
+            merged[user_id] = merged.get(user_id, 0) + count
+    game_state.hints_used = updated_hints
+
+
 def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle | CompositePuzzle]:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         payload = load_puzzle(game_state.puzzle_id)
@@ -1759,7 +1795,15 @@ def _load_puzzle_for_state(game_state: GameState) -> Optional[Puzzle | Composite
             logger.error("Puzzle referenced by chat is missing")
             return None
         logger.debug("Loaded puzzle definition for rendering or clues")
-        return puzzle_from_dict(dict(payload))
+        puzzle = puzzle_from_dict(dict(payload))
+        if puzzle is None:
+            return None
+        mapping = renumber_slots(puzzle)
+        if mapping:
+            logger.info("Reassigned slot numbers using updated ordering rule")
+            _apply_slot_mapping_to_state(game_state, mapping)
+            _store_state(game_state)
+        return puzzle
 
 
 def _format_clue_section(
