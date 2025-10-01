@@ -9,8 +9,8 @@ within the configured bounds.
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from typing import Deque, Dict, List, Sequence, Tuple
+from collections import defaultdict
+from typing import Dict, List, Sequence, Tuple
 
 from utils.crossword import Cell, Direction, Puzzle, Slot, calculate_slots
 
@@ -84,7 +84,6 @@ def generate_fill_in_puzzle(
     def attempt(first_word: str) -> Puzzle:
         remaining_words = [word for word in normalised_words if word != first_word]
         remaining_words.sort(key=len, reverse=True)
-        words_to_process: Deque[str] = deque(remaining_words)
 
         grid_letters: Dict[Tuple[int, int], str] = {}
         cell_directions: Dict[Tuple[int, int], set[Direction]] = defaultdict(set)
@@ -93,17 +92,20 @@ def generate_fill_in_puzzle(
         bounds_initialised = False
         min_row = max_row = min_col = max_col = 0
 
-        def update_bounds(row: int, col: int) -> None:
+        def recompute_bounds() -> None:
             nonlocal bounds_initialised, min_row, max_row, min_col, max_col
-            if not bounds_initialised:
-                min_row = max_row = row
-                min_col = max_col = col
-                bounds_initialised = True
+            if not grid_letters:
+                bounds_initialised = False
+                min_row = max_row = min_col = max_col = 0
                 return
-            min_row = min(min_row, row)
-            max_row = max(max_row, row)
-            min_col = min(min_col, col)
-            max_col = max(max_col, col)
+
+            rows = [coord[0] for coord in grid_letters]
+            cols = [coord[1] for coord in grid_letters]
+            min_row = min(rows)
+            max_row = max(rows)
+            min_col = min(cols)
+            max_col = max(cols)
+            bounds_initialised = True
 
         def would_exceed_bounds(
             start_row: int, start_col: int, direction: Direction, length: int
@@ -176,10 +178,23 @@ def generate_fill_in_puzzle(
                 grid_letters[(row, col)] = char
                 cell_directions[(row, col)].add(direction)
                 letter_positions[char].append((row, col))
-                update_bounds(row, col)
+            recompute_bounds()
 
-        def try_place_word(word: str) -> bool:
-            # Prefer placements that intersect with existing words.
+        def remove_word(word: str, start_row: int, start_col: int, direction: Direction) -> None:
+            for idx, char in enumerate(word):
+                row = start_row + (idx if direction is Direction.DOWN else 0)
+                col = start_col + (idx if direction is Direction.ACROSS else 0)
+                cell_directions[(row, col)].remove(direction)
+                letter_positions[char].remove((row, col))
+                if not letter_positions[char]:
+                    del letter_positions[char]
+                if not cell_directions[(row, col)]:
+                    del cell_directions[(row, col)]
+                    del grid_letters[(row, col)]
+            recompute_bounds()
+
+        def list_possible_placements(word: str) -> List[Tuple[int, int, Direction]]:
+            placements: set[Tuple[int, int, Direction]] = set()
             for idx, char in enumerate(word):
                 for row, col in letter_positions.get(char, []):
                     for direction in (Direction.ACROSS, Direction.DOWN):
@@ -189,31 +204,60 @@ def generate_fill_in_puzzle(
                         start_col = col - idx if direction is Direction.ACROSS else col
                         if not can_place(word, start_row, start_col, direction, True):
                             continue
-                        place_word(word, start_row, start_col, direction)
-                        return True
+                        placements.add((start_row, start_col, direction))
+
+            return sorted(
+                placements,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    0 if item[2] is Direction.ACROSS else 1,
+                ),
+            )
+
+        last_disconnected_word: str | None = None
+
+        def mark_disconnected(word: str) -> None:
+            nonlocal last_disconnected_word
+            if last_disconnected_word is None:
+                last_disconnected_word = word
+
+        def backtrack(words_remaining: List[str]) -> bool:
+            if not words_remaining:
+                return True
+
+            best_index = -1
+            best_options: List[Tuple[int, int, Direction]] | None = None
+            for idx, candidate in enumerate(words_remaining):
+                options = list_possible_placements(candidate)
+                if not options:
+                    mark_disconnected(candidate)
+                    return False
+                if best_options is None or len(options) < len(best_options):
+                    best_index = idx
+                    best_options = options
+                    if len(best_options) == 1:
+                        break
+
+            assert best_options is not None
+            word = words_remaining.pop(best_index)
+            for start_row, start_col, direction in best_options:
+                place_word(word, start_row, start_col, direction)
+                if backtrack(words_remaining):
+                    words_remaining.insert(best_index, word)
+                    return True
+                remove_word(word, start_row, start_col, direction)
+
+            words_remaining.insert(best_index, word)
             return False
 
         horizontal_start_col = -(len(first_word) // 2)
         place_word(first_word, 0, horizontal_start_col, Direction.ACROSS)
 
-        while words_to_process:
-            progress_made = False
-            waiting_words: Deque[str] = deque()
-
-            while words_to_process:
-                word = words_to_process.popleft()
-                if try_place_word(word):
-                    progress_made = True
-                    continue
-                waiting_words.append(word)
-
-            if not waiting_words:
-                break
-
-            if not progress_made:
-                raise DisconnectedWordError(waiting_words[0])
-
-            words_to_process = waiting_words
+        if not backtrack(list(remaining_words)):
+            if last_disconnected_word is not None:
+                raise DisconnectedWordError(last_disconnected_word)
+            raise FillInGenerationError("Unable to place all words into the crossword grid")
 
         rows = max_row - min_row + 1
         cols = max_col - min_col + 1

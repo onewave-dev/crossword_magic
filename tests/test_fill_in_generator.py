@@ -95,6 +95,48 @@ def test_generate_fill_in_puzzle_reorders_words_when_needed() -> None:
     assert puzzle.size_cols <= 15
 
 
+def test_generate_fill_in_puzzle_backtracks_when_initial_choice_fails() -> None:
+    words = ["PEAL", "SEAL", "TAPE", "TEAL", "EEL"]
+
+    puzzle = generate_fill_in_puzzle(
+        puzzle_id="backtrack",
+        theme="Test",
+        language="en",
+        words=words,
+    )
+
+    answers = {slot.answer for slot in puzzle.slots}
+    assert {_canonical(word, "en") for word in words} <= answers
+
+    for slot in puzzle.slots:
+        intersects = any(
+            len(puzzle.grid[row][col].source_slots) > 1 for row, col in slot.coordinates()
+        )
+        assert intersects, f"Slot {slot.slot_id} must intersect with another word"
+
+
+def test_generate_fill_in_puzzle_is_order_invariant() -> None:
+    base_words = ["PLANET", "NEAT", "LEAP", "TONE"]
+    variants = [
+        base_words,
+        list(reversed(base_words)),
+        base_words[1:] + base_words[:1],
+    ]
+
+    expected = {_canonical(word, "en") for word in base_words}
+
+    for words in variants:
+        puzzle = generate_fill_in_puzzle(
+            puzzle_id="permutation",
+            theme="Permutation",
+            language="en",
+            words=words,
+        )
+
+        answers = {slot.answer for slot in puzzle.slots}
+        assert expected <= answers
+
+
 def test_generate_fill_in_puzzle_respects_max_size() -> None:
     with pytest.raises(FillInGenerationError):
         generate_fill_in_puzzle(
