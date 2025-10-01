@@ -184,6 +184,7 @@ class AppState:
         self.cleanup_task: Optional[asyncio.Task[None]] = None
         self.active_games: dict[str, GameState] = {}
         self.chat_to_game: dict[int, str] = {}
+        self.dm_chat_to_game: dict[int, str] = {}
         self.player_chats: dict[int, int] = {}
         self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
@@ -215,6 +216,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
         with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
             state.generating_chats.discard(chat_id)
             state.chat_to_game.pop(chat_id, None)
+            state.dm_chat_to_game.pop(chat_id, None)
             task = state.lobby_generation_tasks.pop(game_id, None)
             if task is not None:
                 task.cancel()
@@ -231,6 +233,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
     with logging_context(chat_id=chat_id, puzzle_id=puzzle_id):
         state.generating_chats.discard(chat_id)
         state.chat_to_game.pop(chat_id, None)
+        state.dm_chat_to_game.pop(chat_id, None)
         task = state.lobby_generation_tasks.pop(str(chat_id), None)
         if task is not None:
             task.cancel()
@@ -255,6 +258,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         _cancel_job(game_state.dummy_job_id)
         state.generating_chats.discard(game_state.chat_id)
         state.chat_to_game.pop(game_state.chat_id, None)
+        state.dm_chat_to_game.pop(game_state.chat_id, None)
         state.active_games.pop(game_state.game_id, None)
         task = state.lobby_generation_tasks.pop(game_state.game_id, None)
         if task is not None:
@@ -266,6 +270,12 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         for user_id, mapped_chat in list(state.player_chats.items()):
             if mapped_chat == game_state.chat_id:
                 state.player_chats.pop(user_id, None)
+        for player in game_state.players.values():
+            if player.dm_chat_id is None:
+                continue
+            state.dm_chat_to_game.pop(player.dm_chat_id, None)
+            if state.player_chats.get(player.user_id) == player.dm_chat_id:
+                state.player_chats.pop(player.user_id, None)
         state.lobby_messages.pop(game_state.game_id, None)
         if game_state.puzzle_id:
             delete_puzzle(game_state.puzzle_id)
@@ -725,6 +735,112 @@ def _lookup_player_chat(user_id: int) -> int | None:
     return state.player_chats.get(user_id)
 
 
+def _iter_player_dm_chats(game_state: GameState) -> list[tuple[int | None, int]]:
+    """Return unique player DM chats associated with a game state."""
+
+    chats: list[tuple[int | None, int]] = []
+    seen: set[int] = set()
+    for player in game_state.players.values():
+        if player.dm_chat_id is None:
+            continue
+        if player.dm_chat_id in seen:
+            continue
+        seen.add(player.dm_chat_id)
+        chats.append((player.user_id, player.dm_chat_id))
+    if not chats:
+        chats.append((None, game_state.chat_id))
+    return chats
+
+
+def _update_dm_mappings(game_state: GameState) -> None:
+    """Synchronise in-memory DM chat mappings for the given game."""
+
+    active_chats = {
+        player.dm_chat_id
+        for player in game_state.players.values()
+        if player.dm_chat_id is not None
+    }
+    for chat_id, mapped_game in list(state.dm_chat_to_game.items()):
+        if mapped_game == game_state.game_id and chat_id not in active_chats:
+            state.dm_chat_to_game.pop(chat_id, None)
+    for player in game_state.players.values():
+        if player.dm_chat_id is None:
+            continue
+        state.dm_chat_to_game[player.dm_chat_id] = game_state.game_id
+        state.player_chats[player.user_id] = player.dm_chat_id
+
+
+async def _broadcast_to_players(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
+    reply_markup_for: Iterable[int] | None = None,
+    exclude_chat_ids: Iterable[int] | None = None,
+    disable_notification: bool | None = None,
+) -> None:
+    """Send a text message to every player participating in the game."""
+
+    allowed_markup_users = (
+        set(reply_markup_for)
+        if reply_markup_for is not None
+        else None
+    )
+    excluded = set(exclude_chat_ids or [])
+    for user_id, chat_id in _iter_player_dm_chats(game_state):
+        if chat_id in excluded:
+            continue
+        markup = reply_markup
+        if allowed_markup_users is not None and user_id not in allowed_markup_users:
+            markup = None
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=markup,
+                disable_notification=disable_notification,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to broadcast message for game %s to chat %s",
+                game_state.game_id,
+                chat_id,
+            )
+
+
+async def _broadcast_photo_to_players(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    photo_bytes: bytes,
+    *,
+    caption: str | None = None,
+    parse_mode: str | None = None,
+    exclude_chat_ids: Iterable[int] | None = None,
+) -> None:
+    """Send a rendered puzzle image to all players except specified chats."""
+
+    excluded = set(exclude_chat_ids or [])
+    for _, chat_id in _iter_player_dm_chats(game_state):
+        if chat_id in excluded:
+            continue
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_bytes,
+                caption=caption,
+                parse_mode=parse_mode,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to broadcast puzzle image for game %s to chat %s",
+                game_state.game_id,
+                chat_id,
+            )
+
+
 def _remember_job(job: Job | None) -> None:
     if job is None:
         return
@@ -1038,16 +1154,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         else f"🤖 {dummy_player.name}"
     )
     message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=message_text,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to announce dummy answer attempt in game %s", game_state.game_id
-        )
+    await _broadcast_to_players(context, game_state, message_text)
     log_result = "success" if attempt_success else "fail"
     points = SCORE_PER_WORD if attempt_success else 0
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
@@ -1073,16 +1180,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         success_text = (
             f"{info_prefix} разгадал {slot_ref.public_id}! (+{SCORE_PER_WORD} очков)"
         )
-        try:
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text=success_text,
-                **_thread_kwargs(game_state),
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to notify about dummy success in game %s", game_state.game_id
-            )
+        await _broadcast_to_players(context, game_state, success_text)
         if _all_slots_solved(puzzle, game_state):
             await _finish_game(
                 context,
@@ -1101,16 +1199,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         dummy_player.answers_fail += 1
     _cancel_turn_timers(game_state)
     failure_text = f"{info_prefix} ошибся на {slot_ref.public_id}."
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=failure_text,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to notify about dummy failure in game %s", game_state.game_id
-        )
+    await _broadcast_to_players(context, game_state, failure_text)
     _advance_turn(game_state)
     _store_state(game_state)
     await _announce_turn(context, game_state, puzzle)
@@ -1197,25 +1286,27 @@ async def _announce_turn(
     parts.append(f"Ход игрока {player.name}. Выберите подсказку.")
     text = "\n".join(parts)
     keyboard = _build_turn_keyboard(game_state)
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=text,
-            reply_markup=keyboard,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to announce turn in group for game %s", game_state.game_id)
-    if player.dm_chat_id and player.dm_chat_id != game_state.chat_id:
+    recipients = _iter_player_dm_chats(game_state)
+    await _broadcast_to_players(
+        context,
+        game_state,
+        text,
+        reply_markup=keyboard,
+        reply_markup_for={player.user_id},
+    )
+    dm_chats = {chat_id for _, chat_id in recipients}
+    if game_state.chat_id not in dm_chats:
         try:
             await context.bot.send_message(
-                chat_id=player.dm_chat_id,
+                chat_id=game_state.chat_id,
                 text=text,
                 reply_markup=keyboard,
+                **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
             logger.exception(
-                "Failed to send DM announcement to player %s", player.user_id
+                "Failed to announce turn in primary chat for game %s",
+                game_state.game_id,
             )
     _schedule_turn_timers(context, game_state)
     if game_state.test_mode:
@@ -1262,14 +1353,7 @@ async def _handle_turn_timeout(
     message = "Ход пропущен по таймеру."
     if player:
         message = f"{player.name} не успел ответить. Ход переходит дальше."
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=message,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to notify about turn timeout for game %s", game_state.game_id)
+    await _broadcast_to_players(context, game_state, message)
     _advance_turn(game_state)
     _store_state(game_state)
     await _announce_turn(context, game_state, puzzle)
@@ -1409,16 +1493,13 @@ async def _finish_game(
             ],
         ]
     )
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text="\n".join(lines),
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=keyboard,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to send finish summary for game %s", game_state.game_id)
+    await _broadcast_to_players(
+        context,
+        game_state,
+        "\n".join(lines),
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=keyboard,
+    )
     _store_state(game_state)
 
 
@@ -1645,9 +1726,8 @@ async def _run_lobby_puzzle_generation(
     puzzle: Puzzle | CompositePuzzle | None = None
     generated_state: GameState | None = None
     try:
-        puzzle, generated_state = await loop.run_in_executor(
-            None,
-            _generate_puzzle,
+        puzzle, generated_state = await _run_generate_puzzle(
+            loop,
             chat_id,
             language,
             theme,
@@ -1758,12 +1838,14 @@ def _load_state_by_game_id(game_id: str) -> GameState | None:
             save_state(cached)
         elif getattr(cached, "thread_id", 0) > 0:
             state.chat_threads[cached.chat_id] = cached.thread_id
+        _update_dm_mappings(cached)
         return cached
     restored = load_state(game_id)
     if restored is None:
         return None
     state.active_games[restored.game_id] = restored
     state.chat_to_game[restored.chat_id] = restored.game_id
+    _update_dm_mappings(restored)
     for code, target in list(state.join_codes.items()):
         if target == restored.game_id and code not in restored.join_codes:
             state.join_codes.pop(code, None)
@@ -1838,6 +1920,7 @@ def _store_state(game_state: GameState) -> None:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         state.active_games[game_state.game_id] = game_state
         state.chat_to_game[game_state.chat_id] = game_state.game_id
+        _update_dm_mappings(game_state)
         for code, target in list(state.join_codes.items()):
             if target == game_state.game_id and code not in game_state.join_codes:
                 state.join_codes.pop(code, None)
@@ -1852,6 +1935,8 @@ def _store_state(game_state: GameState) -> None:
 def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
     with logging_context(chat_id=chat_id):
         game_id = state.chat_to_game.get(chat_id)
+        if game_id is None:
+            game_id = state.dm_chat_to_game.get(chat_id)
         if game_id and game_id in state.active_games:
             cached = state.active_games[game_id]
             hint_thread = state.chat_threads.get(chat_id, 0)
@@ -1860,6 +1945,7 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
                 save_state(cached)
             elif getattr(cached, "thread_id", 0) > 0:
                 state.chat_threads[cached.chat_id] = cached.thread_id
+            _update_dm_mappings(cached)
             return cached
         identifiers_to_try: list[str | int] = []
         if game_id is not None:
@@ -1883,6 +1969,7 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
             state.active_games.pop(game_id, None)
         state.active_games[restored.game_id] = restored
         state.chat_to_game[restored.chat_id] = restored.game_id
+        _update_dm_mappings(restored)
         for code, target in list(state.join_codes.items()):
             if target == restored.game_id and code not in restored.join_codes:
                 state.join_codes.pop(code, None)
@@ -2500,14 +2587,7 @@ async def _game_warning_job(context: CallbackContext) -> None:
     if not game_state or game_state.status != "running":
         return
     text = "До завершения игры осталось одна минута!"
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=text,
-            **_thread_kwargs(game_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to send game warning for %s", game_id)
+    await _broadcast_to_players(context, game_state, text)
 
 
 async def _game_timeout_job(context: CallbackContext) -> None:
@@ -2542,16 +2622,7 @@ async def _turn_warning_job(context: CallbackContext) -> None:
     if not player:
         return
     warning = f"{player.name}, осталось {TURN_WARNING_SECONDS} секунд на ход!"
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=warning,
-            **_thread_kwargs(game_state),
-        )
-        if player.dm_chat_id and player.dm_chat_id != game_state.chat_id:
-            await context.bot.send_message(chat_id=player.dm_chat_id, text=warning)
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to send turn warning for game %s", game_id)
+    await _broadcast_to_players(context, game_state, warning)
 
 
 async def _turn_timeout_job(context: CallbackContext) -> None:
@@ -2744,6 +2815,19 @@ def _clone_puzzle_for_test(
     save_puzzle(new_id, payload)
     cloned = puzzle_from_dict(dict(payload))
     return cloned, new_id, None
+
+
+async def _run_generate_puzzle(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    language: str,
+    theme: str,
+    thread_id: int,
+) -> tuple[Puzzle | CompositePuzzle, GameState]:
+    args: list[Any] = [chat_id, language, theme]
+    if thread_id:
+        args.append(thread_id)
+    return await loop.run_in_executor(None, _generate_puzzle, *args)
 
 
 def _generate_puzzle(
@@ -3370,10 +3454,10 @@ async def _process_join_code(
         await message.reply_text(
             f"Вы уже в игре «{game_state.theme or 'без темы'}». Ожидаем старт."
         )
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=f"{existing.name} снова с нами!",
-            **_thread_kwargs(game_state),
+        await _broadcast_to_players(
+            context,
+            game_state,
+            f"{existing.name} снова с нами!",
         )
         return
 
@@ -3386,10 +3470,10 @@ async def _process_join_code(
         await message.reply_text(
             f"Добро пожаловать обратно, {player.name}! Ждите начала игры."
         )
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=f"{player.name} подключился к игре!",
-            **_thread_kwargs(game_state),
+        await _broadcast_to_players(
+            context,
+            game_state,
+            f"{player.name} подключился к игре!",
         )
         await _update_lobby_message(context, game_state)
         return
@@ -3723,9 +3807,8 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             generated_state: GameState | None = None
             state.generating_chats.add(chat.id)
             try:
-                puzzle, generated_state = await loop.run_in_executor(
-                    None,
-                    _generate_puzzle,
+                puzzle, generated_state = await _run_generate_puzzle(
+                    loop,
                     chat.id,
                     language,
                     theme,
@@ -3848,9 +3931,8 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         game_state: GameState | None = None
         state.generating_chats.add(chat.id)
         try:
-            puzzle, game_state = await loop.run_in_executor(
-                None,
-                _generate_puzzle,
+            puzzle, game_state = await _run_generate_puzzle(
+                loop,
                 chat.id,
                 language,
                 theme,
@@ -3959,9 +4041,8 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     generation_token = secrets.token_hex(16)
     context.chat_data[GENERATION_TOKEN_KEY] = generation_token
     try:
-        puzzle, game_state = await loop.run_in_executor(
-            None,
-            _generate_puzzle,
+        puzzle, game_state = await _run_generate_puzzle(
+            loop,
             chat.id,
             language,
             theme,
@@ -4076,10 +4157,10 @@ async def join_name_response_handler(
         f"Приятно познакомиться, {player.name}! Ждите начала игры.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await context.bot.send_message(
-        chat_id=game_state.chat_id,
-        text=f"{player.name} присоединился к игре!",
-        **_thread_kwargs(game_state),
+    await _broadcast_to_players(
+        context,
+        game_state,
+        f"{player.name} присоединился к игре!",
     )
     await _update_lobby_message(context, game_state)
 
@@ -4627,6 +4708,10 @@ async def turn_select_callback_handler(
         return
     if not query.data.startswith(TURN_SELECT_CALLBACK_PREFIX):
         return
+    message_chat = query.message.chat if query.message else None
+    if message_chat is None or message_chat.type != ChatType.PRIVATE:
+        await query.answer("Используйте личный чат с ботом.", show_alert=True)
+        return
     game_id = query.data[len(TURN_SELECT_CALLBACK_PREFIX) :]
     game_state = _load_state_by_game_id(game_id)
     if not game_state or game_state.status != "running":
@@ -4651,7 +4736,7 @@ async def turn_select_callback_handler(
         return
     keyboard = _build_slot_keyboard(game_state, puzzle)
     await query.answer("Открываю список вопросов.")
-    target_chat = current_player.dm_chat_id or game_state.chat_id
+    target_chat = current_player.dm_chat_id or (message_chat.id if message_chat else game_state.chat_id)
     try:
         await context.bot.send_message(
             chat_id=target_chat,
@@ -4673,6 +4758,10 @@ async def turn_slot_callback_handler(
     if query is None or not query.data:
         return
     if not query.data.startswith(TURN_SLOT_CALLBACK_PREFIX):
+        return
+    message_chat = query.message.chat if query.message else None
+    if message_chat is None or message_chat.type != ChatType.PRIVATE:
+        await query.answer("Используйте личный чат с ботом.", show_alert=True)
         return
     payload = query.data[len(TURN_SLOT_CALLBACK_PREFIX) :]
     if "|" not in payload:
@@ -4714,17 +4803,11 @@ async def turn_slot_callback_handler(
     _store_state(game_state)
     await query.answer("Слот выбран!", show_alert=False)
     clue = slot_ref.slot.clue or "(без подсказки)"
-    announcement = (
-        f"{current_player.name} отвечает на {slot_ref.public_id}: {clue}"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=game_state.chat_id,
-            text=announcement,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to announce selected slot in game %s", game_state.game_id)
-    if current_player.dm_chat_id and current_player.dm_chat_id != game_state.chat_id:
+    announcement = f"{current_player.name} отвечает на {slot_ref.public_id}: {clue}"
+    recipients = _iter_player_dm_chats(game_state)
+    await _broadcast_to_players(context, game_state, announcement)
+    unique_chats = {chat_id for _, chat_id in recipients}
+    if current_player.dm_chat_id and len(unique_chats) > 1:
         try:
             await context.bot.send_message(
                 chat_id=current_player.dm_chat_id,
@@ -5099,9 +5182,31 @@ async def _handle_answer_submission(
                 chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
             )
             with open(image_path, "rb") as photo:
-                await message.reply_photo(
-                    photo=photo, caption=f"Верно! {selected_slot_ref.public_id}"
+                photo_bytes = photo.read()
+            await message.reply_photo(
+                photo=photo_bytes, caption=f"Верно! {selected_slot_ref.public_id}"
+            )
+            if in_turn_mode:
+                await _broadcast_photo_to_players(
+                    context,
+                    game_state,
+                    photo_bytes,
+                    caption=f"Верно! {selected_slot_ref.public_id}",
+                    exclude_chat_ids={chat.id},
                 )
+            if in_turn_mode and chat.id == game_state.chat_id:
+                try:
+                    name = current_player.name if current_player else "Игрок"
+                    await context.bot.send_message(
+                        chat_id=game_state.chat_id,
+                        text=f"{name} разгадал {selected_slot_ref.public_id}!",
+                        **_thread_kwargs(game_state),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to notify primary chat about answer in game %s",
+                        game_state.game_id,
+                    )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to render updated grid after correct answer")
             await message.reply_text(
@@ -5121,18 +5226,6 @@ async def _handle_answer_submission(
                     ),
                 )
                 return
-            if chat.id != game_state.chat_id:
-                try:
-                    name = current_player.name if current_player else "Игрок"
-                    await context.bot.send_message(
-                        chat_id=game_state.chat_id,
-                        text=f"{name} разгадал {selected_slot_ref.public_id}!",
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Failed to notify group about answer in game %s",
-                        game_state.game_id,
-                    )
             _advance_turn(game_state)
             _store_state(game_state)
             await _announce_turn(
@@ -5264,14 +5357,8 @@ async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.effective_message
     if chat is None or message is None:
         return
-    if chat.type in GROUP_CHAT_TYPES:
-        game_state = _load_state_for_chat(chat.id)
-        if not game_state or game_state.mode != "turn_based":
-            if not await _reject_group_chat(update):
-                return
-    else:
-        if not await _reject_group_chat(update):
-            return
+    if not await _reject_group_chat(update):
+        return
     if not context.args or len(context.args) < 2:
         await message.reply_text("Использование: /answer <слот> <слово>")
         return
@@ -6053,10 +6140,13 @@ async def on_startup() -> None:
     restored_games = load_all_states()
     state.active_games = restored_games
     state.chat_to_game = {game_state.chat_id: game_id for game_id, game_state in restored_games.items()}
+    state.dm_chat_to_game = {}
+    state.player_chats = {}
     state.join_codes = {}
     for game_state in restored_games.values():
         for code, target in game_state.join_codes.items():
             state.join_codes[code] = target
+        _update_dm_mappings(game_state)
     if restored_games:
         logger.info("Restored %s active game states", len(restored_games))
     else:
