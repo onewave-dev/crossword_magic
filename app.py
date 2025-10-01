@@ -3418,8 +3418,17 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
             get_chat_mode(context),
         )
         return
-    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
-    if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
+    chat_data = getattr(context, "chat_data", None)
+    if not isinstance(chat_data, dict):
+        chat_data = {}
+        setattr(context, "chat_data", chat_data)
+
+    flow_state = chat_data.get(BUTTON_NEW_GAME_KEY)
+    if not isinstance(flow_state, dict):
+        flow_state = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
+        chat_data[BUTTON_NEW_GAME_KEY] = flow_state
+
+    if flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
         return
     message = update.effective_message
     chat = update.effective_chat
