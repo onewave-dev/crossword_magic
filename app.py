@@ -257,7 +257,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         task = state.lobby_generation_tasks.pop(game_state.game_id, None)
         if task is not None:
             task.cancel()
-        delete_state(game_state)
+        delete_state(game_state.game_id)
         for code, target in list(state.join_codes.items()):
             if target == game_state.game_id:
                 state.join_codes.pop(code, None)
