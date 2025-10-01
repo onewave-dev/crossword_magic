@@ -730,6 +730,62 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
 
 
 @pytest.mark.anyio
+async def test_turn_based_second_answer_rejected_after_advance(
+    monkeypatch, tmp_path, fresh_state
+):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-701, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_send_clues_update", AsyncMock())
+
+    stored_turns: list[int] = []
+
+    def fake_store(gs: GameState) -> None:
+        stored_turns.append(gs.turn_index)
+        state.active_games[gs.game_id] = gs
+        state.chat_to_game[gs.chat_id] = gs.game_id
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+
+    image_path = tmp_path / "grid.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    job_queue = DummyJobQueue()
+    bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
+    context = SimpleNamespace(bot=bot, job_queue=job_queue)
+
+    game_state.thread_id = 111
+    await app._announce_turn(context, game_state, puzzle)
+
+    update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
+    message.reply_photo = AsyncMock()
+    message.reply_text = AsyncMock()
+
+    await app._handle_answer_submission(context, chat, message, "A1", "рим")
+
+    assert game_state.turn_index == 1
+    assert game_state.scoreboard[1] == app.SCORE_PER_WORD
+    assert stored_turns and stored_turns[-1] == 1
+    first_store_count = len(stored_turns)
+
+    message.reply_text.reset_mock()
+    message.reply_photo.reset_mock()
+
+    await app._handle_answer_submission(context, chat, message, "A1", "рим")
+
+    message.reply_text.assert_awaited()
+    assert "Игрок 2" in message.reply_text.await_args.args[0]
+    assert message.reply_photo.await_count == 0
+    assert game_state.turn_index == 1
+    assert len(stored_turns) == first_store_count
+
+
+@pytest.mark.anyio
 async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     chat_id = 555

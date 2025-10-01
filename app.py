@@ -5093,6 +5093,38 @@ async def _handle_answer_submission(
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
         logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
+        turn_prefix: str | None = None
+        puzzle_finished = False
+        completion_reason: str | None = None
+        if in_turn_mode:
+            turn_prefix = (
+                f"{current_player.name} разгадал {selected_slot_ref.public_id}!"
+                if current_player
+                else f"Слот {selected_slot_ref.public_id} разгадан!"
+            )
+            completion_reason = (
+                f"{current_player.name} разгадал последний слот!"
+                if current_player
+                else "Все слова разгаданы!"
+            )
+            _cancel_turn_timers(game_state)
+            puzzle_finished = _all_slots_solved(puzzle, game_state)
+            if chat.id != game_state.chat_id:
+                try:
+                    name = current_player.name if current_player else "Игрок"
+                    await context.bot.send_message(
+                        chat_id=game_state.chat_id,
+                        text=f"{name} разгадал {selected_slot_ref.public_id}!",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to notify group about answer in game %s",
+                        game_state.game_id,
+                    )
+            if not puzzle_finished:
+                _advance_turn(game_state)
+            _store_state(game_state)
+
         try:
             image_path = render_puzzle(puzzle, game_state)
             await context.bot.send_chat_action(
@@ -5109,41 +5141,18 @@ async def _handle_answer_submission(
             )
 
         if in_turn_mode:
-            _cancel_turn_timers(game_state)
-            if _all_slots_solved(puzzle, game_state):
+            if puzzle_finished:
                 await _finish_game(
                     context,
                     game_state,
-                    reason=(
-                        f"{current_player.name} разгадал последний слот!"
-                        if current_player
-                        else "Все слова разгаданы!"
-                    ),
+                    reason=completion_reason,
                 )
                 return
-            if chat.id != game_state.chat_id:
-                try:
-                    name = current_player.name if current_player else "Игрок"
-                    await context.bot.send_message(
-                        chat_id=game_state.chat_id,
-                        text=f"{name} разгадал {selected_slot_ref.public_id}!",
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Failed to notify group about answer in game %s",
-                        game_state.game_id,
-                    )
-            _advance_turn(game_state)
-            _store_state(game_state)
             await _announce_turn(
                 context,
                 game_state,
                 puzzle,
-                prefix=(
-                    f"{current_player.name} разгадал {selected_slot_ref.public_id}!"
-                    if current_player
-                    else f"Слот {selected_slot_ref.public_id} разгадан!"
-                ),
+                prefix=turn_prefix,
             )
         else:
             if _all_slots_solved(puzzle, game_state):
