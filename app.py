@@ -378,7 +378,8 @@ except ValueError:
     DUMMY_ACCURACY = 0.8
 DUMMY_ACCURACY = min(max(DUMMY_ACCURACY, 0.0), 1.0)
 
-_DEFAULT_DELAY_MIN = 3.0
+MIN_DUMMY_DELAY = 5.0
+_DEFAULT_DELAY_MIN = MIN_DUMMY_DELAY
 _DEFAULT_DELAY_MAX = 8.0
 delay_env = os.getenv("DUMMY_DELAY_RANGE")
 if delay_env:
@@ -392,7 +393,7 @@ if delay_env:
     else:
         try:
             single = float(parts[0])
-            delay_min = max(0.1, single)
+            delay_min = max(MIN_DUMMY_DELAY, single)
             delay_max = delay_min
         except (IndexError, ValueError):
             delay_min, delay_max = _DEFAULT_DELAY_MIN, _DEFAULT_DELAY_MAX
@@ -400,7 +401,7 @@ else:
     delay_min, delay_max = _DEFAULT_DELAY_MIN, _DEFAULT_DELAY_MAX
 if delay_max < delay_min:
     delay_min, delay_max = delay_max, delay_min
-delay_min = max(0.1, delay_min)
+delay_min = max(MIN_DUMMY_DELAY, delay_min)
 delay_max = max(delay_min, delay_max)
 DUMMY_DELAY_RANGE = (delay_min, delay_max)
 
@@ -1004,7 +1005,7 @@ def _schedule_dummy_turn(
         _cancel_dummy_job(game_state)
         return
     _cancel_dummy_job(game_state)
-    delay = random.uniform(*DUMMY_DELAY_RANGE)
+    delay = max(MIN_DUMMY_DELAY, random.uniform(*DUMMY_DELAY_RANGE))
     job_name = f"dummy-turn-{game_state.game_id}"
     data = {"game_id": game_state.game_id, "planned_delay": delay}
     job = context.job_queue.run_once(
