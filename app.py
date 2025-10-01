@@ -3363,6 +3363,7 @@ async def new_game_menu_admin_proxy_handler(
 ) -> int:
     _normalise_thread_id(update)
     _reset_new_game_context(update, context)
+    await admin_test_game_callback_handler(update, context)
     return ConversationHandler.END
 
 
@@ -5503,7 +5504,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
                 CallbackQueryHandler(
                     new_game_menu_admin_proxy_handler,
                     pattern=fr"^{ADMIN_TEST_GAME_CALLBACK_PREFIX}.*$",
-                    block=False,
+                    block=True,
                 ),
             ],
             LANGUAGE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_language)],
