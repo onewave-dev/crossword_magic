@@ -86,6 +86,7 @@ class GameState:
 
     chat_id: int
     puzzle_id: str
+    thread_id: int = 0
     filled_cells: Dict[str, str] = field(default_factory=dict)
     solved_slots: set[str] = field(default_factory=set)
     score: int = 0
@@ -127,6 +128,10 @@ class GameState:
         self.game_id = str(self.game_id or self.chat_id)
         self.puzzle_id = str(self.puzzle_id)
         self.chat_id = int(self.chat_id)
+        with suppress(TypeError, ValueError):
+            self.thread_id = int(self.thread_id)
+        if self.thread_id < 0:
+            self.thread_id = 0
         self.score = int(self.score)
         self.mode = str(self.mode or "single")
         self.status = str(self.status or "running")
@@ -246,6 +251,7 @@ class GameState:
             "game_id": self.game_id,
             "chat_id": self.chat_id,
             "puzzle_id": self.puzzle_id,
+            "thread_id": self.thread_id,
             "puzzle_ids": list(self.puzzle_ids) if self.puzzle_ids else None,
             "filled_cells": self.filled_cells,
             "solved_slots": sorted(self.solved_slots),
@@ -358,6 +364,11 @@ class GameState:
         chat_id = int(chat_id_raw)
         game_id = str(game_id_raw) if game_id_raw else str(chat_id)
 
+        thread_raw = payload.get("thread_id")
+        thread_id = int(thread_raw) if thread_raw not in (None, "") else 0
+        if thread_id < 0:
+            thread_id = 0
+
         host_raw = payload.get("host_id")
         host_id = int(host_raw) if host_raw not in (None, "") else None
 
@@ -432,6 +443,7 @@ class GameState:
             chat_id=chat_id,
             host_id=host_id,
             puzzle_id=str(payload["puzzle_id"]),
+            thread_id=thread_id,
             puzzle_ids=puzzle_ids,
             filled_cells=dict(payload.get("filled_cells", {})),
             solved_slots=solved_slots,
