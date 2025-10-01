@@ -16,6 +16,8 @@ from app import (
     BUTTON_STEP_KEY,
     BUTTON_STEP_THEME,
     GENERATION_NOTICE_KEY,
+    MODE_AWAIT_THEME,
+    button_language_handler,
     button_theme_handler,
     state,
 )
@@ -46,6 +48,25 @@ class DummyJobQueue:
         job = DummyJob(chat_id, name)
         self.submitted.append((callback, when, chat_id, name))
         return job
+
+
+@pytest.mark.anyio
+async def test_button_language_handler_initialises_flow_when_missing():
+    chat = SimpleNamespace(id=123, type=ChatType.PRIVATE)
+    message = SimpleNamespace(text=" Ru ", message_thread_id=None, reply_text=AsyncMock())
+    context = SimpleNamespace(chat_data={}, user_data={})
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+
+    app.set_chat_mode(context, app.MODE_AWAIT_LANGUAGE)
+
+    await button_language_handler(update, context)
+
+    flow_state = context.chat_data[BUTTON_NEW_GAME_KEY]
+    assert flow_state[BUTTON_LANGUAGE_KEY] == "ru"
+    assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_THEME
+    assert app.get_chat_mode(context) == MODE_AWAIT_THEME
+    assert context.user_data["new_game_language"] == "ru"
+    message.reply_text.assert_awaited_once_with("Отлично! Теперь укажите тему кроссворда.")
 
 
 @pytest.mark.anyio
