@@ -190,6 +190,7 @@ class AppState:
         self.lobby_messages: dict[str, tuple[int, int]] = {}
         self.scheduled_jobs: dict[str, Job] = {}
         self.lobby_generation_tasks: dict[str, asyncio.Task[None]] = {}
+        self.chat_threads: dict[int, int] = {}
 
 
 state = AppState()
@@ -434,12 +435,22 @@ def _normalise_thread_id(update: Update) -> int:
     thread_id = 0
     if message is not None and message.message_thread_id is not None:
         thread_id = message.message_thread_id
+    chat = update.effective_chat
+    if chat is not None and thread_id > 0:
+        state.chat_threads[chat.id] = thread_id
     logger.debug(
         "Normalised thread id for chat %s: %s",
         update.effective_chat.id if update.effective_chat else "<unknown>",
         thread_id,
     )
     return thread_id
+
+
+def _thread_kwargs(game_state: GameState) -> dict[str, int]:
+    thread_id = getattr(game_state, "thread_id", 0) or 0
+    if thread_id > 0:
+        return {"message_thread_id": thread_id}
+    return {}
 
 
 def _format_duration(seconds: float) -> str:
@@ -1028,7 +1039,11 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     )
     message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
     try:
-        await context.bot.send_message(chat_id=game_state.chat_id, text=message_text)
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=message_text,
+            **_thread_kwargs(game_state),
+        )
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to announce dummy answer attempt in game %s", game_state.game_id
@@ -1060,7 +1075,9 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         )
         try:
             await context.bot.send_message(
-                chat_id=game_state.chat_id, text=success_text
+                chat_id=game_state.chat_id,
+                text=success_text,
+                **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
             logger.exception(
@@ -1085,7 +1102,11 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     _cancel_turn_timers(game_state)
     failure_text = f"{info_prefix} ошибся на {slot_ref.public_id}."
     try:
-        await context.bot.send_message(chat_id=game_state.chat_id, text=failure_text)
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=failure_text,
+            **_thread_kwargs(game_state),
+        )
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to notify about dummy failure in game %s", game_state.game_id
@@ -1181,6 +1202,7 @@ async def _announce_turn(
             chat_id=game_state.chat_id,
             text=text,
             reply_markup=keyboard,
+            **_thread_kwargs(game_state),
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to announce turn in group for game %s", game_state.game_id)
@@ -1241,7 +1263,11 @@ async def _handle_turn_timeout(
     if player:
         message = f"{player.name} не успел ответить. Ход переходит дальше."
     try:
-        await context.bot.send_message(chat_id=game_state.chat_id, text=message)
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=message,
+            **_thread_kwargs(game_state),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to notify about turn timeout for game %s", game_state.game_id)
     _advance_turn(game_state)
@@ -1389,6 +1415,7 @@ async def _finish_game(
             text="\n".join(lines),
             parse_mode=constants.ParseMode.HTML,
             reply_markup=keyboard,
+            **_thread_kwargs(game_state),
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send finish summary for game %s", game_state.game_id)
@@ -1576,6 +1603,7 @@ async def _publish_lobby_message(
         chat_id=chat_id,
         text=text,
         reply_markup=keyboard,
+        **_thread_kwargs(game_state),
     )
     state.lobby_messages[game_state.game_id] = (chat_id, sent.message_id)
 
@@ -1618,7 +1646,12 @@ async def _run_lobby_puzzle_generation(
     generated_state: GameState | None = None
     try:
         puzzle, generated_state = await loop.run_in_executor(
-            None, _generate_puzzle, chat_id, language, theme
+            None,
+            _generate_puzzle,
+            chat_id,
+            language,
+            theme,
+            base_state.thread_id if getattr(base_state, "thread_id", 0) else 0,
         )
     except asyncio.CancelledError:
         logger.info("Lobby puzzle generation cancelled for game %s", game_id)
@@ -1650,6 +1683,7 @@ async def _run_lobby_puzzle_generation(
                 text=(
                     "Не удалось подготовить кроссворд. Попробуйте выбрать тему ещё раз."
                 ),
+                **(_thread_kwargs(refreshed) if refreshed else {}),
             )
         except TelegramError:
             logger.exception("Failed to notify chat %s about generation failure", chat_id)
@@ -1704,6 +1738,7 @@ async def _run_lobby_puzzle_generation(
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Кроссворд готов! Нажмите «Старт», чтобы начать игру.",
+                **_thread_kwargs(refreshed),
             )
         except TelegramError:
             logger.exception(
@@ -1716,7 +1751,14 @@ def _load_state_by_game_id(game_id: str) -> GameState | None:
     if not game_id:
         return None
     if game_id in state.active_games:
-        return state.active_games[game_id]
+        cached = state.active_games[game_id]
+        hint_thread = state.chat_threads.get(cached.chat_id, 0)
+        if _maybe_update_thread_binding(cached, hint_thread):
+            state.chat_threads[cached.chat_id] = cached.thread_id
+            save_state(cached)
+        elif getattr(cached, "thread_id", 0) > 0:
+            state.chat_threads[cached.chat_id] = cached.thread_id
+        return cached
     restored = load_state(game_id)
     if restored is None:
         return None
@@ -1727,6 +1769,12 @@ def _load_state_by_game_id(game_id: str) -> GameState | None:
             state.join_codes.pop(code, None)
     for code, target in restored.join_codes.items():
         state.join_codes[code] = target
+    hint_thread = state.chat_threads.get(restored.chat_id, 0)
+    if _maybe_update_thread_binding(restored, hint_thread):
+        state.chat_threads[restored.chat_id] = restored.thread_id
+        save_state(restored)
+    elif getattr(restored, "thread_id", 0) > 0:
+        state.chat_threads[restored.chat_id] = restored.thread_id
     return restored
 
 
@@ -1775,6 +1823,17 @@ async def track_player_callback(update: Update, context: ContextTypes.DEFAULT_TY
         _register_player_chat(user.id, chat.id)
 
 
+def _maybe_update_thread_binding(
+    game_state: GameState | None, thread_id: int
+) -> bool:
+    if game_state is None or thread_id <= 0:
+        return False
+    if getattr(game_state, "thread_id", 0) == thread_id:
+        return False
+    game_state.thread_id = thread_id
+    return True
+
+
 def _store_state(game_state: GameState) -> None:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         state.active_games[game_state.game_id] = game_state
@@ -1784,6 +1843,8 @@ def _store_state(game_state: GameState) -> None:
                 state.join_codes.pop(code, None)
         for code, target in game_state.join_codes.items():
             state.join_codes[code] = target
+        if game_state.thread_id > 0:
+            state.chat_threads[game_state.chat_id] = game_state.thread_id
         save_state(game_state)
         logger.info("Game state persisted for game %s", game_state.game_id)
 
@@ -1792,7 +1853,14 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
     with logging_context(chat_id=chat_id):
         game_id = state.chat_to_game.get(chat_id)
         if game_id and game_id in state.active_games:
-            return state.active_games[game_id]
+            cached = state.active_games[game_id]
+            hint_thread = state.chat_threads.get(chat_id, 0)
+            if _maybe_update_thread_binding(cached, hint_thread):
+                state.chat_threads[cached.chat_id] = cached.thread_id
+                save_state(cached)
+            elif getattr(cached, "thread_id", 0) > 0:
+                state.chat_threads[cached.chat_id] = cached.thread_id
+            return cached
         identifiers_to_try: list[str | int] = []
         if game_id is not None:
             identifiers_to_try.append(game_id)
@@ -1820,6 +1888,12 @@ def _load_state_for_chat(chat_id: int) -> Optional[GameState]:
                 state.join_codes.pop(code, None)
         for code, target in restored.join_codes.items():
             state.join_codes[code] = target
+        hint_thread = state.chat_threads.get(restored.chat_id, 0)
+        if _maybe_update_thread_binding(restored, hint_thread):
+            state.chat_threads[restored.chat_id] = restored.thread_id
+            save_state(restored)
+        elif getattr(restored, "thread_id", 0) > 0:
+            state.chat_threads[restored.chat_id] = restored.thread_id
         logger.info("Restored state from disk during command handling")
         return restored
 
@@ -2427,7 +2501,11 @@ async def _game_warning_job(context: CallbackContext) -> None:
         return
     text = "До завершения игры осталось одна минута!"
     try:
-        await context.bot.send_message(chat_id=game_state.chat_id, text=text)
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=text,
+            **_thread_kwargs(game_state),
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send game warning for %s", game_id)
 
@@ -2465,7 +2543,11 @@ async def _turn_warning_job(context: CallbackContext) -> None:
         return
     warning = f"{player.name}, осталось {TURN_WARNING_SECONDS} секунд на ход!"
     try:
-        await context.bot.send_message(chat_id=game_state.chat_id, text=warning)
+        await context.bot.send_message(
+            chat_id=game_state.chat_id,
+            text=warning,
+            **_thread_kwargs(game_state),
+        )
         if player.dm_chat_id and player.dm_chat_id != game_state.chat_id:
             await context.bot.send_message(chat_id=player.dm_chat_id, text=warning)
     except Exception:  # noqa: BLE001
@@ -2585,6 +2667,8 @@ def _generate_composite(
     language: str,
     theme: str,
     components: Sequence[Sequence[WordClue]],
+    *,
+    thread_id: int = 0,
 ) -> tuple[CompositePuzzle, GameState]:
     composite_id = uuid4().hex
     composite_components: list[CompositeComponent] = []
@@ -2631,6 +2715,7 @@ def _generate_composite(
         host_id=chat_id,
         game_id=str(chat_id),
         scoreboard={chat_id: 0},
+        thread_id=thread_id,
     )
     return composite, game_state
 
@@ -2662,7 +2747,7 @@ def _clone_puzzle_for_test(
 
 
 def _generate_puzzle(
-    chat_id: int, language: str, theme: str
+    chat_id: int, language: str, theme: str, thread_id: int = 0
 ) -> tuple[Puzzle | CompositePuzzle, GameState]:
     with logging_context(chat_id=chat_id):
         logger.info(
@@ -3022,7 +3107,11 @@ def _generate_puzzle(
                                 )
                                 try:
                                     composite, game_state = _generate_composite(
-                                        chat_id, language, theme, components
+                                        chat_id,
+                                        language,
+                                        theme,
+                                        components,
+                                        thread_id=thread_id,
                                     )
                                 except FillInGenerationError as composite_error:
                                     logger.debug(
@@ -3057,6 +3146,7 @@ def _generate_puzzle(
                             host_id=chat_id,
                             game_id=str(chat_id),
                             scoreboard={chat_id: 0},
+                            thread_id=thread_id,
                         )
                         _store_state(game_state)
                         logger.info("Generated puzzle ready for delivery")
@@ -3180,6 +3270,7 @@ async def _start_new_private_game(
 async def _start_new_group_game(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
+    thread_id = _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
@@ -3227,6 +3318,7 @@ async def _start_new_group_game(
         mode="turn_based",
         status="lobby",
         players={},
+        thread_id=thread_id if thread_id > 0 else 0,
     )
     if user and host_id is not None:
         _ensure_player_entry(game_state, user, host_name, dm_chat_id)
@@ -3281,6 +3373,7 @@ async def _process_join_code(
         await context.bot.send_message(
             chat_id=game_state.chat_id,
             text=f"{existing.name} снова с нами!",
+            **_thread_kwargs(game_state),
         )
         return
 
@@ -3296,6 +3389,7 @@ async def _process_join_code(
         await context.bot.send_message(
             chat_id=game_state.chat_id,
             text=f"{player.name} подключился к игре!",
+            **_thread_kwargs(game_state),
         )
         await _update_lobby_message(context, game_state)
         return
@@ -3619,7 +3713,12 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             state.generating_chats.add(chat.id)
             try:
                 puzzle, generated_state = await loop.run_in_executor(
-                    None, _generate_puzzle, chat.id, language, theme
+                    None,
+                    _generate_puzzle,
+                    chat.id,
+                    language,
+                    theme,
+                    game_state.thread_id if getattr(game_state, "thread_id", 0) else 0,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -3739,7 +3838,12 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         state.generating_chats.add(chat.id)
         try:
             puzzle, game_state = await loop.run_in_executor(
-                None, _generate_puzzle, chat.id, language, theme
+                None,
+                _generate_puzzle,
+                chat.id,
+                language,
+                theme,
+                state.chat_threads.get(chat.id, 0),
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to generate puzzle for chat %s", chat.id)
@@ -3845,7 +3949,12 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     context.chat_data[GENERATION_TOKEN_KEY] = generation_token
     try:
         puzzle, game_state = await loop.run_in_executor(
-            None, _generate_puzzle, chat.id, language, theme
+            None,
+            _generate_puzzle,
+            chat.id,
+            language,
+            theme,
+            state.chat_threads.get(chat.id, 0),
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to generate puzzle for chat %s via button flow", chat.id)
@@ -3959,6 +4068,7 @@ async def join_name_response_handler(
     await context.bot.send_message(
         chat_id=game_state.chat_id,
         text=f"{player.name} присоединился к игре!",
+        **_thread_kwargs(game_state),
     )
     await _update_lobby_message(context, game_state)
 
@@ -4266,6 +4376,7 @@ async def lobby_start_callback_handler(
             await context.bot.send_message(
                 chat_id=game_state.chat_id,
                 text="Не удалось подготовить кроссворд. Попробуйте начать позже.",
+                **_thread_kwargs(game_state),
             )
             return
         refreshed_state = _load_state_by_game_id(game_id)
@@ -4273,6 +4384,7 @@ async def lobby_start_callback_handler(
             await context.bot.send_message(
                 chat_id=game_state.chat_id,
                 text="Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
+                **_thread_kwargs(game_state),
             )
             return
         game_state = refreshed_state
@@ -4281,6 +4393,7 @@ async def lobby_start_callback_handler(
             await context.bot.send_message(
                 chat_id=game_state.chat_id,
                 text="Не удалось загрузить кроссворд. Попробуйте позже.",
+                **_thread_kwargs(game_state),
             )
             return
     players_sorted = sorted(
@@ -4308,6 +4421,7 @@ async def lobby_start_callback_handler(
     await context.bot.send_message(
         chat_id=game_state.chat_id,
         text="Игра началась! Ходы идут по очереди.",
+        **_thread_kwargs(game_state),
     )
     await _announce_turn(
         context,
@@ -4374,6 +4488,7 @@ async def _launch_admin_test_game(
         players={admin_id: admin_player, DUMMY_USER_ID: dummy_player},
         turn_order=turn_order,
         turn_index=0,
+        thread_id=base_state.thread_id,
     )
     admin_state.test_mode = True
     admin_state.dummy_user_id = DUMMY_USER_ID
@@ -4399,6 +4514,7 @@ async def _launch_admin_test_game(
         await context.bot.send_message(
             chat_id=base_state.chat_id,
             text="\n".join(intro_lines),
+            **_thread_kwargs(base_state),
         )
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -5645,9 +5761,14 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         generation_token = secrets.token_hex(16)
         context.chat_data[GENERATION_TOKEN_KEY] = generation_token
         try:
-            new_puzzle, new_state = await loop.run_in_executor(
-                None, _generate_puzzle, chat.id, language, theme
-            )
+                new_puzzle, new_state = await loop.run_in_executor(
+                    None,
+                    _generate_puzzle,
+                    chat.id,
+                    language,
+                    theme,
+                    state.chat_threads.get(chat.id, 0),
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to regenerate puzzle for chat %s on same theme", chat.id

@@ -47,6 +47,7 @@ def fresh_state():
     state.lobby_messages.clear()
     state.generating_chats.clear()
     state.scheduled_jobs.clear()
+    state.chat_threads.clear()
     yield
     state.active_games.clear()
     state.chat_to_game.clear()
@@ -55,6 +56,7 @@ def fresh_state():
     state.lobby_messages.clear()
     state.generating_chats.clear()
     state.scheduled_jobs.clear()
+    state.chat_threads.clear()
     state.settings = original_settings
 
 
@@ -660,7 +662,15 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
     bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
     context = SimpleNamespace(bot=bot, job_queue=job_queue)
 
+    game_state.thread_id = 321
     await app._announce_turn(context, game_state, puzzle)
+    group_call = next(
+        call
+        for call in bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == game_state.chat_id
+    )
+    assert group_call.kwargs.get("message_thread_id") == 321
+    bot.send_message.reset_mock()
     assert len(job_queue.submitted) >= 1
     initial_warn_name = game_state.turn_warn_job_id
     initial_timeout_name = game_state.turn_timer_job_id
@@ -709,6 +719,7 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
 
     assert announce_mock.await_count == 1
     assert announce_mock.await_args.kwargs["chat_id"] == chat_id
+    assert "message_thread_id" not in announce_mock.await_args.kwargs
 
     warning_mock = AsyncMock()
     job_name = "turn-warn-test"
