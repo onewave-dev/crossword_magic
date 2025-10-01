@@ -1080,6 +1080,36 @@ async def test_admin_test_game_recovers_from_stale_mapping(monkeypatch, fresh_st
     cleanup_mock.assert_not_called()
 
 
+def test_schedule_dummy_turn_clamps_minimum_delay(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    puzzle.slots = puzzle.slots[:1]
+    game_state = _make_turn_state(-999, puzzle)
+    game_state.test_mode = True
+    game_state.dummy_user_id = app.DUMMY_USER_ID
+    dummy_player = Player(user_id=app.DUMMY_USER_ID, name="Dummy", is_bot=True)
+    game_state.players[app.DUMMY_USER_ID] = dummy_player
+    game_state.turn_order = [app.DUMMY_USER_ID]
+    game_state.turn_index = 0
+    game_state.active_slot_id = None
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    job_queue = DummyJobQueue()
+    context = SimpleNamespace(job_queue=job_queue)
+
+    monkeypatch.setattr(app, "DUMMY_DELAY_RANGE", (1.0, 3.0))
+    monkeypatch.setattr(app.random, "uniform", lambda *_: 2.0)
+
+    app._schedule_dummy_turn(context, game_state, puzzle)
+
+    assert len(job_queue.submitted) == 1
+    _, when, _, _, data = job_queue.submitted[0]
+    assert when >= app.MIN_DUMMY_DELAY
+    assert data["planned_delay"] >= app.MIN_DUMMY_DELAY
+    assert game_state.dummy_planned_delay >= app.MIN_DUMMY_DELAY
+    assert state.scheduled_jobs[game_state.dummy_job_id].name == game_state.dummy_job_id
+
+
 @pytest.mark.anyio
 async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog):
     puzzle = _make_turn_puzzle()
