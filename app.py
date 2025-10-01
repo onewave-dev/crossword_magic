@@ -13,7 +13,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -465,6 +465,41 @@ def _get_new_game_storage(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None)
         data = {}
         setattr(context, "user_data", data)
     return data
+
+
+def _get_button_flow_state(
+    context: ContextTypes.DEFAULT_TYPE, chat: Chat | None
+) -> dict | None:
+    storage = _get_new_game_storage(context, chat)
+    flow_state = storage.get(BUTTON_NEW_GAME_KEY)
+    if isinstance(flow_state, dict):
+        return flow_state
+    return None
+
+
+def _ensure_button_flow_state(
+    context: ContextTypes.DEFAULT_TYPE, chat: Chat | None
+) -> dict:
+    storage = _get_new_game_storage(context, chat)
+    flow_state = storage.get(BUTTON_NEW_GAME_KEY)
+    if not isinstance(flow_state, dict):
+        flow_state = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
+        storage[BUTTON_NEW_GAME_KEY] = flow_state
+    return flow_state
+
+
+def _set_button_flow_state(
+    context: ContextTypes.DEFAULT_TYPE, chat: Chat | None, state: dict[str, Any] | None
+) -> None:
+    storage = _get_new_game_storage(context, chat)
+    if state is None:
+        storage.pop(BUTTON_NEW_GAME_KEY, None)
+    else:
+        storage[BUTTON_NEW_GAME_KEY] = state
+
+
+def _clear_button_flow_state(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> None:
+    _set_button_flow_state(context, chat, None)
 
 
 def _get_pending_language(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> str | None:
@@ -3282,9 +3317,9 @@ def _reset_new_game_context(
     _clear_generation_notice(context, chat_id)
     _clear_pending_language(context, chat)
     if isinstance(getattr(context, "chat_data", None), dict):
-        context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
         context.chat_data.pop("lobby_message_id", None)
         context.chat_data.pop(PENDING_ADMIN_TEST_KEY, None)
+    _clear_button_flow_state(context, chat)
     set_chat_mode(context, MODE_IDLE)
     if isinstance(getattr(context, "user_data", None), dict):
         context.user_data.pop("pending_join", None)
@@ -3481,27 +3516,18 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @command_entrypoint()
 async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None or not message.text:
+        return
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
         logger.debug(
             "Ignoring button language input while in mode %s",
             get_chat_mode(context),
         )
         return
-    chat_data = getattr(context, "chat_data", None)
-    if not isinstance(chat_data, dict):
-        chat_data = {}
-        setattr(context, "chat_data", chat_data)
-
-    flow_state = chat_data.get(BUTTON_NEW_GAME_KEY)
-    if not isinstance(flow_state, dict):
-        flow_state = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
-        chat_data[BUTTON_NEW_GAME_KEY] = flow_state
-
+    flow_state = _ensure_button_flow_state(context, chat)
     if flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
-        return
-    message = update.effective_message
-    chat = update.effective_chat
-    if chat is None or message is None or not message.text:
         return
     language = message.text.strip().lower()
     if not language or not language.isalpha():
@@ -3772,10 +3798,10 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 @command_entrypoint()
 async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
-    flow_state = context.chat_data.get(BUTTON_NEW_GAME_KEY)
+    chat = update.effective_chat
+    flow_state = _get_button_flow_state(context, chat)
     if not flow_state or flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_THEME:
         return
-    chat = update.effective_chat
     message = update.effective_message
     if chat is None or message is None or not message.text:
         return
@@ -3824,7 +3850,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:  # noqa: BLE001
         logger.exception("Failed to generate puzzle for chat %s via button flow", chat.id)
         _cleanup_chat_resources(chat.id)
-        context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+        _clear_button_flow_state(context, chat)
         _clear_generation_notice(context, chat.id)
         await message.reply_text(
             "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
@@ -3834,7 +3860,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         state.generating_chats.discard(chat.id)
     stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
-    context.chat_data.pop(BUTTON_NEW_GAME_KEY, None)
+    _clear_button_flow_state(context, chat)
     if stored_token != generation_token:
         logger.info(
             "Skipping button flow delivery for chat %s due to cancellation",
@@ -5678,7 +5704,11 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             _cleanup_game_state(game_state)
         _cancel_reminder(context)
         _clear_pending_language(context, chat)
-        context.chat_data[BUTTON_NEW_GAME_KEY] = {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE}
+        _set_button_flow_state(
+            context,
+            chat,
+            {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE},
+        )
         set_chat_mode(context, MODE_AWAIT_LANGUAGE)
         await context.bot.send_message(
             chat_id=chat.id,
