@@ -314,10 +314,13 @@ async def test_new_game_menu_solo_starts_private_flow(monkeypatch, fresh_state):
         chat_data={
             "reminder_job": job,
             app.GENERATION_NOTICE_KEY: {"active": True},
-            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
             "lobby_message_id": 123,
         },
-        user_data={"new_game_language": "ru", "pending_join": object()},
+        user_data={
+            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
+            "new_game_language": "ru",
+            "pending_join": object(),
+        },
         bot=SimpleNamespace(),
     )
     query = SimpleNamespace(
@@ -341,7 +344,7 @@ async def test_new_game_menu_solo_starts_private_flow(monkeypatch, fresh_state):
     query.answer.assert_awaited_once()
     assert job.cancelled is True
     assert "reminder_job" not in context.chat_data
-    assert app.BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert app.BUTTON_NEW_GAME_KEY not in context.user_data
     assert app.GENERATION_NOTICE_KEY not in context.chat_data
     assert "lobby_message_id" not in context.chat_data
     assert "new_game_language" not in context.user_data
@@ -425,9 +428,12 @@ async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
         chat_data={
             "reminder_job": job,
             app.GENERATION_NOTICE_KEY: {"active": True},
-            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
         },
-        user_data={"pending_join": object(), "new_game_language": "en"},
+        user_data={
+            app.BUTTON_NEW_GAME_KEY: {"step": "language"},
+            "pending_join": object(),
+            "new_game_language": "en",
+        },
         bot=SimpleNamespace(),
     )
     query = SimpleNamespace(
@@ -447,7 +453,7 @@ async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
     assert result == ConversationHandler.END
     assert job.cancelled is True
     assert "reminder_job" not in context.chat_data
-    assert app.BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert app.BUTTON_NEW_GAME_KEY not in context.user_data
     assert app.GENERATION_NOTICE_KEY not in context.chat_data
     assert "pending_join" not in context.user_data
     assert "new_game_language" not in context.user_data

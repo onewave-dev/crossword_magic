@@ -13,12 +13,16 @@ import app
 from app import (
     BUTTON_LANGUAGE_KEY,
     BUTTON_NEW_GAME_KEY,
+    BUTTON_STEP_LANGUAGE,
     BUTTON_STEP_KEY,
     BUTTON_STEP_THEME,
+    MODE_AWAIT_LANGUAGE,
     GENERATION_NOTICE_KEY,
     MODE_AWAIT_THEME,
+    NEW_PUZZLE_CALLBACK_PREFIX,
     button_language_handler,
     button_theme_handler,
+    completion_callback_handler,
     state,
 )
 from utils.crossword import Puzzle
@@ -61,12 +65,59 @@ async def test_button_language_handler_initialises_flow_when_missing():
 
     await button_language_handler(update, context)
 
-    flow_state = context.chat_data[BUTTON_NEW_GAME_KEY]
+    flow_state = context.user_data[BUTTON_NEW_GAME_KEY]
     assert flow_state[BUTTON_LANGUAGE_KEY] == "ru"
     assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_THEME
     assert app.get_chat_mode(context) == MODE_AWAIT_THEME
     assert context.user_data["new_game_language"] == "ru"
     message.reply_text.assert_awaited_once_with("Отлично! Теперь укажите тему кроссворда.")
+
+
+@pytest.mark.anyio
+async def test_completion_callback_followed_by_language_message_uses_private_storage(monkeypatch):
+    chat = SimpleNamespace(id=555, type=ChatType.PRIVATE)
+    callback_message = SimpleNamespace(message_thread_id=None, edit_reply_markup=AsyncMock())
+    query = SimpleNamespace(
+        data=f"{NEW_PUZZLE_CALLBACK_PREFIX}prev",
+        answer=AsyncMock(),
+        message=callback_message,
+    )
+    update_callback = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=callback_message,
+        callback_query=query,
+    )
+    context = SimpleNamespace(
+        chat_data={},
+        user_data={},
+        bot=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _chat_id: None)
+
+    await completion_callback_handler(update_callback, context)
+
+    assert app.get_chat_mode(context) == MODE_AWAIT_LANGUAGE
+    assert BUTTON_NEW_GAME_KEY in context.user_data
+    flow_state = context.user_data[BUTTON_NEW_GAME_KEY]
+    assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_LANGUAGE
+    query.answer.assert_awaited_once()
+    callback_message.edit_reply_markup.assert_awaited_once()
+    send_call = context.bot.send_message.await_args
+    assert send_call.kwargs["chat_id"] == chat.id
+    assert "Выберите язык" in send_call.kwargs["text"]
+
+    language_message = SimpleNamespace(text=" En ", message_thread_id=None, reply_text=AsyncMock())
+    update_language = SimpleNamespace(effective_chat=chat, effective_message=language_message)
+
+    await button_language_handler(update_language, context)
+
+    updated_state = context.user_data[BUTTON_NEW_GAME_KEY]
+    assert updated_state[BUTTON_LANGUAGE_KEY] == "en"
+    assert updated_state[BUTTON_STEP_KEY] == BUTTON_STEP_THEME
+    assert context.user_data["new_game_language"] == "en"
+    assert app.get_chat_mode(context) == MODE_AWAIT_THEME
+    language_message.reply_text.assert_awaited_once()
 
 
 @pytest.mark.anyio
@@ -106,12 +157,12 @@ async def test_button_theme_handler_generates_puzzle_via_completion_menu(monkeyp
     job_queue = DummyJobQueue()
     context = SimpleNamespace(
         bot=SimpleNamespace(),
-        chat_data={
+        chat_data={"reminder_job": previous_job},
+        user_data={
             BUTTON_NEW_GAME_KEY: {
                 BUTTON_STEP_KEY: BUTTON_STEP_THEME,
                 BUTTON_LANGUAGE_KEY: "ru",
-            },
-            "reminder_job": previous_job,
+            }
         },
         job_queue=job_queue,
     )
@@ -123,7 +174,7 @@ async def test_button_theme_handler_generates_puzzle_via_completion_menu(monkeyp
 
     assert generate_calls == [(chat_id, "ru", "Древний мир")]
     deliver_mock.assert_awaited_once_with(context, chat_id, puzzle, game_state)
-    assert BUTTON_NEW_GAME_KEY not in context.chat_data
+    assert BUTTON_NEW_GAME_KEY not in context.user_data
     assert GENERATION_NOTICE_KEY not in context.chat_data
     assert chat_id not in state.generating_chats
     assert previous_job.cancelled is True
