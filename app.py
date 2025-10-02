@@ -10,10 +10,10 @@ import re
 import secrets
 import string
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -6179,8 +6179,8 @@ async def cleanup_states_periodically(app_state: AppState) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+@asynccontextmanager
+async def app_lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.debug("FastAPI startup initiated")
     ensure_storage_directories()
 
@@ -6239,35 +6239,38 @@ async def on_startup() -> None:
     state.webhook_task = asyncio.create_task(monitor_webhook(telegram_application, settings))
     state.cleanup_task = asyncio.create_task(cleanup_states_periodically(state))
 
+    try:
+        yield
+    finally:
+        logger.debug("FastAPI shutdown initiated")
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    logger.debug("FastAPI shutdown initiated")
+        if state.cleanup_task:
+            logger.debug("Cancelling state cleanup task")
+            state.cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.cleanup_task
+            state.cleanup_task = None
 
-    if state.cleanup_task:
-        logger.debug("Cancelling state cleanup task")
-        state.cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await state.cleanup_task
-        state.cleanup_task = None
+        if state.webhook_task:
+            logger.debug("Cancelling webhook monitor task")
+            state.webhook_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.webhook_task
+            state.webhook_task = None
 
-    if state.webhook_task:
-        logger.debug("Cancelling webhook monitor task")
-        state.webhook_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await state.webhook_task
-        state.webhook_task = None
+        if state.telegram_app:
+            logger.debug("Shutting down Telegram application")
 
-    if state.telegram_app:
-        logger.debug("Shutting down Telegram application")
+            if getattr(state.telegram_app, "running", False):
+                logger.debug("Stopping Telegram application")
+                await state.telegram_app.stop()
 
-        if getattr(state.telegram_app, "running", False):   
-            logger.debug("Stopping Telegram application")
-            await state.telegram_app.stop()
+            await state.telegram_app.shutdown()
+            state.telegram_app = None
+            logger.info("Telegram application shut down")
 
-        await state.telegram_app.shutdown()
-        state.telegram_app = None
-        logger.info("Telegram application shut down")
+
+app.router.lifespan_context = app_lifespan
 
 
 # ---------------------------------------------------------------------------
