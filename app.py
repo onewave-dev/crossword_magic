@@ -1133,6 +1133,20 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         )
         return
     normalised_slot = _normalise_slot_id(slot_ref.public_id)
+    dummy_player = game_state.players.get(game_state.dummy_user_id)
+    info_prefix = (
+        f"🤖 {DUMMY_NAME}"
+        if dummy_player is None or not dummy_player.name
+        else f"🤖 {dummy_player.name}"
+    )
+    clue = slot_ref.slot.clue or "(без подсказки)"
+    game_state.active_slot_id = normalised_slot
+    game_state.last_update = time.time()
+    _store_state(game_state)
+    selection_text = (
+        f"{info_prefix} отвечает на {slot_ref.public_id}: {clue}"
+    )
+    await _broadcast_to_players(context, game_state, selection_text)
     actual_delay = 0.0
     if game_state.dummy_turn_started_at is not None:
         actual_delay = max(0.0, time.time() - game_state.dummy_turn_started_at)
@@ -1144,16 +1158,10 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         if attempt_success
         else _generate_dummy_incorrect_answer(slot_ref, puzzle.language)
     )
-    dummy_player = game_state.players.get(game_state.dummy_user_id)
     game_state.dummy_turns += 1
     game_state.dummy_total_delay += actual_delay
     game_state.dummy_turn_started_at = None
     game_state.dummy_planned_delay = 0.0
-    info_prefix = (
-        f"🤖 {DUMMY_NAME}"
-        if dummy_player is None or not dummy_player.name
-        else f"🤖 {dummy_player.name}"
-    )
     message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
     await _broadcast_to_players(context, game_state, message_text)
     log_result = "success" if attempt_success else "fail"
