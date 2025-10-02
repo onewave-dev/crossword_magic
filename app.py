@@ -5176,6 +5176,28 @@ async def _handle_answer_submission(
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
         logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
+        turn_announcement_prefix: str | None = None
+        puzzle_completed = False
+        completion_reason: str | None = None
+
+        if in_turn_mode:
+            turn_announcement_prefix = (
+                f"{current_player.name} разгадал {selected_slot_ref.public_id}!"
+                if current_player
+                else f"Слот {selected_slot_ref.public_id} разгадан!"
+            )
+            _cancel_turn_timers(game_state)
+            if _all_slots_solved(puzzle, game_state):
+                puzzle_completed = True
+                completion_reason = (
+                    f"{current_player.name} разгадал последний слот!"
+                    if current_player
+                    else "Все слова разгаданы!"
+                )
+            else:
+                _advance_turn(game_state)
+                _store_state(game_state)
+
         try:
             image_path = render_puzzle(puzzle, game_state)
             await context.bot.send_chat_action(
@@ -5214,29 +5236,18 @@ async def _handle_answer_submission(
             )
 
         if in_turn_mode:
-            _cancel_turn_timers(game_state)
-            if _all_slots_solved(puzzle, game_state):
+            if puzzle_completed:
                 await _finish_game(
                     context,
                     game_state,
-                    reason=(
-                        f"{current_player.name} разгадал последний слот!"
-                        if current_player
-                        else "Все слова разгаданы!"
-                    ),
+                    reason=completion_reason,
                 )
                 return
-            _advance_turn(game_state)
-            _store_state(game_state)
             await _announce_turn(
                 context,
                 game_state,
                 puzzle,
-                prefix=(
-                    f"{current_player.name} разгадал {selected_slot_ref.public_id}!"
-                    if current_player
-                    else f"Слот {selected_slot_ref.public_id} разгадан!"
-                ),
+                prefix=turn_announcement_prefix,
             )
         else:
             if _all_slots_solved(puzzle, game_state):
