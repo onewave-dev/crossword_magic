@@ -1208,6 +1208,15 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
 
     monkeypatch.setattr(app, "_store_state", fake_store)
     monkeypatch.setattr(app, "_announce_turn", AsyncMock())
+    image_path = tmp_path / "dummy.png"
+
+    def fake_render(*_args, **_kwargs):
+        image_path.write_bytes(b"fake-image")
+        return image_path
+
+    monkeypatch.setattr(app, "render_puzzle", fake_render)
+    broadcast_photo_mock = AsyncMock()
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", broadcast_photo_mock)
 
     job_name = f"dummy-turn-{game_state.game_id}"
     game_state.dummy_job_id = job_name
@@ -1215,7 +1224,13 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     game_state.dummy_turn_started_at = time.time() - 0.5
 
     job = SimpleNamespace(name=job_name, data={"game_id": game_state.game_id, "planned_delay": 0.5})
-    context = SimpleNamespace(job=job, bot=SimpleNamespace(send_message=AsyncMock()))
+    context = SimpleNamespace(
+        job=job,
+        bot=SimpleNamespace(
+            send_message=AsyncMock(),
+            send_photo=AsyncMock(),
+        ),
+    )
 
     caplog.set_level("INFO")
     await app._dummy_turn_job(context)
@@ -1226,3 +1241,13 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     finish_mock.assert_awaited()
     assert any("Dummy turn" in record.message for record in caplog.records)
     assert job_name not in state.scheduled_jobs
+    broadcast_photo_mock.assert_awaited()
+    assert (
+        broadcast_photo_mock.await_args.kwargs.get("caption")
+        == "Верно! A1"
+    )
+    context.bot.send_photo.assert_awaited()
+    assert (
+        context.bot.send_photo.await_args.kwargs.get("caption")
+        == "Верно! A1"
+    )
