@@ -1510,3 +1510,86 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
         context.bot.send_photo.await_args.kwargs.get("caption")
         == "Верно! A1"
     )
+
+
+@pytest.mark.anyio
+async def test_dummy_turn_job_admin_test_mirrors_primary_chat(
+    monkeypatch, tmp_path, fresh_state
+):
+    puzzle = _make_turn_puzzle()
+    puzzle.slots = puzzle.slots[:1]
+    game_state = _make_turn_state(-951, puzzle)
+    host_player = game_state.players[1]
+    game_state.players = {1: host_player}
+    game_state.game_id = f"admin:{game_state.chat_id}"
+    game_state.test_mode = True
+    game_state.dummy_user_id = app.DUMMY_USER_ID
+    dummy_player = Player(
+        user_id=app.DUMMY_USER_ID,
+        name="Dummy",
+        is_bot=True,
+        dm_chat_id=None,
+    )
+    game_state.players[app.DUMMY_USER_ID] = dummy_player
+    game_state.turn_order = [app.DUMMY_USER_ID, 1]
+    game_state.turn_index = 0
+    game_state.active_slot_id = None
+    game_state.scoreboard = {1: 0, app.DUMMY_USER_ID: 0}
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    finish_mock = AsyncMock()
+    monkeypatch.setattr(app, "_finish_game", finish_mock)
+    monkeypatch.setattr(app.random, "random", lambda: 0.1)
+
+    stored_states: list[GameState] = []
+
+    def fake_store(gs: GameState) -> None:
+        stored_states.append(gs)
+        state.active_games[gs.game_id] = gs
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+    monkeypatch.setattr(app, "_announce_turn", AsyncMock())
+
+    image_path = tmp_path / "dummy_admin.png"
+
+    def fake_render(*_args, **_kwargs):
+        image_path.write_bytes(b"fake-image")
+        return image_path
+
+    monkeypatch.setattr(app, "render_puzzle", fake_render)
+    monkeypatch.setattr(
+        app,
+        "_broadcast_photo_to_players",
+        AsyncMock(),
+    )
+
+    job_name = f"dummy-turn-{game_state.game_id}"
+    game_state.dummy_job_id = job_name
+    state.scheduled_jobs[job_name] = DummyJob(game_state.chat_id, job_name)
+    game_state.dummy_turn_started_at = time.time() - 0.5
+
+    job = SimpleNamespace(
+        name=job_name,
+        data={"game_id": game_state.game_id, "planned_delay": 0.5},
+    )
+    context = SimpleNamespace(
+        job=job,
+        bot=SimpleNamespace(
+            send_message=AsyncMock(),
+            send_photo=AsyncMock(),
+        ),
+    )
+
+    await app._dummy_turn_job(context)
+
+    main_chat_messages = [
+        call.kwargs["text"]
+        for call in context.bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == game_state.chat_id
+    ]
+    assert any("отвечает на" in text for text in main_chat_messages)
+    assert any("разгадал" in text for text in main_chat_messages)
+
