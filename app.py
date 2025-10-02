@@ -4869,6 +4869,55 @@ async def _launch_admin_test_game(
     _schedule_game_timers(context, admin_state)
     _store_state(admin_state)
 
+    caption = (
+        "Кроссворд готов!\n"
+        f"Язык: {cloned_puzzle.language.upper()}\n"
+        f"Тема: {cloned_puzzle.theme}"
+    )
+    await _deliver_puzzle_via_bot(
+        context, admin_state.chat_id, cloned_puzzle, admin_state
+    )
+    dm_delivery_required = any(
+        chat_id != admin_state.chat_id
+        for _, chat_id in _iter_player_dm_chats(admin_state)
+    )
+    if dm_delivery_required:
+        puzzle_image_bytes: bytes | None = None
+        try:
+            image_path = render_puzzle(cloned_puzzle, admin_state)
+            with open(image_path, "rb") as photo:
+                puzzle_image_bytes = photo.read()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to render puzzle image for admin test game %s",
+                admin_state.game_id,
+            )
+        if puzzle_image_bytes is not None:
+            await _broadcast_photo_to_players(
+                context,
+                admin_state,
+                puzzle_image_bytes,
+                caption=caption,
+                exclude_chat_ids={admin_state.chat_id},
+            )
+        clues_message = _format_clues_message(cloned_puzzle, admin_state)
+        await _broadcast_to_players(
+            context,
+            admin_state,
+            clues_message,
+            parse_mode=constants.ParseMode.HTML,
+            exclude_chat_ids={admin_state.chat_id},
+        )
+        await _broadcast_to_players(
+            context,
+            admin_state,
+            (
+                "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
+                "Если удобнее, можно пользоваться и командой /answer."
+            ),
+            exclude_chat_ids={admin_state.chat_id},
+        )
+
     intro_lines = [
         "[адм.] Тестовая игра 1×1 запущена!",
         f"Игроки: {_user_display_name(admin_user)} и {DUMMY_NAME}.",
