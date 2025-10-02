@@ -1593,3 +1593,120 @@ async def test_dummy_turn_job_admin_test_mirrors_primary_chat(
     assert any("отвечает на" in text for text in main_chat_messages)
     assert any("разгадал" in text for text in main_chat_messages)
 
+
+@pytest.mark.anyio
+async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
+    monkeypatch, fresh_state
+):
+    puzzle = _make_turn_puzzle()
+    dummy_player = Player(
+        user_id=-2,
+        name="Dummy",
+        dm_chat_id=909,
+        is_bot=True,
+    )
+    human_player = Player(user_id=1, name="Админ", dm_chat_id=808)
+    game_state = GameState(
+        chat_id=-5005,
+        puzzle_id=puzzle.id,
+        hinted_cells=set(),
+        score=0,
+        started_at=time.time(),
+        last_update=time.time(),
+        host_id=human_player.user_id,
+        game_id="admin:-5005",
+        mode="turn_based",
+        status="running",
+        players={human_player.user_id: human_player, dummy_player.user_id: dummy_player},
+        turn_order=[human_player.user_id, dummy_player.user_id],
+        turn_index=1,
+        scoreboard={human_player.user_id: 0, dummy_player.user_id: 0},
+        test_mode=True,
+        dummy_user_id=dummy_player.user_id,
+    )
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda *_: puzzle)
+    stored_states: list[GameState] = []
+    monkeypatch.setattr(app, "_store_state", lambda gs: stored_states.append(gs))
+    monkeypatch.setattr(app, "_finish_game", AsyncMock())
+    monkeypatch.setattr(app, "_announce_turn", AsyncMock())
+    monkeypatch.setattr(app.random, "random", lambda: 1.0)
+
+    attempted: list[int] = []
+    delivered: list[int] = []
+
+    async def fake_send_message(*args, **kwargs):
+        chat_id = kwargs.get("chat_id")
+        if chat_id is None and args:
+            chat_id = args[0]
+        attempted.append(chat_id)
+        if chat_id == dummy_player.dm_chat_id:
+            raise RuntimeError("dm failure")
+        delivered.append(chat_id)
+        return SimpleNamespace(message_id=700 + len(delivered))
+
+    bot = SimpleNamespace(
+        send_message=AsyncMock(side_effect=fake_send_message),
+        send_photo=AsyncMock(),
+    )
+    job = SimpleNamespace(
+        name="dummy-turn-test",
+        data={"game_id": game_state.game_id, "planned_delay": 0.5},
+    )
+    state.scheduled_jobs[job.name] = job
+    context = SimpleNamespace(job=job, bot=bot)
+
+    await app._dummy_turn_job(context)
+
+    assert attempted.count(dummy_player.dm_chat_id) == 3
+    assert delivered.count(game_state.chat_id) == 3
+    assert delivered.count(human_player.dm_chat_id) == 3
+
+
+@pytest.mark.anyio
+async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    player = Player(user_id=1, name="Игрок", dm_chat_id=404)
+    game_state = GameState(
+        chat_id=-7007,
+        puzzle_id=puzzle.id,
+        hinted_cells=set(),
+        score=0,
+        started_at=time.time(),
+        last_update=time.time(),
+        host_id=player.user_id,
+        game_id="turns:-7007",
+        mode="turn_based",
+        status="running",
+        players={player.user_id: player},
+        turn_order=[player.user_id],
+        turn_index=0,
+        scoreboard={player.user_id: 0},
+    )
+
+    monkeypatch.setattr(app, "_store_state", lambda *_: None)
+
+    attempted: list[int] = []
+    delivered: list[int] = []
+
+    async def fake_send_message(*args, **kwargs):
+        chat_id = kwargs.get("chat_id")
+        if chat_id is None and args:
+            chat_id = args[0]
+        attempted.append(chat_id)
+        if chat_id == player.dm_chat_id:
+            raise RuntimeError("dm failure")
+        delivered.append(chat_id)
+        return SimpleNamespace(message_id=900 + len(delivered))
+
+    bot = SimpleNamespace(send_message=AsyncMock(side_effect=fake_send_message))
+    context = SimpleNamespace(bot=bot, job_queue=None)
+
+    await app._announce_turn(context, game_state, puzzle)
+
+    assert attempted == [player.dm_chat_id, game_state.chat_id]
+    assert delivered == [game_state.chat_id]
+
