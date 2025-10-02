@@ -1269,10 +1269,28 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     game_state.active_slot_id = normalised_slot
     game_state.last_update = time.time()
     _store_state(game_state)
+    async def _broadcast_with_primary(text: str) -> None:
+        recipients = _iter_player_dm_chats(game_state)
+        await _broadcast_to_players(context, game_state, text)
+        dm_chats = {chat_id for _, chat_id in recipients}
+        if game_state.chat_id in dm_chats:
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=text,
+                **_thread_kwargs(game_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to mirror message to primary chat for game %s",
+                game_state.game_id,
+            )
+
     selection_text = (
         f"{info_prefix} отвечает на {slot_ref.public_id}: {clue}"
     )
-    await _broadcast_to_players(context, game_state, selection_text)
+    await _broadcast_with_primary(selection_text)
     actual_delay = 0.0
     if game_state.dummy_turn_started_at is not None:
         actual_delay = max(0.0, time.time() - game_state.dummy_turn_started_at)
@@ -1289,7 +1307,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     game_state.dummy_turn_started_at = None
     game_state.dummy_planned_delay = 0.0
     message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
-    await _broadcast_to_players(context, game_state, message_text)
+    await _broadcast_with_primary(message_text)
     log_result = "success" if attempt_success else "fail"
     points = SCORE_PER_WORD if attempt_success else 0
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
@@ -1342,7 +1360,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         success_text = (
             f"{info_prefix} разгадал {slot_ref.public_id}! (+{SCORE_PER_WORD} очков)"
         )
-        await _broadcast_to_players(context, game_state, success_text)
+        await _broadcast_with_primary(success_text)
         if _all_slots_solved(puzzle, game_state):
             await _finish_game(
                 context,
@@ -1361,7 +1379,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         dummy_player.answers_fail += 1
     _cancel_turn_timers(game_state)
     failure_text = f"{info_prefix} ошибся на {slot_ref.public_id}."
-    await _broadcast_to_players(context, game_state, failure_text)
+    await _broadcast_with_primary(failure_text)
     _advance_turn(game_state)
     _store_state(game_state)
     await _announce_turn(context, game_state, puzzle)
