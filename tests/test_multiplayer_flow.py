@@ -86,6 +86,11 @@ class DummyJobQueue:
         return job
 
 
+class FalseyJobQueue(DummyJobQueue):
+    def __bool__(self) -> bool:
+        return False
+
+
 def _make_turn_puzzle() -> Puzzle:
     puzzle = Puzzle.from_size("puzzle", "Тема", "ru", 5, 5)
     puzzle.slots = [
@@ -1435,6 +1440,30 @@ def test_schedule_dummy_turn_clamps_minimum_delay(monkeypatch, fresh_state):
     assert data["planned_delay"] >= app.MIN_DUMMY_DELAY
     assert game_state.dummy_planned_delay >= app.MIN_DUMMY_DELAY
     assert state.scheduled_jobs[game_state.dummy_job_id].name == game_state.dummy_job_id
+
+
+def test_schedule_dummy_turn_with_falsey_job_queue(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    puzzle.slots = puzzle.slots[:1]
+    game_state = _make_turn_state(-998, puzzle)
+    game_state.test_mode = True
+    game_state.dummy_user_id = app.DUMMY_USER_ID
+    dummy_player = Player(user_id=app.DUMMY_USER_ID, name="Dummy", is_bot=True)
+    game_state.players = {app.DUMMY_USER_ID: dummy_player}
+    game_state.turn_order = [app.DUMMY_USER_ID]
+    game_state.turn_index = 0
+    game_state.active_slot_id = None
+
+    job_queue = FalseyJobQueue()
+    context = SimpleNamespace(job_queue=job_queue)
+
+    monkeypatch.setattr(app.random, "uniform", lambda *_: app.MIN_DUMMY_DELAY + 1)
+
+    app._schedule_dummy_turn(context, game_state, puzzle)
+
+    assert len(job_queue.submitted) == 1
+    _, _, _, name, _ = job_queue.submitted[0]
+    assert name == game_state.dummy_job_id
 
 
 @pytest.mark.anyio
