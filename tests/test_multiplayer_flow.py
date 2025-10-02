@@ -582,6 +582,97 @@ async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_handle_theme_admin_test_launch(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    chat_id = -204
+    base_state = _make_turn_state(chat_id, puzzle)
+    admin_id = base_state.host_id
+    admin_player = base_state.players[admin_id]
+    base_state.status = "lobby"
+    base_state.language = "ru"
+    base_state.theme = None
+    base_state.puzzle_id = "previous"
+    base_state.puzzle_ids = None
+    base_state.players = {admin_id: admin_player}
+    base_state.scoreboard = {}
+    base_state.turn_order = []
+    base_state.turn_index = 0
+    state.active_games[base_state.game_id] = base_state
+    state.chat_to_game[chat_id] = base_state.game_id
+    state.lobby_messages[base_state.game_id] = {chat_id: 42}
+    state.settings = SimpleNamespace(admin_id=admin_id)
+
+    generated_state = GameState(
+        chat_id=base_state.chat_id,
+        puzzle_id=puzzle.id,
+        game_id=base_state.game_id,
+        hinted_cells=set(),
+        players={admin_id: admin_player},
+        scoreboard={admin_id: 0},
+        host_id=admin_id,
+        mode="turn_based",
+        status="lobby",
+    )
+
+    run_generate_mock = AsyncMock(return_value=(puzzle, generated_state))
+    monkeypatch.setattr(app, "_run_generate_puzzle", run_generate_mock)
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: base_state)
+    monkeypatch.setattr(app, "delete_puzzle", lambda _pid: None)
+    monkeypatch.setattr(app, "_clone_puzzle_for_test", lambda _p: (puzzle, puzzle.id, None))
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _gid: None)
+    monkeypatch.setattr(app, "_register_player_chat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "set_chat_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "_schedule_game_timers", lambda *args, **kwargs: None)
+    deliver_mock = AsyncMock()
+    monkeypatch.setattr(app, "_deliver_puzzle_via_bot", deliver_mock)
+    monkeypatch.setattr(app, "_iter_player_dm_chats", lambda _gs: [])
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", AsyncMock())
+    monkeypatch.setattr(app, "_broadcast_to_players", AsyncMock())
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+
+    stored_states: list[GameState] = []
+
+    def fake_store(game_state: GameState) -> None:
+        stored_states.append(game_state)
+        state.active_games[game_state.game_id] = game_state
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+
+    message = SimpleNamespace(
+        message_thread_id=None,
+        text="Тестовая тема",
+        reply_text=AsyncMock(),
+    )
+    chat = SimpleNamespace(id=chat_id, type=ChatType.GROUP)
+    user = SimpleNamespace(id=admin_id, full_name="Админ", username="admin")
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_message=AsyncMock()),
+        chat_data={app.PENDING_ADMIN_TEST_KEY: chat_id},
+        user_data={},
+    )
+
+    result = await app.handle_theme(update, context)
+
+    assert result == ConversationHandler.END
+    run_generate_mock.assert_awaited_once()
+    assert message.reply_text.await_count == 1
+    assert "Подбираю" in message.reply_text.await_args_list[0].args[0]
+    send_calls = context.bot.send_message.await_args_list
+    assert len(send_calls) == 1
+    assert "Тестовая игра 1×1" in send_calls[0].kwargs["text"]
+    assert send_calls[0].kwargs["chat_id"] == chat_id
+    assert app.PENDING_ADMIN_TEST_KEY not in context.chat_data
+    announce_mock.assert_awaited()
+    assert stored_states, "Admin state should be stored"
+
+
+@pytest.mark.anyio
 async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
     chat = SimpleNamespace(id=909, type=ChatType.PRIVATE)
     message = SimpleNamespace(message_thread_id=None)
