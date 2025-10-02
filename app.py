@@ -360,9 +360,6 @@ TURN_WARNING_SECONDS = 15
 HINT_PENALTY = 1
 SCORE_PER_WORD = 2
 
-TURN_SELECT_CALLBACK_PREFIX = "turn_select:"
-TURN_SLOT_CALLBACK_PREFIX = "turn_slot:"
-
 MAX_PUZZLE_SIZE = 15
 MAX_REPLACEMENT_REQUESTS = 30
 # After this many consecutive replacement attempts without a usable word we
@@ -1379,19 +1376,6 @@ def _advance_turn(game_state: GameState) -> int | None:
     return _current_player_id(game_state)
 
 
-def _build_turn_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Выбрать подсказку",
-                    callback_data=f"{TURN_SELECT_CALLBACK_PREFIX}{game_state.game_id}",
-                )
-            ]
-        ]
-    )
-
-
 def _iter_available_slots(
     puzzle: Puzzle | CompositePuzzle, game_state: GameState
 ) -> list[SlotRef]:
@@ -1404,35 +1388,6 @@ def _iter_available_slots(
             continue
         slots.append(ref)
     return slots
-
-
-def _build_slot_keyboard(
-    game_state: GameState, puzzle: Puzzle | CompositePuzzle
-) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for ref in _iter_available_slots(puzzle, game_state):
-        callback = f"{TURN_SLOT_CALLBACK_PREFIX}{game_state.game_id}|{_normalise_slot_id(ref.public_id)}"
-        label = ref.public_id
-        row.append(InlineKeyboardButton(label, callback_data=callback))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    if not buttons:
-        buttons = [[InlineKeyboardButton("Нет доступных слотов", callback_data="noop")]]
-    return InlineKeyboardMarkup(buttons)
-
-
-def _find_slot_by_identifier(
-    puzzle: Puzzle | CompositePuzzle, identifier: str
-) -> SlotRef | None:
-    normalised = _normalise_slot_id(identifier)
-    for ref in iter_slot_refs(puzzle):
-        if _normalise_slot_id(ref.public_id) == normalised:
-            return ref
-    return None
 
 
 async def _announce_turn(
@@ -1448,16 +1403,16 @@ async def _announce_turn(
     parts = []
     if prefix:
         parts.append(prefix)
-    parts.append(f"Ход игрока {player.name}. Выберите подсказку.")
+    parts.append(
+        "Ход игрока "
+        f"{player.name}. Ответьте командой /answer <слот> <слово> или запросите подсказку через /hint <слот>."
+    )
     text = "\n".join(parts)
-    keyboard = _build_turn_keyboard(game_state)
     recipients = _iter_player_dm_chats(game_state)
     await _broadcast_to_players(
         context,
         game_state,
         text,
-        reply_markup=keyboard,
-        reply_markup_for={player.user_id},
     )
     dm_chats = {chat_id for _, chat_id in recipients}
     if game_state.chat_id not in dm_chats:
@@ -1465,7 +1420,6 @@ async def _announce_turn(
             await context.bot.send_message(
                 chat_id=game_state.chat_id,
                 text=text,
-                reply_markup=keyboard,
                 **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
@@ -5021,127 +4975,6 @@ async def admin_test_game_callback_handler(
     await query.answer("Тестовая игра запущена!")
 
 
-@command_entrypoint()
-async def turn_select_callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    _normalise_thread_id(update)
-    query = update.callback_query
-    if query is None or not query.data:
-        return
-    if not query.data.startswith(TURN_SELECT_CALLBACK_PREFIX):
-        return
-    message_chat = query.message.chat if query.message else None
-    if message_chat is None or message_chat.type != ChatType.PRIVATE:
-        await query.answer("Используйте личный чат с ботом.", show_alert=True)
-        return
-    game_id = query.data[len(TURN_SELECT_CALLBACK_PREFIX) :]
-    game_state = _load_state_by_game_id(game_id)
-    if not game_state or game_state.status != "running":
-        await query.answer("Игра не активна.", show_alert=True)
-        return
-    if game_state.mode != "turn_based":
-        await query.answer("Эта функция доступна только в мультиплеере.", show_alert=True)
-        return
-    current_player = _current_player(game_state)
-    user = query.from_user
-    if not current_player or not user or current_player.user_id != user.id:
-        if current_player:
-            await query.answer(
-                f"Сейчас ход {current_player.name}.", show_alert=True
-            )
-        else:
-            await query.answer("Сейчас нельзя выбирать подсказку.", show_alert=True)
-        return
-    puzzle = _load_puzzle_for_state(game_state)
-    if puzzle is None:
-        await query.answer("Кроссворд недоступен.", show_alert=True)
-        return
-    keyboard = _build_slot_keyboard(game_state, puzzle)
-    await query.answer("Открываю список вопросов.")
-    target_chat = current_player.dm_chat_id or (message_chat.id if message_chat else game_state.chat_id)
-    try:
-        await context.bot.send_message(
-            chat_id=target_chat,
-            text="Выберите слот для ответа:",
-            reply_markup=keyboard,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to send slot selection keyboard for game %s", game_state.game_id
-        )
-
-
-@command_entrypoint()
-async def turn_slot_callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    _normalise_thread_id(update)
-    query = update.callback_query
-    if query is None or not query.data:
-        return
-    if not query.data.startswith(TURN_SLOT_CALLBACK_PREFIX):
-        return
-    message_chat = query.message.chat if query.message else None
-    if message_chat is None or message_chat.type != ChatType.PRIVATE:
-        await query.answer("Используйте личный чат с ботом.", show_alert=True)
-        return
-    payload = query.data[len(TURN_SLOT_CALLBACK_PREFIX) :]
-    if "|" not in payload:
-        await query.answer()
-        return
-    game_id, slot_identifier = payload.split("|", 1)
-    game_state = _load_state_by_game_id(game_id)
-    if not game_state or game_state.status != "running":
-        await query.answer("Игра завершена.", show_alert=True)
-        return
-    if game_state.mode != "turn_based":
-        await query.answer("Комната не в пошаговом режиме.", show_alert=True)
-        return
-    current_player = _current_player(game_state)
-    user = query.from_user
-    if not current_player or not user or current_player.user_id != user.id:
-        if current_player:
-            await query.answer(
-                f"Сейчас ход {current_player.name}.", show_alert=True
-            )
-        else:
-            await query.answer("Сейчас нельзя выбрать слот.", show_alert=True)
-        return
-    puzzle = _load_puzzle_for_state(game_state)
-    if puzzle is None:
-        await query.answer("Кроссворд недоступен.", show_alert=True)
-        return
-    slot_ref = _find_slot_by_identifier(puzzle, slot_identifier)
-    if slot_ref is None:
-        await query.answer("Этот слот уже недоступен.", show_alert=True)
-        return
-    if _normalise_slot_id(slot_ref.public_id) in {
-        _normalise_slot_id(entry) for entry in game_state.solved_slots
-    }:
-        await query.answer("Этот слот уже решён.", show_alert=True)
-        return
-    game_state.active_slot_id = _normalise_slot_id(slot_ref.public_id)
-    game_state.last_update = time.time()
-    _store_state(game_state)
-    await query.answer("Слот выбран!", show_alert=False)
-    clue = slot_ref.slot.clue or "(без подсказки)"
-    announcement = f"{current_player.name} отвечает на {slot_ref.public_id}: {clue}"
-    recipients = _iter_player_dm_chats(game_state)
-    await _broadcast_to_players(context, game_state, announcement)
-    unique_chats = {chat_id for _, chat_id in recipients}
-    if current_player.dm_chat_id and len(unique_chats) > 1:
-        try:
-            await context.bot.send_message(
-                chat_id=current_player.dm_chat_id,
-                text=f"Вы выбрали {slot_ref.public_id}. Подсказка: {clue}",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to send DM confirmation for player %s", current_player.user_id
-            )
-
-
 @command_entrypoint(fallback=ConversationHandler.END)
 async def cancel_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
@@ -5448,21 +5281,8 @@ async def _handle_answer_submission(
         public_id = _normalise_slot_id(selected_slot_ref.public_id)
 
         if in_turn_mode:
-            expected_slot = game_state.active_slot_id
-            if not expected_slot:
-                await message.reply_text(
-                    "Сначала выберите слот кнопкой «Выбрать подсказку»."
-                )
-                await refresh_clues_if_needed()
-                log_abort("slot_not_selected", slot_identifier=public_id)
-                return
-            if public_id != expected_slot:
-                await message.reply_text(
-                    "Сначала выберите этот слот кнопкой «Выбрать подсказку»."
-                )
-                await refresh_clues_if_needed()
-                log_abort("slot_not_selected", slot_identifier=public_id)
-                return
+            game_state.active_slot_id = public_id
+            game_state.last_update = time.time()
 
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
             slot.answer,
@@ -5917,12 +5737,9 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         normalised_public_id = _normalise_slot_id(slot_ref.public_id)
-        if in_turn_mode and game_state.active_slot_id:
-            if normalised_public_id != game_state.active_slot_id:
-                await message.reply_text(
-                    "Сначала выберите этот слот кнопкой «Выбрать подсказку»."
-                )
-                return
+        if in_turn_mode:
+            game_state.active_slot_id = normalised_public_id
+            game_state.last_update = time.time()
 
         result = _reveal_letter(
             game_state, slot_ref, slot_ref.slot.answer, user_id=player_id
@@ -6382,20 +6199,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         CallbackQueryHandler(
             lobby_start_callback_handler,
             pattern=fr"^{LOBBY_START_CALLBACK_PREFIX}.*|^{LOBBY_WAIT_CALLBACK_PREFIX}.*",
-            block=False,
-        )
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            turn_select_callback_handler,
-            pattern=fr"^{TURN_SELECT_CALLBACK_PREFIX}.*",
-            block=False,
-        )
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            turn_slot_callback_handler,
-            pattern=fr"^{TURN_SLOT_CALLBACK_PREFIX}.*",
             block=False,
         )
     )

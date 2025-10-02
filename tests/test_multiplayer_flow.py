@@ -134,7 +134,7 @@ def _make_turn_state(chat_id: int, puzzle: Puzzle) -> GameState:
         players={1: player_one, 2: player_two},
         turn_order=[1, 2],
         turn_index=0,
-        active_slot_id="A1",
+        active_slot_id=None,
     )
 
 
@@ -1024,8 +1024,11 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     await app._announce_turn(context, game_state, puzzle)
 
     assert announce_mock.await_count == 1
-    assert announce_mock.await_args.kwargs["chat_id"] == chat_id
-    assert "message_thread_id" not in announce_mock.await_args.kwargs
+    announce_kwargs = announce_mock.await_args.kwargs
+    assert announce_kwargs["chat_id"] == chat_id
+    assert "message_thread_id" not in announce_kwargs
+    assert "/answer" in announce_kwargs.get("text", "")
+    assert announce_kwargs.get("reply_markup") is None
 
     warning_mock = AsyncMock()
     job_name = "turn-warn-test"
@@ -1041,25 +1044,45 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     assert warning_mock.await_count == 1
     assert warning_mock.await_args.kwargs["chat_id"] == chat_id
 
-    slot_mock = AsyncMock()
-    query = SimpleNamespace(
-        data=f"{app.TURN_SLOT_CALLBACK_PREFIX}{game_state.game_id}|A1",
-        answer=AsyncMock(),
-        from_user=SimpleNamespace(id=game_state.turn_order[game_state.turn_index]),
-        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id, type=ChatType.PRIVATE)),
-    )
-    update = SimpleNamespace(
-        callback_query=query,
-        effective_chat=SimpleNamespace(id=chat_id, type=ChatType.PRIVATE),
-        effective_message=SimpleNamespace(message_thread_id=None),
-        effective_user=query.from_user,
-    )
-    slot_context = SimpleNamespace(bot=SimpleNamespace(send_message=slot_mock))
 
-    await app.turn_slot_callback_handler(update, slot_context)
+@pytest.mark.anyio
+async def test_turn_based_answer_without_keyboard(monkeypatch, tmp_path, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-612, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
 
-    assert slot_mock.await_count == 1
-    assert slot_mock.await_args.kwargs["chat_id"] == chat_id
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
+    monkeypatch.setattr(app, "_send_clues_update", AsyncMock())
+    broadcast_mock = AsyncMock()
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", broadcast_mock)
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+
+    image_path = tmp_path / "answer.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_chat_action=AsyncMock()),
+        job_queue=DummyJobQueue(),
+    )
+
+    _update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
+    message.reply_photo = AsyncMock()
+    message.reply_text = AsyncMock()
+
+    await app._handle_answer_submission(context, chat, message, "A1", "рим")
+
+    assert message.reply_text.await_count == 0
+    assert message.reply_photo.await_count == 1
+    assert game_state.solved_slots == {"A1"}
+    assert game_state.scoreboard[1] == app.SCORE_PER_WORD
+    assert game_state.active_slot_id is None
+    broadcast_mock.assert_awaited()
+    announce_mock.assert_awaited()
 
 
 @pytest.mark.anyio
@@ -1105,6 +1128,39 @@ async def test_turn_based_hint_penalises_current_player(monkeypatch, tmp_path, f
     assert game_state.score == -HINT_PENALTY
     assert game_state.hints_used
     message.reply_photo.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_turn_based_hint_explicit_slot(monkeypatch, tmp_path, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-950, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
+
+    image_path = tmp_path / "hint.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
+    message.reply_photo = AsyncMock()
+    message.reply_text = AsyncMock()
+
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_chat_action=AsyncMock()),
+        args=["A1"],
+        job_queue=DummyJobQueue(),
+    )
+
+    await hint_command(update, context)
+
+    assert message.reply_text.await_count == 0
+    assert message.reply_photo.await_count == 1
+    assert game_state.active_slot_id == "A1"
+    assert game_state.scoreboard[1] == -HINT_PENALTY
 
 
 @pytest.mark.anyio
