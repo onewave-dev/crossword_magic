@@ -886,6 +886,15 @@ def _update_dm_mappings(game_state: GameState) -> None:
         state.player_chats[player.user_id] = player.dm_chat_id
 
 
+@dataclass(slots=True)
+class BroadcastResult:
+    successful_chats: set[int]
+    message_ids: dict[int, int] | None = None
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience helper
+        return bool(self.successful_chats)
+
+
 async def _broadcast_to_players(
     context: ContextTypes.DEFAULT_TYPE,
     game_state: GameState,
@@ -897,7 +906,7 @@ async def _broadcast_to_players(
     exclude_chat_ids: Iterable[int] | None = None,
     disable_notification: bool | None = None,
     collect_message_ids: bool = False,
-) -> dict[int, int] | None:
+) -> BroadcastResult:
     """Send a text message to every player participating in the game."""
 
     allowed_markup_users = (
@@ -907,6 +916,7 @@ async def _broadcast_to_players(
     )
     excluded = set(exclude_chat_ids or [])
     collected: dict[int, int] | None = {} if collect_message_ids else None
+    successful: set[int] = set()
     for user_id, chat_id in _iter_player_dm_chats(game_state):
         if chat_id in excluded:
             continue
@@ -925,6 +935,7 @@ async def _broadcast_to_players(
                 disable_notification=disable_notification,
                 **kwargs,
             )
+            successful.add(chat_id)
             if collected is not None and hasattr(sent, "message_id"):
                 collected[chat_id] = sent.message_id
         except Exception:  # noqa: BLE001
@@ -933,9 +944,10 @@ async def _broadcast_to_players(
                 game_state.game_id,
                 chat_id,
             )
-    if collected is not None and not collected:
-        return {}
-    return collected
+    return BroadcastResult(
+        successful_chats=successful,
+        message_ids=collected if collected is not None else None,
+    )
 
 
 async def _broadcast_photo_to_players(
@@ -1270,10 +1282,22 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     game_state.last_update = time.time()
     _store_state(game_state)
     async def _broadcast_with_primary(text: str) -> None:
-        recipients = _iter_player_dm_chats(game_state)
-        await _broadcast_to_players(context, game_state, text)
-        dm_chats = {chat_id for _, chat_id in recipients}
-        if game_state.chat_id in dm_chats:
+        need_primary = False
+        successful_chats: set[int] = set()
+        try:
+            broadcast = await _broadcast_to_players(context, game_state, text)
+            successful_chats = broadcast.successful_chats
+            if not successful_chats:
+                need_primary = True
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to deliver dummy message via direct chats for game %s",
+                game_state.game_id,
+            )
+            need_primary = True
+        if not need_primary and game_state.chat_id not in successful_chats:
+            need_primary = True
+        if not need_primary:
             return
         try:
             await context.bot.send_message(
@@ -1426,14 +1450,22 @@ async def _announce_turn(
         f"{player.name}. Ответьте командой /answer <слот> <слово> или запросите подсказку через /hint <слот>."
     )
     text = "\n".join(parts)
-    recipients = _iter_player_dm_chats(game_state)
-    await _broadcast_to_players(
-        context,
-        game_state,
-        text,
-    )
-    dm_chats = {chat_id for _, chat_id in recipients}
-    if game_state.chat_id not in dm_chats:
+    try:
+        broadcast = await _broadcast_to_players(
+            context,
+            game_state,
+            text,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to announce turn via direct chats for game %s",
+            game_state.game_id,
+        )
+        broadcast = BroadcastResult(successful_chats=set())
+    if (
+        not broadcast.successful_chats
+        or game_state.chat_id not in broadcast.successful_chats
+    ):
         try:
             await context.bot.send_message(
                 chat_id=game_state.chat_id,
@@ -1817,15 +1849,15 @@ async def _publish_lobby_message(
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
     if _is_private_multiplayer(game_state):
-        sent_map = await _broadcast_to_players(
+        broadcast = await _broadcast_to_players(
             context,
             game_state,
             text,
             reply_markup=keyboard,
             collect_message_ids=True,
         )
-        if sent_map:
-            state.lobby_messages[game_state.game_id] = dict(sent_map)
+        if broadcast and broadcast.message_ids:
+            state.lobby_messages[game_state.game_id] = dict(broadcast.message_ids)
         else:
             state.lobby_messages.pop(game_state.game_id, None)
         return
@@ -1880,7 +1912,7 @@ async def _update_lobby_message(
             missing_chats.add(chat_id)
     if _is_private_multiplayer(game_state):
         if missing_chats:
-            sent_map = await _broadcast_to_players(
+            broadcast = await _broadcast_to_players(
                 context,
                 game_state,
                 text,
@@ -1888,8 +1920,8 @@ async def _update_lobby_message(
                 exclude_chat_ids=set(entry),
                 collect_message_ids=True,
             )
-            if sent_map:
-                entry.update(sent_map)
+            if broadcast and broadcast.message_ids:
+                entry.update(broadcast.message_ids)
         return
     if missing_chats:
         await _publish_lobby_message(context, game_state)
