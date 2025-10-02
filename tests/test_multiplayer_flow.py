@@ -1340,6 +1340,12 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
     assert admin_state.test_mode is True
     assert admin_state.dummy_user_id == app.DUMMY_USER_ID
     assert admin_state.players.get(app.DUMMY_USER_ID)
+    main_chat_texts = [
+        call.kwargs.get("text", "")
+        for call in bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == base_state.chat_id
+    ]
+    assert sum(text.count("Первым ходит") for text in main_chat_texts) == 1
     query.answer.assert_awaited()
 
 
@@ -1407,7 +1413,15 @@ async def test_admin_test_game_recovers_from_stale_mapping(monkeypatch, fresh_st
     assert len(load_calls) >= 2 and str(load_calls[1]) == str(base_state.chat_id)
     assert state.active_games.get(base_state.game_id) is base_state
     assert stored_states and stored_states[-1].game_id.startswith("admin:")
+    main_chat_texts = [
+        call.kwargs.get("text", "")
+        for call in bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == base_state.chat_id
+    ]
+    assert all("Первым ходит" not in text for text in main_chat_texts)
     announce_mock.assert_awaited()
+    prefix = announce_mock.await_args.kwargs.get("prefix")
+    assert prefix and prefix.count("Первым ходит") == 1
     query.answer.assert_awaited_with("Тестовая игра запущена!")
     cleanup_mock.assert_not_called()
 

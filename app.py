@@ -4930,8 +4930,6 @@ async def _launch_admin_test_game(
         f"Игроки: {_user_display_name(admin_user)} и {DUMMY_NAME}.",
     ]
     first_player = admin_state.players.get(admin_state.turn_order[0])
-    if first_player:
-        intro_lines.append(f"Первым ходит {first_player.name}.")
     try:
         await context.bot.send_message(
             chat_id=base_state.chat_id,
