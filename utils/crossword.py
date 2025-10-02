@@ -8,7 +8,7 @@ serialising puzzles and a simple backtracking based filling algorithm.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import json
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -65,6 +65,30 @@ class Slot:
                 yield self.start_row + offset, self.start_col
 
 
+def _utcnow() -> datetime:
+    """Return a timezone-aware ``datetime`` in UTC."""
+
+    return datetime.now(timezone.utc)
+
+
+def _parse_created_at(value: object) -> datetime:
+    """Parse a ``created_at`` value into a timezone-aware ``datetime``."""
+
+    if isinstance(value, str):
+        normalised = value.strip()
+        if normalised.endswith("Z"):
+            normalised = f"{normalised[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalised)
+        except ValueError:
+            logger.warning("Failed to parse created_at value %r, defaulting to now", value)
+        else:
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+    return _utcnow()
+
+
 @dataclass
 class Puzzle:
     """Dataclass mirroring the crossword puzzle structure."""
@@ -76,7 +100,7 @@ class Puzzle:
     size_cols: int
     grid: List[List[Cell]]
     slots: List[Slot] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
 
     @classmethod
     def from_size(
@@ -133,7 +157,7 @@ class CompositePuzzle:
     language: str
     components: List[CompositeComponent]
     gap_cells: int = 1
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
 
     @property
     def size_rows(self) -> int:
@@ -627,11 +651,7 @@ def puzzle_from_dict(payload: Dict[str, object]) -> Puzzle | CompositePuzzle:
         slots.append(slot)
 
     created_at_raw = payload.get("created_at")
-    created_at = (
-        datetime.fromisoformat(created_at_raw)
-        if isinstance(created_at_raw, str)
-        else datetime.utcnow()
-    )
+    created_at = _parse_created_at(created_at_raw)
 
     puzzle = Puzzle(
         id=payload["id"],
@@ -666,11 +686,7 @@ def composite_from_dict(payload: Dict[str, object]) -> CompositePuzzle:
         )
 
     created_at_raw = payload.get("created_at")
-    created_at = (
-        datetime.fromisoformat(created_at_raw)
-        if isinstance(created_at_raw, str)
-        else datetime.utcnow()
-    )
+    created_at = _parse_created_at(created_at_raw)
 
     return CompositePuzzle(
         id=payload["id"],
