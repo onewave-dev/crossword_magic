@@ -18,6 +18,7 @@ from app import (
     MENU_STATE,
     NEW_GAME_MODE_GROUP,
     NEW_GAME_MODE_SOLO,
+    THEME_STATE,
     Settings,
     finish_command,
     hint_command,
@@ -44,18 +45,22 @@ def fresh_state():
     state.active_games.clear()
     state.chat_to_game.clear()
     state.player_chats.clear()
+    state.dm_chat_to_game.clear()
     state.join_codes.clear()
     state.lobby_messages.clear()
     state.generating_chats.clear()
+    state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
     state.chat_threads.clear()
     yield
     state.active_games.clear()
     state.chat_to_game.clear()
     state.player_chats.clear()
+    state.dm_chat_to_game.clear()
     state.join_codes.clear()
     state.lobby_messages.clear()
     state.generating_chats.clear()
+    state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
     state.chat_threads.clear()
     state.settings = original_settings
@@ -395,7 +400,7 @@ async def test_new_game_menu_group_starts_group_flow(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
-async def test_new_game_menu_group_requires_group_chat(monkeypatch, fresh_state):
+async def test_new_game_menu_group_allows_private_chat(monkeypatch, fresh_state):
     chat = SimpleNamespace(id=808, type=ChatType.PRIVATE)
     message = SimpleNamespace(message_thread_id=None)
     context = SimpleNamespace(chat_data={}, user_data={}, bot=SimpleNamespace())
@@ -410,16 +415,100 @@ async def test_new_game_menu_group_requires_group_chat(monkeypatch, fresh_state)
         effective_user=SimpleNamespace(id=3),
         callback_query=query,
     )
-    group_mock = AsyncMock()
+    group_mock = AsyncMock(return_value=LANGUAGE_STATE)
     monkeypatch.setattr(app, "_start_new_group_game", group_mock)
 
     result = await new_game_menu_callback_handler(update, context)
 
-    assert result == MENU_STATE
-    group_mock.assert_not_called()
+    assert result == LANGUAGE_STATE
+    group_mock.assert_awaited_once_with(update, context)
     query.answer.assert_awaited_once()
     call = query.answer.await_args
-    assert call.kwargs.get("show_alert") is True
+    assert call.kwargs.get("show_alert") is not True
+
+
+@pytest.mark.anyio
+async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=606, type=ChatType.PRIVATE)
+    host_user = SimpleNamespace(id=42, full_name="Хост", username="host")
+    start_message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    update_start = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=start_message,
+        effective_user=host_user,
+    )
+    send_message_mock = AsyncMock(return_value=SimpleNamespace(message_id=777))
+    context = SimpleNamespace(
+        chat_data={},
+        user_data={},
+        bot=SimpleNamespace(send_message=send_message_mock),
+    )
+
+    monkeypatch.setattr(app, "uuid4", lambda: SimpleNamespace(hex="roomdm001"))
+    monkeypatch.setattr(app, "save_state", lambda *_: None)
+    monkeypatch.setattr(app, "load_state", lambda *_: None)
+
+    result = await app._start_new_group_game(update_start, context)
+
+    assert result == LANGUAGE_STATE
+    start_message.reply_text.assert_awaited_once()
+    game_id = state.chat_to_game[chat.id]
+    assert game_id == "roomdm001"
+    assert state.dm_chat_to_game[chat.id] == game_id
+    assert state.player_chats[host_user.id] == chat.id
+    game_state = state.active_games[game_id]
+    assert game_state.host_id == host_user.id
+    assert game_state.players[host_user.id].dm_chat_id == chat.id
+
+    language_message = SimpleNamespace(
+        message_thread_id=None,
+        text="ru",
+        reply_text=AsyncMock(),
+    )
+    update_language = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=language_message,
+        effective_user=host_user,
+    )
+
+    lang_result = await app.handle_language(update_language, context)
+
+    assert lang_result == THEME_STATE
+    assert state.active_games[game_id].language == "ru"
+    language_message.reply_text.assert_awaited_once()
+
+    theme_message = SimpleNamespace(
+        message_thread_id=None,
+        text="История",
+        reply_text=AsyncMock(),
+    )
+    update_theme = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=theme_message,
+        effective_user=host_user,
+    )
+
+    generation_calls: list[tuple] = []
+
+    async def fake_run(context_arg, game_id_arg, language_arg, theme_arg):
+        generation_calls.append((context_arg, game_id_arg, language_arg, theme_arg))
+        state.lobby_generation_tasks.pop(game_id_arg, None)
+
+    monkeypatch.setattr(app, "_run_lobby_puzzle_generation", fake_run)
+    run_generate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_run_generate_puzzle", run_generate_mock)
+
+    theme_result = await app.handle_theme(update_theme, context)
+
+    assert theme_result == ConversationHandler.END
+    await asyncio.sleep(0)
+    assert generation_calls == [(context, game_id, "ru", "История")]
+    run_generate_mock.assert_not_awaited()
+    theme_message.reply_text.assert_awaited()
+    assert game_state.theme == "История"
+    assert state.lobby_messages[game_id][0] == chat.id
+    assert send_message_mock.await_count >= 1
+    assert state.lobby_generation_tasks.get(game_id) is None
 
 
 @pytest.mark.anyio

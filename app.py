@@ -1956,6 +1956,11 @@ def _store_state(game_state: GameState) -> None:
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         state.active_games[game_state.game_id] = game_state
         state.chat_to_game[game_state.chat_id] = game_state.game_id
+        if game_state.chat_id > 0 and game_state.mode == "turn_based":
+            state.dm_chat_to_game[game_state.chat_id] = game_state.game_id
+            host_id = getattr(game_state, "host_id", None)
+            if host_id is not None:
+                state.player_chats.setdefault(host_id, game_state.chat_id)
         _update_dm_mappings(game_state)
         for code, target in list(state.join_codes.items()):
             if target == game_state.game_id and code not in game_state.join_codes:
@@ -3415,14 +3420,20 @@ async def _start_new_group_game(
 
     if existing is not None:
         _cleanup_game_state(existing)
+    is_private_lobby = chat.type == ChatType.PRIVATE
+    game_id = uuid4().hex if is_private_lobby else str(chat.id)
 
-    state.lobby_messages.pop(str(chat.id), None)
+    state.lobby_messages.pop(game_id, None)
     context.chat_data.pop("lobby_message_id", None)
 
     now = time.time()
     host_id = user.id if user else None
     host_name = _user_display_name(user)
-    dm_chat_id = _lookup_player_chat(host_id) if host_id else None
+    if host_id and is_private_lobby:
+        _register_player_chat(host_id, chat.id)
+    dm_chat_id = (
+        chat.id if is_private_lobby else _lookup_player_chat(host_id)
+    ) if host_id else None
     game_state = GameState(
         chat_id=chat.id,
         puzzle_id="",
@@ -3433,7 +3444,7 @@ async def _start_new_group_game(
         last_update=now,
         hinted_cells=set(),
         host_id=host_id,
-        game_id=str(chat.id),
+        game_id=game_id,
         scoreboard={},
         mode="turn_based",
         status="lobby",
@@ -3630,9 +3641,13 @@ async def new_game_menu_callback_handler(
         return await _start_new_private_game(update, context)
 
     if mode == "group":
-        if chat is None or chat.type not in GROUP_CHAT_TYPES:
+        if chat is None or (
+            chat.type not in GROUP_CHAT_TYPES
+            and chat.type != ChatType.PRIVATE
+        ):
             await query.answer(
-                "Режим для друзей запускается в групповом чате.", show_alert=True
+                "Режим для друзей доступен в группах или из личного чата с ботом.",
+                show_alert=True,
             )
             return MENU_STATE
         await query.answer()
@@ -3711,9 +3726,14 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     pending_admin_chat = _get_pending_admin_test(context)
     is_admin_flow = chat is not None and pending_admin_chat == chat.id
-    if chat.type in GROUP_CHAT_TYPES:
-        game_state = _load_state_for_chat(chat.id)
-        if not game_state or game_state.status != "lobby":
+    game_state = _load_state_for_chat(chat.id)
+    lobby_mode = (
+        game_state is not None
+        and game_state.mode == "turn_based"
+        and game_state.status == "lobby"
+    )
+    if chat.type in GROUP_CHAT_TYPES or lobby_mode:
+        if not lobby_mode:
             await message.reply_text("Создайте новую игру командой /new в этом чате.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
@@ -3758,6 +3778,15 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
     if not language or not language.isalpha():
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
         return
+    game_state = _load_state_for_chat(chat.id)
+    if (
+        game_state is not None
+        and game_state.mode == "turn_based"
+        and game_state.status == "lobby"
+    ):
+        game_state.language = language
+        game_state.last_update = time.time()
+        _store_state(game_state)
     flow_state[BUTTON_LANGUAGE_KEY] = language
     flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
     set_chat_mode(context, MODE_AWAIT_THEME)
@@ -3787,9 +3816,14 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user = getattr(update, "effective_user", None)
     pending_admin_chat = _get_pending_admin_test(context)
     is_admin_flow = chat is not None and pending_admin_chat == chat.id
-    if chat.type in GROUP_CHAT_TYPES:
-        game_state = _load_state_for_chat(chat.id)
-        if not game_state or game_state.status != "lobby":
+    game_state = _load_state_for_chat(chat.id)
+    lobby_mode = (
+        game_state is not None
+        and game_state.mode == "turn_based"
+        and game_state.status == "lobby"
+    )
+    if chat.type in GROUP_CHAT_TYPES or lobby_mode:
+        if not lobby_mode:
             await message.reply_text("Создайте новую игру командой /new в этом чате.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
@@ -4039,6 +4073,15 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if chat is None or message is None or not message.text:
         return
     if chat.type in GROUP_CHAT_TYPES:
+        await handle_theme(update, context)
+        flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
+        return
+    game_state = _load_state_for_chat(chat.id)
+    if (
+        game_state is not None
+        and game_state.mode == "turn_based"
+        and game_state.status == "lobby"
+    ):
         await handle_theme(update, context)
         flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
         return
