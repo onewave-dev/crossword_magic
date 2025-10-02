@@ -13,7 +13,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, AsyncIterator, Iterable, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Iterable, Mapping, MutableMapping, Optional, Sequence
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -188,7 +188,7 @@ class AppState:
         self.player_chats: dict[int, int] = {}
         self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
-        self.lobby_messages: dict[str, tuple[int, int]] = {}
+        self.lobby_messages: dict[str, dict[int, int]] = {}
         self.scheduled_jobs: dict[str, Job] = {}
         self.lobby_generation_tasks: dict[str, asyncio.Task[None]] = {}
         self.chat_threads: dict[int, int] = {}
@@ -753,6 +753,124 @@ def _iter_player_dm_chats(game_state: GameState) -> list[tuple[int | None, int]]
     return chats
 
 
+def _is_private_multiplayer(game_state: GameState) -> bool:
+    """Return True if the game is a multiplayer room hosted in a private chat."""
+
+    return game_state.mode != "single" and game_state.chat_id > 0
+
+
+def _get_chat_data_for_chat(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+) -> dict:
+    """Return chat_data mapping for the provided chat id, creating if needed."""
+
+    if chat_id is None:
+        chat_id = 0
+    application = getattr(context, "application", None)
+    container = getattr(application, "chat_data", None)
+    if isinstance(container, MutableMapping):
+        store = container.get(chat_id)
+        if not isinstance(store, dict):
+            store = {}
+            container[chat_id] = store
+        return store
+    chat_data = getattr(context, "chat_data", None)
+    if isinstance(chat_data, dict):
+        return chat_data
+    fresh: dict = {}
+    if hasattr(context, "chat_data"):
+        setattr(context, "chat_data", fresh)
+    return fresh
+
+
+async def _send_game_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
+    disable_notification: bool | None = None,
+    exclude_chat_ids: Iterable[int] | None = None,
+) -> None:
+    """Send a notification to relevant chats for the game."""
+
+    if _is_private_multiplayer(game_state):
+        await _broadcast_to_players(
+            context,
+            game_state,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_notification=disable_notification,
+            exclude_chat_ids=exclude_chat_ids,
+        )
+        return
+    await context.bot.send_message(
+        chat_id=game_state.chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_notification=disable_notification,
+        **_thread_kwargs(game_state),
+    )
+
+
+async def _send_generation_notice_to_game(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    text: str,
+    *,
+    message: Message | None = None,
+) -> None:
+    """Broadcast a generation notice to all relevant chats for the game."""
+
+    if _is_private_multiplayer(game_state):
+        for _, chat_id in _iter_player_dm_chats(game_state):
+            chat_data = _get_chat_data_for_chat(context, chat_id)
+            use_message = None
+            if message is not None:
+                message_chat = getattr(message, "chat", None)
+                message_chat_id = getattr(message_chat, "id", None)
+                if message_chat_id == chat_id or (
+                    message_chat is None and chat_id == game_state.chat_id
+                ):
+                    use_message = message
+            await _send_generation_notice(
+                context,
+                chat_id,
+                text,
+                message=use_message,
+                chat_data=chat_data,
+            )
+        return
+    chat_data = _get_chat_data_for_chat(context, game_state.chat_id)
+    await _send_generation_notice(
+        context,
+        game_state.chat_id,
+        text,
+        message=message,
+        chat_data=chat_data,
+    )
+
+
+def _clear_generation_notice_for_game(
+    context: ContextTypes.DEFAULT_TYPE, game_state: GameState
+) -> None:
+    """Clear generation notices for every chat tied to the game."""
+
+    if _is_private_multiplayer(game_state):
+        for _, chat_id in _iter_player_dm_chats(game_state):
+            chat_data = _get_chat_data_for_chat(context, chat_id)
+            _clear_generation_notice(context, chat_id, chat_data=chat_data)
+        return
+    _clear_generation_notice(
+        context,
+        game_state.chat_id,
+        chat_data=_get_chat_data_for_chat(context, game_state.chat_id),
+    )
+
+
 def _update_dm_mappings(game_state: GameState) -> None:
     """Synchronise in-memory DM chat mappings for the given game."""
 
@@ -781,7 +899,8 @@ async def _broadcast_to_players(
     reply_markup_for: Iterable[int] | None = None,
     exclude_chat_ids: Iterable[int] | None = None,
     disable_notification: bool | None = None,
-) -> None:
+    collect_message_ids: bool = False,
+) -> dict[int, int] | None:
     """Send a text message to every player participating in the game."""
 
     allowed_markup_users = (
@@ -790,26 +909,36 @@ async def _broadcast_to_players(
         else None
     )
     excluded = set(exclude_chat_ids or [])
+    collected: dict[int, int] | None = {} if collect_message_ids else None
     for user_id, chat_id in _iter_player_dm_chats(game_state):
         if chat_id in excluded:
             continue
         markup = reply_markup
         if allowed_markup_users is not None and user_id not in allowed_markup_users:
             markup = None
+        kwargs = {}
+        if chat_id == game_state.chat_id:
+            kwargs.update(_thread_kwargs(game_state))
         try:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
                 reply_markup=markup,
                 disable_notification=disable_notification,
+                **kwargs,
             )
+            if collected is not None and hasattr(sent, "message_id"):
+                collected[chat_id] = sent.message_id
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to broadcast message for game %s to chat %s",
                 game_state.game_id,
                 chat_id,
             )
+    if collected is not None and not collected:
+        return {}
+    return collected
 
 
 async def _broadcast_photo_to_players(
@@ -1713,36 +1842,85 @@ async def _publish_lobby_message(
     *,
     message: Message | None = None,
 ) -> None:
-    chat_id = game_state.chat_id
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
+    if _is_private_multiplayer(game_state):
+        sent_map = await _broadcast_to_players(
+            context,
+            game_state,
+            text,
+            reply_markup=keyboard,
+            collect_message_ids=True,
+        )
+        if sent_map:
+            state.lobby_messages[game_state.game_id] = dict(sent_map)
+        else:
+            state.lobby_messages.pop(game_state.game_id, None)
+        return
+    chat_id = game_state.chat_id
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=keyboard,
         **_thread_kwargs(game_state),
     )
-    state.lobby_messages[game_state.game_id] = (chat_id, sent.message_id)
+    state.lobby_messages[game_state.game_id] = {chat_id: sent.message_id}
 
 
 async def _update_lobby_message(
     context: ContextTypes.DEFAULT_TYPE, game_state: GameState
 ) -> None:
     entry = state.lobby_messages.get(game_state.game_id)
-    if not entry:
+    if isinstance(entry, tuple):
+        chat_id, message_id = entry
+        entry = {chat_id: message_id}
+        state.lobby_messages[game_state.game_id] = entry
+    if not isinstance(entry, dict) or not entry:
+        await _publish_lobby_message(context, game_state)
         return
-    chat_id, message_id = entry
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=keyboard,
-        )
-    except TelegramError:
-        logger.exception("Failed to update lobby message for game %s", game_state.game_id)
+    expected_chats: set[int] = set()
+    if _is_private_multiplayer(game_state):
+        expected_chats = {chat_id for _, chat_id in _iter_player_dm_chats(game_state)}
+    else:
+        expected_chats = {game_state.chat_id}
+    existing_chats = set(entry)
+    missing_chats = expected_chats - existing_chats
+    for chat_id, message_id in list(entry.items()):
+        if chat_id not in expected_chats:
+            entry.pop(chat_id, None)
+            continue
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+        except TelegramError:
+            logger.exception(
+                "Failed to update lobby message for game %s in chat %s",
+                game_state.game_id,
+                chat_id,
+            )
+            entry.pop(chat_id, None)
+            missing_chats.add(chat_id)
+    if _is_private_multiplayer(game_state):
+        if missing_chats:
+            sent_map = await _broadcast_to_players(
+                context,
+                game_state,
+                text,
+                reply_markup=keyboard,
+                exclude_chat_ids=set(entry),
+                collect_message_ids=True,
+            )
+            if sent_map:
+                entry.update(sent_map)
+        return
+    if missing_chats:
+        await _publish_lobby_message(context, game_state)
 
 
 async def _run_lobby_puzzle_generation(
@@ -1792,17 +1970,20 @@ async def _run_lobby_puzzle_generation(
                     "Failed to update lobby message after generation error for %s",
                     game_id,
                 )
-        _clear_generation_notice(context, chat_id)
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Не удалось подготовить кроссворд. Попробуйте выбрать тему ещё раз."
-                ),
-                **(_thread_kwargs(refreshed) if refreshed else {}),
-            )
-        except TelegramError:
-            logger.exception("Failed to notify chat %s about generation failure", chat_id)
+        target_state = refreshed or base_state
+        if target_state:
+            _clear_generation_notice_for_game(context, target_state)
+            try:
+                await _send_game_message(
+                    context,
+                    target_state,
+                    "Не удалось подготовить кроссворд. Попробуйте выбрать тему ещё раз.",
+                )
+            except TelegramError:
+                logger.exception(
+                    "Failed to notify game %s about generation failure",
+                    target_state.game_id,
+                )
         state.lobby_generation_tasks.pop(game_id, None)
         return
     finally:
@@ -1848,17 +2029,18 @@ async def _run_lobby_puzzle_generation(
     except TelegramError:
         update_succeeded = False
         logger.exception("Failed to publish lobby update for game %s", game_id)
-    _clear_generation_notice(context, chat_id)
+    _clear_generation_notice_for_game(context, refreshed)
     if update_succeeded:
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Кроссворд готов! Нажмите «Старт», чтобы начать игру.",
-                **_thread_kwargs(refreshed),
+            await _send_game_message(
+                context,
+                refreshed,
+                "Кроссворд готов! Нажмите «Старт», чтобы начать игру.",
             )
         except TelegramError:
             logger.exception(
-                "Failed to notify chat %s about puzzle readiness", chat_id
+                "Failed to notify game %s about puzzle readiness",
+                refreshed.game_id,
             )
     state.lobby_generation_tasks.pop(game_id, None)
 
@@ -2223,10 +2405,12 @@ async def _send_generation_notice(
     text: str,
     *,
     message: Message | None = None,
+    chat_data: dict | None = None,
 ) -> None:
     """Send a single informational message about puzzle generation per chat."""
 
-    chat_data = getattr(context, "chat_data", None)
+    if chat_data is None:
+        chat_data = _get_chat_data_for_chat(context, chat_id)
     getter = getattr(chat_data, "get", None)
     existing_notice = getter(GENERATION_NOTICE_KEY) if callable(getter) else None
     reason = text
@@ -2240,7 +2424,7 @@ async def _send_generation_notice(
         )
         return
 
-    _cancel_generation_updates(context, chat_id)
+    _cancel_generation_updates(context, chat_id, chat_data=chat_data)
     remover = getattr(chat_data, "pop", None)
     if callable(remover):
         remover(GENERATION_NOTICE_KEY, None)
@@ -2267,8 +2451,8 @@ async def _send_generation_notice(
         "update_index": 0,
     }
     random.shuffle(notice_state["update_cycle"])
-    context.chat_data[GENERATION_NOTICE_KEY] = notice_state
-    _schedule_generation_updates(context, chat_id)
+    chat_data[GENERATION_NOTICE_KEY] = notice_state
+    _schedule_generation_updates(context, chat_id, chat_data=chat_data)
 
     if message is not None:
         await message.reply_text(chosen_text)
@@ -2277,13 +2461,20 @@ async def _send_generation_notice(
 
 
 def _clear_generation_notice(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+    *,
+    chat_data: dict | None = None,
 ) -> None:
     """Clear generation notice tracking for the chat."""
 
-    _cancel_generation_updates(context, chat_id)
-    removed = context.chat_data.pop(GENERATION_NOTICE_KEY, None)
-    if removed is not None and chat_id is not None:
+    if chat_id is None:
+        return
+    if chat_data is None:
+        chat_data = _get_chat_data_for_chat(context, chat_id)
+    _cancel_generation_updates(context, chat_id, chat_data=chat_data)
+    removed = chat_data.pop(GENERATION_NOTICE_KEY, None)
+    if removed is not None:
         logger.debug("Cleared generation notice flag for chat %s", chat_id)
 
 
@@ -2302,13 +2493,14 @@ async def _send_completion_options(
 
 
 def _schedule_generation_updates(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    chat_data: dict | None = None,
 ) -> None:
-    chat_data = getattr(context, "chat_data", None)
-    get_chat_data = getattr(chat_data, "get", None)
-    if not callable(get_chat_data):
-        return
-    notice = get_chat_data(GENERATION_NOTICE_KEY)
+    if chat_data is None:
+        chat_data = _get_chat_data_for_chat(context, chat_id)
+    notice = chat_data.get(GENERATION_NOTICE_KEY)
     if not isinstance(notice, dict):
         return
     updates = list(GENERATION_UPDATE_TEMPLATES)
@@ -2347,13 +2539,16 @@ def _schedule_generation_updates(
 
 
 def _cancel_generation_updates(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+    *,
+    chat_data: dict | None = None,
 ) -> None:
-    chat_data = getattr(context, "chat_data", None)
-    get_chat_data = getattr(chat_data, "get", None)
-    if not callable(get_chat_data):
+    if chat_id is None:
         return
-    notice = get_chat_data(GENERATION_NOTICE_KEY)
+    if chat_data is None:
+        chat_data = _get_chat_data_for_chat(context, chat_id)
+    notice = chat_data.get(GENERATION_NOTICE_KEY)
     if not isinstance(notice, dict):
         return
     update_job_id = notice.pop("update_job_id", None)
@@ -3947,9 +4142,9 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "[адм.] Тестовая игра запущена! Следите за ходами и командами в этом чате.",
             )
             return ConversationHandler.END
-        await _send_generation_notice(
+        await _send_generation_notice_to_game(
             context,
-            chat.id,
+            game_state,
             "Тема сохранена! Готовим кроссворд, это может занять немного времени.",
             message=message,
         )
@@ -4525,9 +4720,9 @@ async def lobby_start_callback_handler(
             state.lobby_generation_tasks.pop(game_state.game_id, None)
             generation_task = None
         if generation_task is None:
-            await _send_generation_notice(
+            await _send_generation_notice_to_game(
                 context,
-                game_state.chat_id,
+                game_state,
                 "Готовим кроссворд, это может занять немного времени...",
                 message=query.message,
             )
@@ -4544,27 +4739,27 @@ async def lobby_start_callback_handler(
             return
         except Exception:
             logger.exception("Unexpected error while awaiting lobby generation for %s", game_id)
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text="Не удалось подготовить кроссворд. Попробуйте начать позже.",
-                **_thread_kwargs(game_state),
+            await _send_game_message(
+                context,
+                game_state,
+                "Не удалось подготовить кроссворд. Попробуйте начать позже.",
             )
             return
         refreshed_state = _load_state_by_game_id(game_id)
         if refreshed_state is None or refreshed_state.puzzle_id == "":
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text="Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
-                **_thread_kwargs(game_state),
+            await _send_game_message(
+                context,
+                game_state,
+                "Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
             )
             return
         game_state = refreshed_state
         puzzle = _load_puzzle_for_state(game_state)
         if puzzle is None:
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text="Не удалось загрузить кроссворд. Попробуйте позже.",
-                **_thread_kwargs(game_state),
+            await _send_game_message(
+                context,
+                game_state,
+                "Не удалось загрузить кроссворд. Попробуйте позже.",
             )
             return
     players_sorted = sorted(
@@ -4589,10 +4784,10 @@ async def lobby_start_callback_handler(
     state.lobby_messages.pop(game_state.game_id, None)
     if not query_answered:
         await query.answer("Игра начинается!")
-    await context.bot.send_message(
-        chat_id=game_state.chat_id,
-        text="Игра началась! Ходы идут по очереди.",
-        **_thread_kwargs(game_state),
+    await _send_game_message(
+        context,
+        game_state,
+        "Игра началась! Ходы идут по очереди.",
     )
     await _announce_turn(
         context,

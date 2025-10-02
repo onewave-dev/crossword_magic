@@ -194,6 +194,71 @@ async def test_start_new_group_game_creates_lobby(monkeypatch, fresh_state):
     message.reply_text.assert_awaited()
 
 
+@pytest.mark.anyio
+async def test_publish_lobby_message_private_records_dm_messages(fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(555, puzzle)
+    game_state.status = "lobby"
+    game_state.mode = "turn_based"
+
+    first_response = SimpleNamespace(message_id=401)
+    second_response = SimpleNamespace(message_id=402)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(side_effect=[first_response, second_response])
+    )
+    context = SimpleNamespace(bot=bot)
+
+    await app._publish_lobby_message(context, game_state)
+
+    expected_chats = {player.dm_chat_id for player in game_state.players.values()}
+    sent_chats = {call.kwargs["chat_id"] for call in bot.send_message.await_args_list}
+    assert bot.send_message.await_count == len(expected_chats)
+    assert sent_chats == expected_chats
+    expected_mapping = {
+        call.kwargs["chat_id"]: response.message_id
+        for call, response in zip(
+            bot.send_message.await_args_list,
+            [first_response, second_response],
+        )
+    }
+    assert state.lobby_messages[game_state.game_id] == expected_mapping
+
+
+@pytest.mark.anyio
+async def test_generation_notice_broadcasts_to_private_players(fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(777, puzzle)
+    game_state.status = "lobby"
+    bot = SimpleNamespace(send_message=AsyncMock())
+    context = SimpleNamespace(
+        bot=bot,
+        application=SimpleNamespace(chat_data={}),
+        job_queue=None,
+    )
+    host_chat_id = next(player.dm_chat_id for player in game_state.players.values())
+    host_message = SimpleNamespace(
+        chat=SimpleNamespace(id=host_chat_id),
+        reply_text=AsyncMock(),
+    )
+
+    await app._send_generation_notice_to_game(
+        context,
+        game_state,
+        "Тестовое уведомление",
+        message=host_message,
+    )
+
+    host_message.reply_text.assert_awaited_once()
+    bot.send_message.assert_awaited()
+    sent_chat_ids = {call.kwargs["chat_id"] for call in bot.send_message.await_args_list}
+    expected_receivers = {
+        player.dm_chat_id
+        for player in game_state.players.values()
+        if player.dm_chat_id != host_chat_id
+    }
+    assert sent_chat_ids == expected_receivers
+
+
 def test_assign_join_code_avoids_collisions(monkeypatch, fresh_state):
     game_state = GameState(
         chat_id=-200,
@@ -506,7 +571,7 @@ async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
     run_generate_mock.assert_not_awaited()
     theme_message.reply_text.assert_awaited()
     assert game_state.theme == "История"
-    assert state.lobby_messages[game_id][0] == chat.id
+    assert chat.id in state.lobby_messages[game_id]
     assert send_message_mock.await_count >= 1
     assert state.lobby_generation_tasks.get(game_id) is None
 
@@ -685,6 +750,55 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     schedule_mock.assert_called_once()
     announce_mock.assert_awaited()
     query.answer.assert_awaited_with("Игра начинается!")
+
+
+@pytest.mark.anyio
+async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(888, puzzle)
+    game_state.status = "lobby"
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    schedule_mock = MagicMock()
+    monkeypatch.setattr(app, "_schedule_game_timers", schedule_mock)
+
+    stored_states: list[GameState] = []
+
+    def fake_store(gs: GameState) -> None:
+        stored_states.append(gs)
+        state.active_games[gs.game_id] = gs
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+
+    send_message_mock = AsyncMock()
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=send_message_mock), job_queue=DummyJobQueue())
+    query_message = SimpleNamespace(
+        chat=SimpleNamespace(id=game_state.chat_id, type=ChatType.PRIVATE),
+        message_thread_id=None,
+    )
+    query = SimpleNamespace(
+        data=f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}",
+        answer=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=query_message.chat,
+        effective_message=query_message,
+    )
+
+    await lobby_start_callback_handler(update, context)
+
+    expected_dm_chats = {player.dm_chat_id for player in game_state.players.values()}
+    sent_chats = {call.kwargs["chat_id"] for call in send_message_mock.await_args_list}
+    assert sent_chats == expected_dm_chats
+    assert send_message_mock.await_count == len(expected_dm_chats)
 
 
 @pytest.mark.anyio
@@ -1101,7 +1215,7 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
     base_state.status = "running"
     state.active_games[base_state.game_id] = base_state
     state.chat_to_game[base_state.chat_id] = base_state.game_id
-    state.lobby_messages[base_state.game_id] = (base_state.chat_id, 111)
+    state.lobby_messages[base_state.game_id] = {base_state.chat_id: 111}
 
     monkeypatch.setattr(app, "_load_state_for_chat", lambda _: base_state)
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
