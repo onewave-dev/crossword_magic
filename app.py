@@ -4145,9 +4145,6 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 _clear_pending_admin_test(context)
                 return ConversationHandler.END
             _clear_pending_admin_test(context)
-            await message.reply_text(
-                "[адм.] Тестовая игра запущена! Следите за ходами и командами в этом чате.",
-            )
             return ConversationHandler.END
         await _send_generation_notice_to_game(
             context,
