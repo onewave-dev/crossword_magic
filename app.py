@@ -1186,6 +1186,33 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         _apply_answer_to_state(game_state, slot_ref, attempt_answer)
         game_state.active_slot_id = None
         _store_state(game_state)
+        try:
+            image_path = render_puzzle(puzzle, game_state)
+            with open(image_path, "rb") as photo:
+                photo_bytes = photo.read()
+            await _broadcast_photo_to_players(
+                context,
+                game_state,
+                photo_bytes,
+                caption=f"Верно! {slot_ref.public_id}",
+                exclude_chat_ids={game_state.chat_id},
+            )
+            try:
+                await context.bot.send_photo(
+                    chat_id=game_state.chat_id,
+                    photo=photo_bytes,
+                    caption=f"Верно! {slot_ref.public_id}",
+                    **_thread_kwargs(game_state),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to send puzzle image to primary chat for game %s",
+                    game_state.game_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to render updated grid after dummy correct answer"
+            )
         success_text = (
             f"{info_prefix} разгадал {slot_ref.public_id}! (+{SCORE_PER_WORD} очков)"
         )
