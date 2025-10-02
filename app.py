@@ -1065,13 +1065,14 @@ def _cancel_dummy_job(game_state: GameState) -> None:
 def _schedule_game_timers(
     context: ContextTypes.DEFAULT_TYPE, game_state: GameState
 ) -> None:
-    if not context.job_queue:
+    job_queue = context.job_queue if context is not None else None
+    if job_queue is None:
         return
     _cancel_game_timers(game_state)
     data = {"game_id": game_state.game_id}
     if GAME_TIME_LIMIT_SECONDS > GAME_WARNING_SECONDS > 0:
         warn_name = f"game-warn-{game_state.game_id}"
-        warn_job = context.job_queue.run_once(
+        warn_job = job_queue.run_once(
             _game_warning_job,
             GAME_TIME_LIMIT_SECONDS - GAME_WARNING_SECONDS,
             chat_id=game_state.chat_id,
@@ -1081,7 +1082,7 @@ def _schedule_game_timers(
         _remember_job(warn_job)
         game_state.game_warn_job_id = warn_name
     timeout_name = f"game-timeout-{game_state.game_id}"
-    timeout_job = context.job_queue.run_once(
+    timeout_job = job_queue.run_once(
         _game_timeout_job,
         GAME_TIME_LIMIT_SECONDS,
         chat_id=game_state.chat_id,
@@ -1095,7 +1096,8 @@ def _schedule_game_timers(
 def _schedule_turn_timers(
     context: ContextTypes.DEFAULT_TYPE, game_state: GameState
 ) -> None:
-    if not context.job_queue:
+    job_queue = context.job_queue if context is not None else None
+    if job_queue is None:
         return
     _cancel_turn_timers(game_state)
     current_player = _current_player(game_state)
@@ -1104,7 +1106,7 @@ def _schedule_turn_timers(
     data = {"game_id": game_state.game_id, "player_id": current_player.user_id}
     if TURN_TIME_LIMIT_SECONDS > TURN_WARNING_SECONDS > 0:
         warn_name = f"turn-warn-{game_state.game_id}"
-        warn_job = context.job_queue.run_once(
+        warn_job = job_queue.run_once(
             _turn_warning_job,
             TURN_TIME_LIMIT_SECONDS - TURN_WARNING_SECONDS,
             chat_id=game_state.chat_id,
@@ -1114,7 +1116,7 @@ def _schedule_turn_timers(
         _remember_job(warn_job)
         game_state.turn_warn_job_id = warn_name
     timeout_name = f"turn-timeout-{game_state.game_id}"
-    timeout_job = context.job_queue.run_once(
+    timeout_job = job_queue.run_once(
         _turn_timeout_job,
         TURN_TIME_LIMIT_SECONDS,
         chat_id=game_state.chat_id,
@@ -1130,7 +1132,8 @@ def _schedule_dummy_turn(
     game_state: GameState,
     puzzle: Puzzle | CompositePuzzle,
 ) -> None:
-    if not (game_state.test_mode and context.job_queue):
+    job_queue = context.job_queue if context is not None else None
+    if job_queue is None or not game_state.test_mode:
         _cancel_dummy_job(game_state)
         return
     player = _current_player(game_state)
@@ -1146,7 +1149,7 @@ def _schedule_dummy_turn(
     delay = max(MIN_DUMMY_DELAY, random.uniform(*DUMMY_DELAY_RANGE))
     job_name = f"dummy-turn-{game_state.game_id}"
     data = {"game_id": game_state.game_id, "planned_delay": delay}
-    job = context.job_queue.run_once(
+    job = job_queue.run_once(
         _dummy_turn_job,
         delay,
         chat_id=game_state.chat_id,
