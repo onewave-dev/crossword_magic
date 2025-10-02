@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -727,6 +728,73 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
     assert state.scheduled_jobs[game_state.turn_timer_job_id] is not initial_timeout_job
     assert message.reply_photo.await_count == 1
     bot.send_message.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_turn_based_rejects_rapid_second_answer(monkeypatch, tmp_path, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-701, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+
+    def fake_store(gs: GameState) -> None:
+        state.active_games[gs.game_id] = gs
+        state.chat_to_game[gs.chat_id] = gs.game_id
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+    monkeypatch.setattr(app, "_send_clues_update", AsyncMock())
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", AsyncMock())
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+
+    image_path = tmp_path / "grid.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    job_queue = DummyJobQueue()
+    bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
+    context = SimpleNamespace(bot=bot, job_queue=job_queue)
+
+    _update1, chat, message1 = _make_group_update(game_state.chat_id, user_id=1)
+
+    start_photo = asyncio.Event()
+    finish_photo = asyncio.Event()
+
+    async def delayed_reply_photo(*args, **kwargs):  # noqa: ANN001 - signature matches AsyncMock usage
+        start_photo.set()
+        await finish_photo.wait()
+
+    message1.reply_photo = AsyncMock(side_effect=delayed_reply_photo)
+
+    first_task = asyncio.create_task(
+        app._handle_answer_submission(context, chat, message1, "A1", "рим")
+    )
+
+    await start_photo.wait()
+    await asyncio.sleep(0)
+    assert game_state.turn_index == 1
+
+    game_state.active_slot_id = "D1"
+
+    _, _, message2 = _make_group_update(game_state.chat_id, user_id=1)
+    message2.reply_photo = AsyncMock()
+    message2.reply_text = AsyncMock()
+
+    await app._handle_answer_submission(context, chat, message2, "D1", "дон")
+
+    message2.reply_text.assert_awaited()
+    assert "Сейчас ход" in message2.reply_text.await_args.args[0]
+    message2.reply_photo.assert_not_awaited()
+
+    game_state.active_slot_id = None
+
+    finish_photo.set()
+    await first_task
+
+    announce_mock.assert_awaited()
 
 
 @pytest.mark.anyio
