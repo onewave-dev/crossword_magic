@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram import InlineKeyboardMarkup
+from telegram import InlineKeyboardMarkup, constants
 from telegram.constants import ChatType
 from telegram.ext import ConversationHandler
 
@@ -1030,6 +1030,68 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
 
 
 @pytest.mark.anyio
+async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-702, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", AsyncMock())
+
+    stored_states: list[GameState] = []
+
+    def fake_store(gs: GameState) -> None:
+        stored_states.append(gs)
+        state.active_games[gs.game_id] = gs
+        state.chat_to_game[gs.chat_id] = gs.game_id
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+
+    broadcast_mock = AsyncMock(
+        side_effect=[app.BroadcastResult(successful_chats=set()) for _ in range(2)]
+    )
+    monkeypatch.setattr(app, "_broadcast_to_players", broadcast_mock)
+
+    image_path = tmp_path / "grid.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_photo=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    context = SimpleNamespace(bot=bot, job_queue=DummyJobQueue())
+
+    chat = SimpleNamespace(id=game_state.chat_id, type=ChatType.GROUP)
+    message = SimpleNamespace(
+        reply_text=AsyncMock(),
+        reply_photo=AsyncMock(),
+        from_user=SimpleNamespace(id=1, full_name="Игрок 1"),
+    )
+
+    await app._handle_answer_submission(context, chat, message, "A1", "рим")
+
+    assert broadcast_mock.await_count == 2
+    first_call = broadcast_mock.await_args_list[0]
+    second_call = broadcast_mock.await_args_list[1]
+
+    updated_clues = app._format_clues_message(puzzle, game_state)
+    assert first_call.args[2] == updated_clues
+    assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert "Ход игрока" in second_call.args[2]
+
+    send_calls = bot.send_message.await_args_list
+    assert len(send_calls) >= 2
+    assert send_calls[0].kwargs.get("text") == updated_clues
+    assert send_calls[0].kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert "Ход игрока" in send_calls[1].kwargs.get("text", "")
+
+    assert stored_states, "Game state should be stored after correct answer"
+
+@pytest.mark.anyio
 async def test_turn_based_rejects_rapid_second_answer(monkeypatch, tmp_path, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(-701, puzzle)
@@ -1119,8 +1181,12 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
 
     await app._announce_turn(context, game_state, puzzle)
 
-    assert announce_mock.await_count == 1
-    announce_kwargs = announce_mock.await_args.kwargs
+    assert announce_mock.await_count == 2
+    first_call = announce_mock.await_args_list[0]
+    second_call = announce_mock.await_args_list[1]
+    assert first_call.kwargs.get("text") == app._format_clues_message(puzzle, game_state)
+    assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
+    announce_kwargs = second_call.kwargs
     assert announce_kwargs["chat_id"] == chat_id
     assert "message_thread_id" not in announce_kwargs
     assert "/answer" in announce_kwargs.get("text", "")
@@ -1841,6 +1907,11 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, fresh_sta
 
     await app._announce_turn(context, game_state, puzzle)
 
-    assert attempted == [player.dm_chat_id, game_state.chat_id]
-    assert delivered == [game_state.chat_id]
+    assert attempted == [
+        player.dm_chat_id,
+        game_state.chat_id,
+        player.dm_chat_id,
+        game_state.chat_id,
+    ]
+    assert delivered == [game_state.chat_id, game_state.chat_id]
 

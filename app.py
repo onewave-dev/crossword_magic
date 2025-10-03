@@ -1445,6 +1445,7 @@ async def _announce_turn(
     player = _current_player(game_state)
     if player is None:
         return
+    await _broadcast_clues_message(context, game_state, puzzle)
     parts = []
     if prefix:
         parts.append(prefix)
@@ -2319,6 +2320,48 @@ def _format_clues_message(
     across_text = _format_clue_section(across, solved_ids)
     down_text = _format_clue_section(down, solved_ids)
     return f"Across:\n{across_text}\n\nDown:\n{down_text}"
+
+
+async def _broadcast_clues_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    puzzle: Puzzle | CompositePuzzle,
+    *,
+    exclude_chat_ids: Iterable[int] | None = None,
+) -> None:
+    """Broadcast formatted clues to players and the primary chat."""
+
+    text = _format_clues_message(puzzle, game_state)
+    try:
+        broadcast = await _broadcast_to_players(
+            context,
+            game_state,
+            text,
+            parse_mode=constants.ParseMode.HTML,
+            exclude_chat_ids=exclude_chat_ids,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to broadcast clues via direct chats for game %s",
+            game_state.game_id,
+        )
+        broadcast = BroadcastResult(successful_chats=set())
+    if (
+        not broadcast.successful_chats
+        or game_state.chat_id not in broadcast.successful_chats
+    ):
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=text,
+                parse_mode=constants.ParseMode.HTML,
+                **_thread_kwargs(game_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to send clues message in primary chat for game %s",
+                game_state.game_id,
+            )
 
 
 def _sorted_slot_refs(puzzle: Puzzle | CompositePuzzle) -> list[SlotRef]:
