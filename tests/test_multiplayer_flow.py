@@ -163,6 +163,47 @@ def _make_group_update(chat_id: int, user_id: int):
     return update, chat, message
 
 
+def test_iter_player_dm_chats_includes_group_when_host_missing_dm():
+    game_state = GameState(
+        chat_id=-500,
+        puzzle_id="demo",
+        host_id=1,
+        players={
+            1: Player(user_id=1, name="Host", dm_chat_id=None),
+            2: Player(user_id=2, name="Player", dm_chat_id=202),
+        },
+        scoreboard={},
+        mode="turn_based",
+        status="lobby",
+    )
+
+    chats = app._iter_player_dm_chats(game_state)
+
+    assert (2, 202) in chats
+    assert (None, -500) in chats
+
+
+def test_iter_player_dm_chats_skips_group_once_host_has_dm():
+    game_state = GameState(
+        chat_id=-501,
+        puzzle_id="demo",
+        host_id=1,
+        players={
+            1: Player(user_id=1, name="Host", dm_chat_id=101),
+            2: Player(user_id=2, name="Player", dm_chat_id=202),
+        },
+        scoreboard={},
+        mode="turn_based",
+        status="lobby",
+    )
+
+    chats = app._iter_player_dm_chats(game_state)
+
+    assert (None, -501) not in chats
+    assert chats.count((1, 101)) == 1
+    assert chats.count((2, 202)) == 1
+
+
 @pytest.mark.anyio
 async def test_start_new_group_game_creates_lobby(monkeypatch, fresh_state):
     chat_id = -1001
