@@ -1918,7 +1918,7 @@ async def _send_lobby_invite_controls(
     request_id = state.lobby_invite_requests.get(game_state.game_id)
     should_send = force or request_id is None
     if request_id is None or force:
-        request_id = secrets.randbits(32) or 1
+        request_id = secrets.randbelow(2**31 - 1) + 1
     keyboard = _build_lobby_invite_keyboard(request_id)
     message_text = text or LOBBY_INVITE_INSTRUCTION
     sent_message_id: int | None = None
@@ -5090,7 +5090,7 @@ async def lobby_link_callback_handler(
     dm_chat_id = _lookup_player_chat(user.id) or user.id
     request_id = state.lobby_invite_requests.get(game_state.game_id)
     if request_id is None:
-        request_id = secrets.randbits(32) or 1
+        request_id = secrets.randbelow(2**31 - 1) + 1
         state.lobby_invite_requests[game_state.game_id] = request_id
     _update_host_pending_invite(
         context,
