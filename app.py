@@ -31,6 +31,15 @@ from telegram import (
     User,
     constants,
 )
+
+try:  # pragma: no cover - compatibility shim for PTB <21
+    from telegram import KeyboardButtonRequestUser  # type: ignore[attr-defined]
+
+    _KEYBOARD_REQUEST_USER_KWARG = "request_user"
+except ImportError:  # pragma: no cover - fallback for PTB >=20.8
+    from telegram import KeyboardButtonRequestUsers as KeyboardButtonRequestUser  # type: ignore[attr-defined]
+
+    _KEYBOARD_REQUEST_USER_KWARG = "request_users"
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -45,6 +54,10 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, TelegramError
+
+USER_SHARED_FILTER = getattr(filters.StatusUpdate, "USER_SHARED", None)
+if USER_SHARED_FILTER is None:  # pragma: no cover - compatibility shim
+    USER_SHARED_FILTER = getattr(filters.StatusUpdate, "USERS_SHARED")
 
 from utils.storage import (
     STATE_CLEANUP_INTERVAL,
@@ -4552,8 +4565,19 @@ async def lobby_invite_callback_handler(
         "Выберите контакт, которому хотите отправить приглашение, или поделитесь ссылкой"
         " через кнопку «Создать ссылку»."
     )
+    request_id = secrets.randbits(32) or 1
+    request_button_kwargs = {
+        "text": "Выбрать пользователя",
+        _KEYBOARD_REQUEST_USER_KWARG: KeyboardButtonRequestUser(
+            request_id=request_id,
+            user_is_bot=False,
+        ),
+    }
     keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton(text="Поделиться контактом", request_contact=True)]],
+        [
+            [KeyboardButton(**request_button_kwargs)],
+            [KeyboardButton(text="Поделиться контактом", request_contact=True)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -4573,7 +4597,7 @@ async def lobby_invite_callback_handler(
     if not isinstance(user_data, dict):
         user_data = {}
         setattr(context, "user_data", user_data)
-    pending_invite = {"game_id": game_state.game_id}
+    pending_invite = {"game_id": game_state.game_id, "request_id": request_id}
     for existing_code, target in game_state.join_codes.items():
         if target == game_state.game_id:
             pending_invite["code"] = existing_code
@@ -4592,7 +4616,11 @@ async def lobby_contact_handler(
     user = update.effective_user
     if chat is None or message is None or user is None:
         return
-    if chat.type != ChatType.PRIVATE or message.contact is None:
+    if chat.type != ChatType.PRIVATE:
+        return
+    shared_user = message.user_shared
+    contact = message.contact
+    if shared_user is None and contact is None:
         return
     user_data = getattr(context, "user_data", None)
     if isinstance(user_data, dict):
@@ -4605,6 +4633,7 @@ async def lobby_contact_handler(
             reply_markup=ReplyKeyboardRemove(),
         )
         return
+    expected_request_id = pending.get("request_id")
     game_id = pending.get("game_id")
     code_hint = pending.get("code")
     if not game_id:
@@ -4632,8 +4661,50 @@ async def lobby_contact_handler(
             reply_markup=ReplyKeyboardRemove(),
         )
         return
-    contact = message.contact
-    target_user_id = contact.user_id
+    target_user_id: int | None = None
+    contact_name: str | None = None
+    if shared_user is not None:
+        if (
+            expected_request_id is not None
+            and shared_user.request_id != expected_request_id
+        ):
+            await message.reply_text(
+                "Запрос устарел. Откройте меню лобби ещё раз.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        target_user_id = shared_user.user_id
+        if target_user_id:
+            try:
+                shared_chat = await context.bot.get_chat(target_user_id)
+            except TelegramError:
+                logger.debug(
+                    "Failed to resolve shared user %s for game %s",
+                    target_user_id,
+                    game_state.game_id,
+                )
+            else:
+                name = getattr(shared_chat, "full_name", None)
+                if not name:
+                    first = getattr(shared_chat, "first_name", None)
+                    last = getattr(shared_chat, "last_name", None)
+                    name = " ".join(part for part in (first, last) if part).strip()
+                if not name:
+                    username = getattr(shared_chat, "username", None)
+                    if username:
+                        name = f"@{username}"
+                if not name:
+                    title = getattr(shared_chat, "title", None)
+                    if title:
+                        name = str(title)
+                if name:
+                    contact_name = str(name)
+    elif contact is not None:
+        target_user_id = contact.user_id
+        contact_name_parts = [contact.first_name or "", contact.last_name or ""]
+        contact_name = " ".join(part for part in contact_name_parts if part).strip()
+        if not contact_name:
+            contact_name = contact.phone_number or None
     if target_user_id == user.id:
         await message.reply_text(
             "Нельзя отправить приглашение самому себе.",
@@ -4683,10 +4754,13 @@ async def lobby_contact_handler(
     if link:
         invite_lines.append(f"Присоединяйтесь по ссылке: {link}")
     invite_text = "\n".join(invite_lines)
-    contact_name_parts = [contact.first_name or "", contact.last_name or ""]
-    contact_name = " ".join(part for part in contact_name_parts if part).strip()
+    if not contact_name and contact is not None:
+        contact_name_parts = [contact.first_name or "", contact.last_name or ""]
+        contact_name = " ".join(part for part in contact_name_parts if part).strip()
+        if not contact_name:
+            contact_name = contact.phone_number or None
     if not contact_name:
-        contact_name = contact.phone_number or "игрок"
+        contact_name = str(target_user_id) if target_user_id else "игрок"
     sent_successfully = False
     error_message: str | None = None
     if target_user_id:
@@ -6328,7 +6402,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(
         MessageHandler(
-            filters.CONTACT,
+            filters.CONTACT | USER_SHARED_FILTER,
             lobby_contact_handler,
             block=False,
         )
