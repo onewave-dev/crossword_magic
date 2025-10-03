@@ -1,4 +1,4 @@
-python-telegram-bot>=20.6
+python-telegram-bot[job-queue]>=20.6
 fastapi>=0.110
 uvicorn[standard]>=0.30
 langchain>=0.2
