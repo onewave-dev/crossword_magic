@@ -769,6 +769,26 @@ def test_lobby_keyboard_start_activation(fresh_state):
     assert start_data.startswith(LOBBY_START_CALLBACK_PREFIX)
 
 
+def test_lobby_keyboard_excludes_admin_button_after_entry(fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-401, puzzle)
+    game_state.status = "lobby"
+    state.settings = SimpleNamespace(admin_id=game_state.host_id)
+
+    keyboard = app._build_lobby_keyboard(game_state)
+
+    admin_callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert all(
+        not callback.startswith(app.ADMIN_TEST_GAME_CALLBACK_PREFIX)
+        for callback in admin_callbacks
+    )
+
+
 @pytest.mark.anyio
 async def test_join_code_limits_players(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()

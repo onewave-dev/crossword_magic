@@ -1826,20 +1826,6 @@ def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
         start_callback = f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}"
     start_button = InlineKeyboardButton(text="Старт", callback_data=start_callback)
     rows = [[invite_button, link_button], [start_button]]
-    settings = state.settings
-    if (
-        settings
-        and settings.admin_id is not None
-        and game_state.host_id == settings.admin_id
-    ):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "[адм.] Тестовая игра 1×1",
-                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{game_state.chat_id}",
-                )
-            ]
-        )
     return InlineKeyboardMarkup(rows)
 
 
