@@ -5332,6 +5332,21 @@ async def _handle_answer_submission(
             game_state.active_slot_id = public_id
             game_state.last_update = time.time()
 
+        player_display_name: str
+        if current_player and current_player.name:
+            player_display_name = current_player.name
+        else:
+            from_user = message.from_user
+            fallback_name = None
+            if from_user is not None:
+                fallback_name = (
+                    getattr(from_user, "full_name", None)
+                    or getattr(from_user, "username", None)
+                    or getattr(from_user, "first_name", None)
+                    or getattr(from_user, "last_name", None)
+                )
+            player_display_name = fallback_name or "Игрок"
+
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
             slot.answer,
             puzzle.language,
@@ -5340,15 +5355,27 @@ async def _handle_answer_submission(
             if in_turn_mode:
                 if current_player:
                     current_player.answers_fail += 1
-                await message.reply_text("Ответ неверный. Ход переходит к следующему игроку.")
+                failure_announcement = (
+                    f"Неверно! {player_display_name} - {public_id} - {candidate}"
+                )
+                await message.reply_text(failure_announcement)
                 await refresh_clues_if_needed()
+                try:
+                    await _broadcast_to_players(
+                        context,
+                        game_state,
+                        failure_announcement,
+                        exclude_chat_ids={chat.id},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to broadcast incorrect answer announcement for game %s",
+                        game_state.game_id,
+                    )
                 _cancel_turn_timers(game_state)
                 _advance_turn(game_state)
                 _store_state(game_state)
-                prefix = (
-                    f"{current_player.name} ошибся." if current_player else "Ответ неверный."
-                )
-                await _announce_turn(context, game_state, puzzle, prefix=prefix)
+                await _announce_turn(context, game_state, puzzle)
             else:
                 await message.reply_text("Ответ неверный, попробуйте ещё раз.")
                 await refresh_clues_if_needed()
@@ -5367,16 +5394,10 @@ async def _handle_answer_submission(
         _apply_answer_to_state(game_state, selected_slot_ref, candidate)
         logger.info("Accepted answer for slot %s", selected_slot_ref.public_id)
 
-        turn_announcement_prefix: str | None = None
         puzzle_completed = False
         completion_reason: str | None = None
 
         if in_turn_mode:
-            turn_announcement_prefix = (
-                f"{current_player.name} разгадал {selected_slot_ref.public_id}!"
-                if current_player
-                else f"Слот {selected_slot_ref.public_id} разгадан!"
-            )
             _cancel_turn_timers(game_state)
             if _all_slots_solved(puzzle, game_state):
                 puzzle_completed = True
@@ -5396,30 +5417,20 @@ async def _handle_answer_submission(
             )
             with open(image_path, "rb") as photo:
                 photo_bytes = photo.read()
+            success_caption = (
+                f"Верно! {player_display_name} - {public_id} - {candidate}"
+            )
             await message.reply_photo(
-                photo=photo_bytes, caption=f"Верно! {selected_slot_ref.public_id}"
+                photo=photo_bytes, caption=success_caption
             )
             if in_turn_mode:
                 await _broadcast_photo_to_players(
                     context,
                     game_state,
                     photo_bytes,
-                    caption=f"Верно! {selected_slot_ref.public_id}",
+                    caption=success_caption,
                     exclude_chat_ids={chat.id},
                 )
-            if in_turn_mode and chat.id == game_state.chat_id:
-                try:
-                    name = current_player.name if current_player else "Игрок"
-                    await context.bot.send_message(
-                        chat_id=game_state.chat_id,
-                        text=f"{name} разгадал {selected_slot_ref.public_id}!",
-                        **_thread_kwargs(game_state),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Failed to notify primary chat about answer in game %s",
-                        game_state.game_id,
-                    )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to render updated grid after correct answer")
             await message.reply_text(
@@ -5438,7 +5449,6 @@ async def _handle_answer_submission(
                 context,
                 game_state,
                 puzzle,
-                prefix=turn_announcement_prefix,
             )
         else:
             if _all_slots_solved(puzzle, game_state):
