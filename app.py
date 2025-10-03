@@ -4815,6 +4815,11 @@ async def lobby_contact_handler(
         expected_request_id = None
         game_id = None
         code_hint = None
+        reply_keyboard = (
+        _build_lobby_invite_keyboard(expected_request_id)
+        if expected_request_id is not None
+        else None
+    )
     if not game_id or expected_request_id is None:
         fallback_state = _find_turn_game_for_private_chat(chat.id, user.id)
         invite_id: int | None = None
