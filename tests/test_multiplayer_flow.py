@@ -1701,15 +1701,12 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     assert any("Dummy turn" in record.message for record in caplog.records)
     assert job_name not in state.scheduled_jobs
     broadcast_photo_mock.assert_awaited()
-    assert (
-        broadcast_photo_mock.await_args.kwargs.get("caption")
-        == "Верно! A1"
+    expected_caption = (
+        f"Верно! 🤖 Dummy - A1: РИМ (+{app.SCORE_PER_WORD} очков)"
     )
+    assert broadcast_photo_mock.await_args.kwargs.get("caption") == expected_caption
     context.bot.send_photo.assert_awaited()
-    assert (
-        context.bot.send_photo.await_args.kwargs.get("caption")
-        == "Верно! A1"
-    )
+    assert context.bot.send_photo.await_args.kwargs.get("caption") == expected_caption
 
 
 @pytest.mark.anyio
@@ -1791,7 +1788,7 @@ async def test_dummy_turn_job_admin_test_mirrors_primary_chat(
         if call.kwargs.get("chat_id") == game_state.chat_id
     ]
     assert any("отвечает на" in text for text in main_chat_messages)
-    assert any("разгадал" in text for text in main_chat_messages)
+    assert all("разгадал" not in text for text in main_chat_messages)
 
 
 @pytest.mark.anyio
