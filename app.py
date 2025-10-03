@@ -2226,6 +2226,7 @@ async def _run_lobby_puzzle_generation(
             language,
             theme,
             base_state.thread_id if getattr(base_state, "thread_id", 0) else 0,
+            persist_state=False,
         )
     except asyncio.CancelledError:
         logger.info("Lobby puzzle generation cancelled for game %s", game_id)
@@ -3387,16 +3388,24 @@ async def _run_generate_puzzle(
     chat_id: int,
     language: str,
     theme: str,
-    thread_id: int,
+    thread_id: int = 0,
+    *,
+    persist_state: bool = True,
 ) -> tuple[Puzzle | CompositePuzzle, GameState]:
     args: list[Any] = [chat_id, language, theme]
-    if thread_id:
+    if thread_id or not persist_state:
         args.append(thread_id)
+    if not persist_state:
+        args.append(persist_state)
     return await loop.run_in_executor(None, _generate_puzzle, *args)
 
 
 def _generate_puzzle(
-    chat_id: int, language: str, theme: str, thread_id: int = 0
+    chat_id: int,
+    language: str,
+    theme: str,
+    thread_id: int = 0,
+    persist_state: bool = True,
 ) -> tuple[Puzzle | CompositePuzzle, GameState]:
     with logging_context(chat_id=chat_id):
         logger.info(
@@ -3771,7 +3780,8 @@ def _generate_puzzle(
                                         "Generated composite puzzle with %s components",
                                         len(components),
                                     )
-                                    _store_state(game_state)
+                                    if persist_state:
+                                        _store_state(game_state)
                                     return composite, game_state
                         break
                     else:
@@ -3797,7 +3807,8 @@ def _generate_puzzle(
                             scoreboard={chat_id: 0},
                             thread_id=thread_id,
                         )
-                        _store_state(game_state)
+                        if persist_state:
+                            _store_state(game_state)
                         logger.info("Generated puzzle ready for delivery")
                         return puzzle, game_state
             return None
@@ -6557,14 +6568,13 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         generation_token = secrets.token_hex(16)
         context.chat_data[GENERATION_TOKEN_KEY] = generation_token
         try:
-                new_puzzle, new_state = await loop.run_in_executor(
-                    None,
-                    _generate_puzzle,
-                    chat.id,
-                    language,
-                    theme,
-                    state.chat_threads.get(chat.id, 0),
-                )
+            new_puzzle, new_state = await _run_generate_puzzle(
+                loop,
+                chat.id,
+                language,
+                theme,
+                state.chat_threads.get(chat.id, 0),
+            )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to regenerate puzzle for chat %s on same theme", chat.id
