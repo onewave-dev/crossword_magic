@@ -48,6 +48,7 @@ def fresh_state():
     state.dm_chat_to_game.clear()
     state.join_codes.clear()
     state.lobby_messages.clear()
+    state.lobby_host_invites.clear()
     state.generating_chats.clear()
     state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
@@ -59,6 +60,7 @@ def fresh_state():
     state.dm_chat_to_game.clear()
     state.join_codes.clear()
     state.lobby_messages.clear()
+    state.lobby_host_invites.clear()
     state.generating_chats.clear()
     state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
@@ -215,18 +217,18 @@ async def test_publish_lobby_message_private_records_dm_messages(fresh_state):
 
     await app._publish_lobby_message(context, game_state)
 
-    expected_chats = {player.dm_chat_id for player in game_state.players.values()}
-    sent_chats = {call.kwargs["chat_id"] for call in bot.send_message.await_args_list}
-    assert bot.send_message.await_count == len(expected_chats)
-    assert sent_chats == expected_chats
-    expected_mapping = {
-        call.kwargs["chat_id"]: response.message_id
-        for call, response in zip(
-            bot.send_message.await_args_list,
-            [first_response, second_response],
-        )
+    host_chat_id = game_state.players[game_state.host_id].dm_chat_id
+    assert bot.send_message.await_count == len(game_state.players)
+    first_call, second_call = bot.send_message.await_args_list
+    assert first_call.kwargs["chat_id"] == host_chat_id
+    assert second_call.kwargs["chat_id"] != host_chat_id
+    assert state.lobby_host_invites[game_state.game_id] == (
+        host_chat_id,
+        first_response.message_id,
+    )
+    assert state.lobby_messages[game_state.game_id] == {
+        second_call.kwargs["chat_id"]: second_response.message_id
     }
-    assert state.lobby_messages[game_state.game_id] == expected_mapping
 
 
 @pytest.mark.anyio
@@ -576,7 +578,7 @@ async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
     run_generate_mock.assert_not_awaited()
     theme_message.reply_text.assert_awaited()
     assert game_state.theme == "История"
-    assert chat.id in state.lobby_messages[game_id]
+    assert state.lobby_host_invites[game_id][0] == chat.id
     assert send_message_mock.await_count >= 1
     assert state.lobby_generation_tasks.get(game_id) is None
 
