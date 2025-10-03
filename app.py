@@ -202,6 +202,7 @@ class AppState:
         self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
         self.lobby_messages: dict[str, dict[int, int]] = {}
+        self.lobby_invite_requests: dict[str, int] = {}
         self.scheduled_jobs: dict[str, Job] = {}
         self.lobby_generation_tasks: dict[str, asyncio.Task[None]] = {}
         self.chat_threads: dict[int, int] = {}
@@ -238,6 +239,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
                 if target == game_id:
                     state.join_codes.pop(code, None)
             state.lobby_messages.pop(game_id, None)
+            state.lobby_invite_requests.pop(game_id, None)
             if puzzle_id:
                 delete_puzzle(puzzle_id)
             logger.info("Cleaned up resources for chat %s", chat_id)
@@ -255,6 +257,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
             if target == str(chat_id):
                 state.join_codes.pop(code, None)
         state.lobby_messages.pop(str(chat_id), None)
+        state.lobby_invite_requests.pop(str(chat_id), None)
         if puzzle_id:
             delete_puzzle(puzzle_id)
         logger.info("Cleaned up resources for chat %s", chat_id)
@@ -290,6 +293,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
             if state.player_chats.get(player.user_id) == player.dm_chat_id:
                 state.player_chats.pop(player.user_id, None)
         state.lobby_messages.pop(game_state.game_id, None)
+        state.lobby_invite_requests.pop(game_state.game_id, None)
         if game_state.puzzle_id:
             delete_puzzle(game_state.puzzle_id)
         logger.info("Cleaned up resources for game %s", game_state.game_id)
@@ -639,6 +643,15 @@ LOBBY_INVITE_CALLBACK_PREFIX = "lobby_invite:"
 LOBBY_LINK_CALLBACK_PREFIX = "lobby_link:"
 LOBBY_START_CALLBACK_PREFIX = "lobby_start:"
 LOBBY_WAIT_CALLBACK_PREFIX = "lobby_wait:"
+
+LOBBY_INVITE_BUTTON_TEXT = "Пригласить из контактов"
+LOBBY_LINK_BUTTON_TEXT = "Создать ссылку"
+LOBBY_SHARE_CONTACT_BUTTON_TEXT = "Поделиться контактом"
+LOBBY_START_BUTTON_TEXT = "Старт"
+LOBBY_INVITE_INSTRUCTION = (
+    "Пригласите друзей в игру: используйте кнопки ниже, чтобы выбрать контакт "
+    "или создать ссылку."
+)
 
 MAX_LOBBY_PLAYERS = 6
 
@@ -1810,22 +1823,146 @@ def _assign_join_code(game_state: GameState) -> str:
     raise RuntimeError("Не удалось сгенерировать код присоединения")
 
 
+def _find_existing_join_code(game_state: GameState) -> str | None:
+    for existing_code, target in game_state.join_codes.items():
+        if target == game_state.game_id:
+            return existing_code
+    for existing_code, target in state.join_codes.items():
+        if target == game_state.game_id:
+            return existing_code
+    return None
+
+
+def _ensure_user_store_for(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> dict:
+    application = getattr(context, "application", None)
+    container = getattr(application, "user_data", None)
+    if isinstance(container, MutableMapping):
+        store = container.get(user_id)
+        if not isinstance(store, dict):
+            store = {}
+            container[user_id] = store
+        return store
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        return user_data
+    fresh: dict = {}
+    if hasattr(context, "user_data"):
+        setattr(context, "user_data", fresh)
+    return fresh
+
+
+def _update_host_pending_invite(
+    context: ContextTypes.DEFAULT_TYPE,
+    host_id: int,
+    game_id: str,
+    request_id: int,
+    join_code: str | None,
+) -> None:
+    store = _ensure_user_store_for(context, host_id)
+    pending = store.get("pending_invite")
+    if not isinstance(pending, dict) or pending.get("game_id") != game_id:
+        pending = {}
+    pending["game_id"] = game_id
+    pending["request_id"] = request_id
+    if join_code:
+        pending["code"] = join_code
+    else:
+        pending.pop("code", None)
+    store["pending_invite"] = pending
+
+
+def _build_lobby_invite_keyboard(request_id: int) -> ReplyKeyboardMarkup:
+    request_button_kwargs = {
+        "text": LOBBY_INVITE_BUTTON_TEXT,
+        _KEYBOARD_REQUEST_USER_KWARG: KeyboardButtonRequestUser(
+            request_id=request_id,
+            user_is_bot=False,
+        ),
+    }
+    rows = [
+        [KeyboardButton(**request_button_kwargs)],
+        [KeyboardButton(text=LOBBY_LINK_BUTTON_TEXT)],
+        [KeyboardButton(text=LOBBY_START_BUTTON_TEXT)],
+        [
+            KeyboardButton(
+                text=LOBBY_SHARE_CONTACT_BUTTON_TEXT,
+                request_contact=True,
+            )
+        ],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+async def _send_lobby_invite_controls(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    force: bool = False,
+    text: str | None = None,
+) -> int | None:
+    if game_state.status != "lobby":
+        return None
+    host_id = getattr(game_state, "host_id", None)
+    if host_id is None:
+        return None
+    player = game_state.players.get(host_id)
+    dm_chat_id = None
+    if player and player.dm_chat_id is not None:
+        dm_chat_id = player.dm_chat_id
+    if dm_chat_id is None:
+        dm_chat_id = _lookup_player_chat(host_id)
+    if dm_chat_id is None:
+        dm_chat_id = host_id
+    request_id = state.lobby_invite_requests.get(game_state.game_id)
+    should_send = force or request_id is None
+    if request_id is None or force:
+        request_id = secrets.randbits(32) or 1
+    keyboard = _build_lobby_invite_keyboard(request_id)
+    message_text = text or LOBBY_INVITE_INSTRUCTION
+    sent_message_id: int | None = None
+    if should_send:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=dm_chat_id,
+                text=message_text,
+                reply_markup=keyboard,
+            )
+        except Forbidden:
+            logger.debug(
+                "Unable to deliver invite controls to host %s for game %s",
+                host_id,
+                game_state.game_id,
+            )
+            return None
+        except TelegramError:
+            logger.exception(
+                "Failed to deliver invite controls for game %s",
+                game_state.game_id,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "Unexpected error while sending invite controls for game %s",
+                game_state.game_id,
+            )
+            return None
+        sent_message_id = getattr(sent, "message_id", None)
+        state.lobby_invite_requests[game_state.game_id] = request_id
+    join_code = _find_existing_join_code(game_state)
+    _update_host_pending_invite(context, host_id, game_state.game_id, request_id, join_code)
+    return sent_message_id
+
+
 def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
-    invite_button = InlineKeyboardButton(
-        text="Пригласить из контактов",
-        callback_data=f"{LOBBY_INVITE_CALLBACK_PREFIX}{game_state.game_id}",
-    )
-    link_button = InlineKeyboardButton(
-        text="Создать ссылку",
-        callback_data=f"{LOBBY_LINK_CALLBACK_PREFIX}{game_state.game_id}",
-    )
     has_min_players = len(game_state.players) >= 2
     if has_min_players:
         start_callback = f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}"
     else:
         start_callback = f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}"
     start_button = InlineKeyboardButton(text="Старт", callback_data=start_callback)
-    rows = [[invite_button, link_button], [start_button]]
+    rows = [[start_button]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1861,15 +1998,35 @@ async def _publish_lobby_message(
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
     if _is_private_multiplayer(game_state):
+        host_chat_id: int | None = None
+        host_id = getattr(game_state, "host_id", None)
+        if host_id is not None:
+            host_player = game_state.players.get(host_id)
+            if host_player and host_player.dm_chat_id is not None:
+                host_chat_id = host_player.dm_chat_id
+            else:
+                host_chat_id = _lookup_player_chat(host_id) or host_id
+        invite_message_id = await _send_lobby_invite_controls(
+            context,
+            game_state,
+            text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
+        )
+        mapping: dict[int, int] = {}
+        if host_chat_id is not None and invite_message_id is not None:
+            mapping[host_chat_id] = invite_message_id
+        exclude = {host_chat_id} if host_chat_id is not None else set()
         broadcast = await _broadcast_to_players(
             context,
             game_state,
             text,
             reply_markup=keyboard,
             collect_message_ids=True,
+            exclude_chat_ids=exclude,
         )
         if broadcast and broadcast.message_ids:
-            state.lobby_messages[game_state.game_id] = dict(broadcast.message_ids)
+            mapping.update(broadcast.message_ids)
+        if mapping:
+            state.lobby_messages[game_state.game_id] = mapping
         else:
             state.lobby_messages.pop(game_state.game_id, None)
         return
@@ -1881,6 +2038,7 @@ async def _publish_lobby_message(
         **_thread_kwargs(game_state),
     )
     state.lobby_messages[game_state.game_id] = {chat_id: sent.message_id}
+    await _send_lobby_invite_controls(context, game_state)
 
 
 async def _update_lobby_message(
@@ -1897,8 +2055,16 @@ async def _update_lobby_message(
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
     expected_chats: set[int] = set()
+    host_chat_id: int | None = None
     if _is_private_multiplayer(game_state):
         expected_chats = {chat_id for _, chat_id in _iter_player_dm_chats(game_state)}
+        host_id = getattr(game_state, "host_id", None)
+        if host_id is not None:
+            host_player = game_state.players.get(host_id)
+            if host_player and host_player.dm_chat_id is not None:
+                host_chat_id = host_player.dm_chat_id
+            else:
+                host_chat_id = _lookup_player_chat(host_id) or host_id
     else:
         expected_chats = {game_state.chat_id}
     existing_chats = set(entry)
@@ -1908,11 +2074,16 @@ async def _update_lobby_message(
             entry.pop(chat_id, None)
             continue
         try:
+            message_text = text
+            markup = keyboard
+            if host_chat_id is not None and chat_id == host_chat_id:
+                message_text = f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}"
+                markup = None
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
+                text=message_text,
+                reply_markup=markup,
             )
         except TelegramError:
             logger.exception(
@@ -1924,6 +2095,16 @@ async def _update_lobby_message(
             missing_chats.add(chat_id)
     if _is_private_multiplayer(game_state):
         if missing_chats:
+            if host_chat_id is not None and host_chat_id in missing_chats:
+                invite_message_id = await _send_lobby_invite_controls(
+                    context,
+                    game_state,
+                    text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
+                    force=True,
+                )
+                if invite_message_id is not None:
+                    entry[host_chat_id] = invite_message_id
+                missing_chats.discard(host_chat_id)
             broadcast = await _broadcast_to_players(
                 context,
                 game_state,
@@ -1937,6 +2118,7 @@ async def _update_lobby_message(
         return
     if missing_chats:
         await _publish_lobby_message(context, game_state)
+    await _send_lobby_invite_controls(context, game_state)
 
 
 async def _run_lobby_puzzle_generation(
@@ -4529,70 +4711,6 @@ async def join_name_response_handler(
 
 
 @command_entrypoint()
-async def lobby_invite_callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    _normalise_thread_id(update)
-    query = update.callback_query
-    if query is None or not query.data:
-        return
-    if not query.data.startswith(LOBBY_INVITE_CALLBACK_PREFIX):
-        return
-    game_id = query.data[len(LOBBY_INVITE_CALLBACK_PREFIX) :]
-    game_state = _load_state_by_game_id(game_id)
-    if not game_state or game_state.status != "lobby":
-        await query.answer("Лобби недоступно.", show_alert=True)
-        return
-    user = update.effective_user
-    if user is None:
-        return
-    dm_chat_id = _lookup_player_chat(user.id) or user.id
-    text = (
-        "Выберите контакт, которому хотите отправить приглашение, или поделитесь ссылкой"
-        " через кнопку «Создать ссылку»."
-    )
-    request_id = secrets.randbits(32) or 1
-    request_button_kwargs = {
-        "text": "Выбрать пользователя",
-        _KEYBOARD_REQUEST_USER_KWARG: KeyboardButtonRequestUser(
-            request_id=request_id,
-            user_is_bot=False,
-        ),
-    }
-    keyboard = ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(**request_button_kwargs)],
-            [KeyboardButton(text="Поделиться контактом", request_contact=True)],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=dm_chat_id,
-            text=text,
-            reply_markup=keyboard,
-        )
-    except Forbidden:
-        await query.answer(
-            "Не могу отправить сообщение — напишите боту в личном чате.",
-            show_alert=True,
-        )
-        return
-    user_data = getattr(context, "user_data", None)
-    if not isinstance(user_data, dict):
-        user_data = {}
-        setattr(context, "user_data", user_data)
-    pending_invite = {"game_id": game_state.game_id, "request_id": request_id}
-    for existing_code, target in game_state.join_codes.items():
-        if target == game_state.game_id:
-            pending_invite["code"] = existing_code
-            break
-    user_data["pending_invite"] = pending_invite
-    await query.answer("Открыл меню приглашений в личном чате.")
-
-
-@command_entrypoint()
 async def lobby_contact_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -4619,43 +4737,57 @@ async def lobby_contact_handler(
     contact = message.contact
     if shared_user is None and contact is None:
         return
-    user_data = getattr(context, "user_data", None)
-    if isinstance(user_data, dict):
-        pending = user_data.pop("pending_invite", None)
+    user_store = _ensure_user_store_for(context, user.id)
+    pending = user_store.get("pending_invite")
+    if isinstance(pending, dict):
+        expected_request_id = pending.get("request_id")
+        game_id = pending.get("game_id")
+        code_hint = pending.get("code")
     else:
         pending = None
-    if not isinstance(pending, dict):
-        await message.reply_text(
-            "Приглашение не найдено. Откройте меню лобби ещё раз.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    expected_request_id = pending.get("request_id")
-    game_id = pending.get("game_id")
-    code_hint = pending.get("code")
-    if not game_id:
-        await message.reply_text(
-            "Не удалось определить игру для приглашения. Попробуйте снова из лобби.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        expected_request_id = None
+        game_id = None
+        code_hint = None
+    if not game_id or expected_request_id is None:
+        fallback_state = _find_turn_game_for_private_chat(chat.id, user.id)
+        invite_id: int | None = None
+        if fallback_state:
+            invite_id = await _send_lobby_invite_controls(
+                context, fallback_state, force=True
+            )
+        if invite_id is not None:
+            refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
+            reply_markup = (
+                _build_lobby_invite_keyboard(refreshed_request)
+                if refreshed_request is not None
+                else None
+            )
+            await message.reply_text(
+                "Обновил клавиатуру приглашений. Попробуйте снова.",
+                reply_markup=reply_markup,
+            )
+        else:
+            await message.reply_text(
+                "Приглашение не найдено. Откройте меню лобби ещё раз.",
+            )
         return
     game_state = _load_state_by_game_id(game_id)
     if not game_state or game_state.status != "lobby":
         await message.reply_text(
             "Лобби больше недоступно. Создайте новое приглашение.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_keyboard,
         )
         return
     if user.id != game_state.host_id:
         await message.reply_text(
             "Только создатель комнаты может отправлять приглашения.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_keyboard,
         )
         return
     if len(game_state.players) >= MAX_LOBBY_PLAYERS:
         await message.reply_text(
             "Достигнут лимит игроков в этой комнате (6).",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_keyboard,
         )
         return
     target_user_id: int | None = None
@@ -4668,7 +4800,7 @@ async def lobby_contact_handler(
         ):
             await message.reply_text(
                 "Запрос устарел. Откройте меню лобби ещё раз.",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=reply_keyboard,
             )
             return
         target_user_id = getattr(shared_user, "user_id", None)
@@ -4706,23 +4838,20 @@ async def lobby_contact_handler(
     if target_user_id == user.id:
         await message.reply_text(
             "Нельзя отправить приглашение самому себе.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_keyboard,
         )
         return
     if target_user_id and target_user_id in game_state.players:
         await message.reply_text(
             "Этот игрок уже участвует в игре.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_keyboard,
         )
         return
     join_code: str | None = None
     if isinstance(code_hint, str) and game_state.join_codes.get(code_hint) == game_state.game_id:
         join_code = code_hint
     if join_code is None:
-        for existing_code, target in game_state.join_codes.items():
-            if target == game_state.game_id:
-                join_code = existing_code
-                break
+        join_code = _find_existing_join_code(game_state)
     generated_code = False
     if join_code is None:
         try:
@@ -4731,13 +4860,24 @@ async def lobby_contact_handler(
         except RuntimeError:
             await message.reply_text(
                 "Не удалось сгенерировать код присоединения. Попробуйте ещё раз позже.",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=reply_keyboard,
             )
             return
     needs_store = generated_code or state.join_codes.get(join_code) != game_state.game_id
     if needs_store:
         game_state.join_codes[join_code] = game_state.game_id
         _store_state(game_state)
+    pending = user_store.get("pending_invite") if isinstance(user_store, dict) else pending
+    if isinstance(pending, dict):
+        pending["code"] = join_code
+        user_store["pending_invite"] = pending
+    _update_host_pending_invite(
+        context,
+        user.id,
+        game_state.game_id,
+        expected_request_id,
+        join_code,
+    )
     link = await _build_join_link(context, join_code)
     inviter_name = _user_display_name(user)
     lobby_theme = game_state.theme or "без темы"
@@ -4794,7 +4934,128 @@ async def lobby_contact_handler(
         host_reply_lines.append(f"Ссылка: {link}")
     await message.reply_text(
         "\n".join(host_reply_lines),
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=reply_keyboard,
+    )
+
+
+@command_entrypoint()
+async def lobby_link_message_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    if chat.type != ChatType.PRIVATE:
+        return
+    text = (message.text or "").strip()
+    if text != LOBBY_LINK_BUTTON_TEXT:
+        return
+    user_store = _ensure_user_store_for(context, user.id)
+    pending = user_store.get("pending_invite")
+    if isinstance(pending, dict):
+        request_id = pending.get("request_id")
+        game_id = pending.get("game_id")
+        code_hint = pending.get("code")
+    else:
+        request_id = None
+        game_id = None
+        code_hint = None
+    if not game_id or request_id is None:
+        fallback_state = _find_turn_game_for_private_chat(chat.id, user.id)
+        invite_id: int | None = None
+        if fallback_state:
+            invite_id = await _send_lobby_invite_controls(
+                context, fallback_state, force=True
+            )
+        if invite_id is not None:
+            refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
+            reply_markup = (
+                _build_lobby_invite_keyboard(refreshed_request)
+                if refreshed_request is not None
+                else None
+            )
+            await message.reply_text(
+                "Обновил клавиатуру приглашений. Используйте кнопки ниже.",
+                reply_markup=reply_markup,
+            )
+        else:
+            await message.reply_text(
+                "Приглашение не найдено. Откройте меню лобби ещё раз.",
+            )
+        return
+    game_state = _load_state_by_game_id(game_id)
+    if (
+        not game_state
+        or game_state.status != "lobby"
+        or user.id != game_state.host_id
+    ):
+        fallback_state = _find_turn_game_for_private_chat(chat.id, user.id)
+        invite_id: int | None = None
+        if fallback_state:
+            invite_id = await _send_lobby_invite_controls(
+                context, fallback_state, force=True
+            )
+        if invite_id is not None:
+            refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
+            reply_markup = (
+                _build_lobby_invite_keyboard(refreshed_request)
+                if refreshed_request is not None
+                else None
+            )
+            await message.reply_text(
+                "Обновил клавиатуру приглашений. Используйте кнопки ниже.",
+                reply_markup=reply_markup,
+            )
+        else:
+            await message.reply_text(
+                "Приглашение не найдено. Откройте меню лобби ещё раз.",
+            )
+        return
+    reply_keyboard = _build_lobby_invite_keyboard(request_id)
+    join_code: str | None = None
+    if (
+        isinstance(code_hint, str)
+        and game_state.join_codes.get(code_hint) == game_state.game_id
+    ):
+        join_code = code_hint
+    if join_code is None:
+        join_code = _find_existing_join_code(game_state)
+    generated_code = False
+    if join_code is None:
+        try:
+            join_code = _assign_join_code(game_state)
+            generated_code = True
+        except RuntimeError:
+            await message.reply_text(
+                "Не удалось сгенерировать код присоединения. Попробуйте ещё раз позже.",
+                reply_markup=reply_keyboard,
+            )
+            return
+    needs_store = generated_code or state.join_codes.get(join_code) != game_state.game_id
+    if needs_store:
+        game_state.join_codes[join_code] = game_state.game_id
+        _store_state(game_state)
+    pending = user_store.get("pending_invite")
+    if isinstance(pending, dict):
+        pending["code"] = join_code
+        user_store["pending_invite"] = pending
+    _update_host_pending_invite(
+        context,
+        user.id,
+        game_state.game_id,
+        request_id,
+        join_code,
+    )
+    link = await _build_join_link(context, join_code)
+    parts = [f"Код для присоединения: {join_code}"]
+    if link:
+        parts.append(f"Ссылка: {link}")
+    await message.reply_text(
+        "\n".join(parts),
+        reply_markup=reply_keyboard,
     )
 
 
@@ -4816,7 +5077,10 @@ async def lobby_link_callback_handler(
     try:
         code = _assign_join_code(game_state)
     except RuntimeError:
-        await query.answer("Не удалось создать новый код. Попробуйте ещё раз позже.", show_alert=True)
+        await query.answer(
+            "Не удалось создать новый код. Попробуйте ещё раз позже.",
+            show_alert=True,
+        )
         return
     _store_state(game_state)
     link = await _build_join_link(context, code)
@@ -4824,6 +5088,18 @@ async def lobby_link_callback_handler(
     if user is None:
         return
     dm_chat_id = _lookup_player_chat(user.id) or user.id
+    request_id = state.lobby_invite_requests.get(game_state.game_id)
+    if request_id is None:
+        request_id = secrets.randbits(32) or 1
+        state.lobby_invite_requests[game_state.game_id] = request_id
+    _update_host_pending_invite(
+        context,
+        user.id,
+        game_state.game_id,
+        request_id,
+        code,
+    )
+    reply_markup = _build_lobby_invite_keyboard(request_id)
     parts = [f"Код для присоединения: {code}"]
     if link:
         parts.append(f"Ссылка: {link}")
@@ -4831,7 +5107,7 @@ async def lobby_link_callback_handler(
         await context.bot.send_message(
             chat_id=dm_chat_id,
             text="\n".join(parts),
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_markup,
         )
     except Forbidden:
         await query.answer(
@@ -4851,111 +5127,48 @@ async def lobby_start_callback_handler(
     if query is None or not query.data:
         return
     data = query.data
-    if data.startswith(LOBBY_WAIT_CALLBACK_PREFIX):
-        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
-        return
     if not data.startswith(LOBBY_START_CALLBACK_PREFIX):
         return
     game_id = data[len(LOBBY_START_CALLBACK_PREFIX) :]
     game_state = _load_state_by_game_id(game_id)
-    if not game_state or game_state.status != "lobby":
-        await query.answer("Игра уже запущена или недоступна.", show_alert=True)
-        return
-    query_answered = False
-    if len(game_state.players) < 2:
-        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
-        await _update_lobby_message(context, game_state)
-        return
     user = update.effective_user
-    if not user or user.id != game_state.host_id:
-        await query.answer("Только создатель комнаты может начинать игру.", show_alert=True)
+    if not game_state or user is None:
+        await query.answer("Лобби недоступно.", show_alert=True)
         return
-    puzzle = _load_puzzle_for_state(game_state)
-    if puzzle is None:
-        language = game_state.language
-        theme = game_state.theme
-        if not language or not theme:
-            await query.answer("Сначала выберите язык и тему.", show_alert=True)
-            return
-        generation_task = state.lobby_generation_tasks.get(game_state.game_id)
-        if generation_task and generation_task.done():
-            state.lobby_generation_tasks.pop(game_state.game_id, None)
-            generation_task = None
-        if generation_task is None:
-            await _send_generation_notice_to_game(
-                context,
-                game_state,
-                "Готовим кроссворд, это может занять немного времени...",
-                message=query.message,
-            )
-            generation_task = asyncio.create_task(
-                _run_lobby_puzzle_generation(context, game_state.game_id, language, theme)
-            )
-            state.lobby_generation_tasks[game_state.game_id] = generation_task
-        await query.answer("Кроссворд готовится, это может занять немного времени.")
-        query_answered = True
-        try:
-            await generation_task
-        except asyncio.CancelledError:
-            logger.info("Lobby puzzle generation cancelled while starting game %s", game_id)
-            return
-        except Exception:
-            logger.exception("Unexpected error while awaiting lobby generation for %s", game_id)
-            await _send_game_message(
-                context,
-                game_state,
-                "Не удалось подготовить кроссворд. Попробуйте начать позже.",
-            )
-            return
-        refreshed_state = _load_state_by_game_id(game_id)
-        if refreshed_state is None or refreshed_state.puzzle_id == "":
-            await _send_game_message(
-                context,
-                game_state,
-                "Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
-            )
-            return
-        game_state = refreshed_state
-        puzzle = _load_puzzle_for_state(game_state)
-        if puzzle is None:
-            await _send_game_message(
-                context,
-                game_state,
-                "Не удалось загрузить кроссворд. Попробуйте позже.",
-            )
-            return
-    players_sorted = sorted(
-        game_state.players.values(), key=lambda player: player.joined_at
-    )
-    if len(players_sorted) < 2:
-        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
-        await _update_lobby_message(context, game_state)
-        return
-    game_state.turn_order = [player.user_id for player in players_sorted]
-    game_state.turn_index = 0
-    game_state.status = "running"
-    game_state.active_slot_id = None
-    game_state.started_at = time.time()
-    game_state.last_update = time.time()
-    for player in players_sorted:
-        game_state.scoreboard[player.user_id] = 0
-        player.answers_ok = 0
-        player.answers_fail = 0
-    _schedule_game_timers(context, game_state)
-    _store_state(game_state)
-    state.lobby_messages.pop(game_state.game_id, None)
-    if not query_answered:
-        await query.answer("Игра начинается!")
-    await _send_game_message(
+    await _process_lobby_start(
         context,
         game_state,
-        "Игра началась! Ходы идут по очереди.",
+        user,
+        trigger_query=query,
+        trigger_message=query.message,
     )
-    await _announce_turn(
+
+
+@command_entrypoint()
+async def lobby_start_button_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None:
+        return
+    if chat.type != ChatType.PRIVATE:
+        return
+    if (message.text or "").strip() != LOBBY_START_BUTTON_TEXT:
+        return
+    game_state = _load_state_for_chat(chat.id)
+    if game_state is None or game_state.mode == "single":
+        game_state = _find_turn_game_for_private_chat(chat.id, user.id)
+    if not game_state:
+        await message.reply_text("Лобби не найдено. Создайте новую игру.")
+        return
+    await _process_lobby_start(
         context,
         game_state,
-        puzzle,
-        prefix=f"Первым ходит {players_sorted[0].name}!",
+        user,
+        trigger_message=message,
     )
 
 
@@ -6393,6 +6606,22 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(
         MessageHandler(
+            filters.TEXT
+            & filters.Regex(fr"^{re.escape(LOBBY_LINK_BUTTON_TEXT)}$"),
+            lobby_link_message_handler,
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & filters.Regex(fr"^{re.escape(LOBBY_START_BUTTON_TEXT)}$"),
+            lobby_start_button_handler,
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
+        MessageHandler(
             filters.TEXT & filters.REPLY & ~filters.COMMAND,
             join_name_response_handler,
             block=False,
@@ -6419,20 +6648,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         CallbackQueryHandler(
             completion_callback_handler,
             pattern=fr"^{COMPLETION_CALLBACK_PREFIX}",
-        )
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            lobby_invite_callback_handler,
-            pattern=fr"^{LOBBY_INVITE_CALLBACK_PREFIX}.*",
-            block=False,
-        )
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            lobby_link_callback_handler,
-            pattern=fr"^{LOBBY_LINK_CALLBACK_PREFIX}.*",
-            block=False,
         )
     )
     telegram_application.add_handler(
@@ -6694,4 +6909,122 @@ async def reset_webhook(
 
 
 __all__ = ["app"]
+
+async def _process_lobby_start(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    user: User,
+    *,
+    trigger_query=None,
+    trigger_message: Message | None = None,
+) -> None:
+    async def respond(text: str, *, alert: bool = False) -> None:
+        if trigger_query is not None:
+            await trigger_query.answer(text, show_alert=alert)
+        elif trigger_message is not None:
+            await trigger_message.reply_text(text)
+
+    if game_state.status != "lobby":
+        await respond("Игра уже запущена или недоступна.", alert=True)
+        return
+    if len(game_state.players) < 2:
+        await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
+        await _update_lobby_message(context, game_state)
+        return
+    if not user or user.id != game_state.host_id:
+        await respond("Только создатель комнаты может начинать игру.", alert=True)
+        return
+
+    puzzle = _load_puzzle_for_state(game_state)
+    query_answered = False
+    if puzzle is None:
+        language = game_state.language
+        theme = game_state.theme
+        if not language or not theme:
+            await respond("Сначала выберите язык и тему.", alert=True)
+            return
+        generation_task = state.lobby_generation_tasks.get(game_state.game_id)
+        if generation_task and generation_task.done():
+            state.lobby_generation_tasks.pop(game_state.game_id, None)
+            generation_task = None
+        if generation_task is None:
+            await _send_generation_notice_to_game(
+                context,
+                game_state,
+                "Готовим кроссворд, это может занять немного времени...",
+                message=trigger_message,
+            )
+            generation_task = asyncio.create_task(
+                _run_lobby_puzzle_generation(context, game_state.game_id, language, theme)
+            )
+            state.lobby_generation_tasks[game_state.game_id] = generation_task
+        await respond("Кроссворд готовится, это может занять немного времени.")
+        query_answered = True
+        try:
+            await generation_task
+        except asyncio.CancelledError:
+            logger.info("Lobby puzzle generation cancelled while starting game %s", game_state.game_id)
+            return
+        except Exception:
+            logger.exception("Unexpected error while awaiting lobby generation for %s", game_state.game_id)
+            await _send_game_message(
+                context,
+                game_state,
+                "Не удалось подготовить кроссворд. Попробуйте начать позже.",
+            )
+            return
+        refreshed_state = _load_state_by_game_id(game_state.game_id)
+        if refreshed_state is None or refreshed_state.puzzle_id == "":
+            await _send_game_message(
+                context,
+                game_state,
+                "Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
+            )
+            return
+        game_state = refreshed_state
+        puzzle = _load_puzzle_for_state(game_state)
+        if puzzle is None:
+            await _send_game_message(
+                context,
+                game_state,
+                "Не удалось загрузить кроссворд. Попробуйте позже.",
+            )
+            return
+
+    players_sorted = sorted(
+        game_state.players.values(), key=lambda player: player.joined_at
+    )
+    if len(players_sorted) < 2:
+        await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
+        await _update_lobby_message(context, game_state)
+        return
+    game_state.turn_order = [player.user_id for player in players_sorted]
+    game_state.turn_index = 0
+    game_state.status = "running"
+    game_state.active_slot_id = None
+    game_state.started_at = time.time()
+    game_state.last_update = time.time()
+    for player in players_sorted:
+        game_state.scoreboard[player.user_id] = 0
+        player.answers_ok = 0
+        player.answers_fail = 0
+    _schedule_game_timers(context, game_state)
+    _store_state(game_state)
+    state.lobby_messages.pop(game_state.game_id, None)
+    if trigger_query is not None and not query_answered:
+        await trigger_query.answer("Игра начинается!")
+    elif trigger_query is None:
+        await respond("Игра начинается!")
+    await _send_game_message(
+        context,
+        game_state,
+        "Игра началась! Ходы идут по очереди.",
+    )
+    await _announce_turn(
+        context,
+        game_state,
+        puzzle,
+        prefix=f"Первым ходит {players_sorted[0].name}!",
+    )
+
 
