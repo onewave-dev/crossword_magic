@@ -4604,7 +4604,18 @@ async def lobby_contact_handler(
         return
     if chat.type != ChatType.PRIVATE:
         return
-    shared_user = message.user_shared
+    shared_user = getattr(message, "user_shared", None)
+    shared_request_id = getattr(shared_user, "request_id", None)
+    if shared_user is None:
+        users_shared = getattr(message, "users_shared", None)
+        if users_shared is not None:
+            shared_users_list = getattr(users_shared, "users", None) or []
+            first_shared_user = shared_users_list[0] if shared_users_list else None
+            if first_shared_user is not None:
+                shared_user = first_shared_user
+                shared_request_id = getattr(first_shared_user, "request_id", None)
+                if shared_request_id is None:
+                    shared_request_id = getattr(users_shared, "request_id", None)
     contact = message.contact
     if shared_user is None and contact is None:
         return
@@ -4652,14 +4663,15 @@ async def lobby_contact_handler(
     if shared_user is not None:
         if (
             expected_request_id is not None
-            and shared_user.request_id != expected_request_id
+            and shared_request_id is not None
+            and shared_request_id != expected_request_id
         ):
             await message.reply_text(
                 "Запрос устарел. Откройте меню лобби ещё раз.",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
-        target_user_id = shared_user.user_id
+        target_user_id = getattr(shared_user, "user_id", None)
         if target_user_id:
             try:
                 shared_chat = await context.bot.get_chat(target_user_id)
