@@ -867,6 +867,93 @@ async def test_join_code_limits_players(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_join_name_accepts_plain_text_with_pending(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-510, puzzle)
+    game_state.status = "lobby"
+    host = game_state.players[game_state.host_id]
+    host.dm_chat_id = 1001
+    pending_game_id = "roompending001"
+
+    def fake_load_state(game_id: str):
+        return game_state if game_id == pending_game_id else None
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", fake_load_state)
+
+    registrations: list[tuple[int, int]] = []
+
+    def fake_register_player_chat(user_id: int, dm_chat_id: int) -> None:
+        registrations.append((user_id, dm_chat_id))
+
+    monkeypatch.setattr(app, "_register_player_chat", fake_register_player_chat)
+
+    added_players: list[Player] = []
+
+    def fake_ensure_player_entry(
+        state_obj: GameState, tg_user, name: str, dm_chat_id: int
+    ) -> Player:
+        player = Player(user_id=tg_user.id, name=name, dm_chat_id=dm_chat_id)
+        state_obj.players[player.user_id] = player
+        added_players.append(player)
+        return player
+
+    monkeypatch.setattr(app, "_ensure_player_entry", fake_ensure_player_entry)
+
+    stored_states: list[GameState] = []
+
+    def fake_store_state(state_obj: GameState) -> None:
+        stored_states.append(state_obj)
+
+    monkeypatch.setattr(app, "_store_state", fake_store_state)
+
+    broadcasts: list[tuple] = []
+
+    async def fake_broadcast(context_obj, state_obj: GameState, text: str) -> None:
+        broadcasts.append((context_obj, state_obj, text))
+
+    monkeypatch.setattr(app, "_broadcast_to_players", fake_broadcast)
+
+    lobby_updates: list[tuple] = []
+
+    async def fake_update_lobby(context_obj, state_obj: GameState) -> None:
+        lobby_updates.append((context_obj, state_obj))
+
+    monkeypatch.setattr(app, "_update_lobby_message", fake_update_lobby)
+
+    chat = SimpleNamespace(id=3030, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        text="Новый игрок",
+        reply_text=AsyncMock(),
+        reply_to_message=None,
+    )
+    user = SimpleNamespace(id=9999, full_name="Новый игрок")
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(
+        bot=SimpleNamespace(id=123456),
+        chat_data={},
+        user_data={"pending_join": {"game_id": pending_game_id, "code": "ROOM01"}},
+    )
+
+    await app.join_name_response_handler(update, context)
+
+    assert context.user_data.get("player_name") == "Новый игрок"
+    assert "pending_join" not in context.user_data
+    assert added_players and added_players[0].name == "Новый игрок"
+    assert registrations == [(user.id, chat.id)]
+    assert stored_states == [game_state]
+    assert broadcasts and broadcasts[0][1] is game_state
+    assert "Новый игрок" in broadcasts[0][2]
+    assert lobby_updates == [(context, game_state)]
+    message.reply_text.assert_awaited_once()
+    assert game_state.players[user.id].dm_chat_id == chat.id
+
+
+@pytest.mark.anyio
 async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(-550, puzzle)
