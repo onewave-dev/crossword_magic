@@ -776,7 +776,16 @@ def _iter_player_dm_chats(game_state: GameState) -> list[tuple[int | None, int]]
             continue
         seen.add(player.dm_chat_id)
         chats.append((player.user_id, player.dm_chat_id))
+    include_group_chat = False
+    host_id = game_state.host_id
+    if host_id is not None:
+        host_player = game_state.players.get(host_id)
+        if host_player is None or host_player.dm_chat_id is None:
+            include_group_chat = True
     if not chats:
+        include_group_chat = True
+    if include_group_chat and game_state.chat_id not in seen:
+        seen.add(game_state.chat_id)
         chats.append((None, game_state.chat_id))
     return chats
 
