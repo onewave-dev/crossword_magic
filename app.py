@@ -933,6 +933,38 @@ def _update_dm_mappings(game_state: GameState) -> None:
         state.player_chats[player.user_id] = player.dm_chat_id
 
 
+def _select_preferred_restored_states(
+    restored_games: Mapping[str, GameState]
+) -> tuple[dict[int, GameState], list[GameState]]:
+    """Select a single restored state per chat, preferring multiplayer lobbies."""
+
+    states_by_chat: dict[int, list[GameState]] = {}
+    for game_state in restored_games.values():
+        states_by_chat.setdefault(game_state.chat_id, []).append(game_state)
+
+    preferred_by_chat: dict[int, GameState] = {}
+    helper_states: list[GameState] = []
+    for chat_id, candidates in states_by_chat.items():
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda game: getattr(game, "last_update", 0.0),
+            reverse=True,
+        )
+        preferred = next(
+            (game for game in candidates_sorted if game.mode != "single"),
+            candidates_sorted[0],
+        )
+        preferred_by_chat[chat_id] = preferred
+        if any(game.mode != "single" for game in candidates_sorted):
+            for candidate in candidates_sorted:
+                if candidate is preferred:
+                    continue
+                if candidate.mode == "single":
+                    helper_states.append(candidate)
+
+    return preferred_by_chat, helper_states
+
+
 @dataclass(slots=True)
 class BroadcastResult:
     successful_chats: set[int]
@@ -6852,17 +6884,38 @@ async def app_lifespan(_: FastAPI) -> AsyncIterator[None]:
     ensure_storage_directories()
 
     restored_games = load_all_states()
-    state.active_games = restored_games
-    state.chat_to_game = {game_state.chat_id: game_id for game_id, game_state in restored_games.items()}
+    preferred_by_chat, helper_states_to_prune = _select_preferred_restored_states(
+        restored_games
+    )
+
+    helper_game_ids = {helper.game_id for helper in helper_states_to_prune}
+    for helper_state in helper_states_to_prune:
+        logger.info(
+            "Discarding stale single-player helper for chat %s (game %s)",
+            helper_state.chat_id,
+            helper_state.game_id,
+        )
+        delete_state(helper_state.game_id)
+        if helper_state.chat_id != helper_state.game_id:
+            delete_state(helper_state.chat_id)
+
+    state.active_games = {
+        game_id: game_state
+        for game_id, game_state in restored_games.items()
+        if game_id not in helper_game_ids
+    }
+    state.chat_to_game = {
+        chat_id: game_state.game_id for chat_id, game_state in preferred_by_chat.items()
+    }
     state.dm_chat_to_game = {}
     state.player_chats = {}
     state.join_codes = {}
-    for game_state in restored_games.values():
+    for game_state in state.active_games.values():
         for code, target in game_state.join_codes.items():
             state.join_codes[code] = target
         _update_dm_mappings(game_state)
-    if restored_games:
-        logger.info("Restored %s active game states", len(restored_games))
+    if state.active_games:
+        logger.info("Restored %s active game states", len(state.active_games))
     else:
         logger.debug("No persisted game states found during startup")
 
