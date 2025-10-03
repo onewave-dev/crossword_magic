@@ -1357,6 +1357,12 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         _apply_answer_to_state(game_state, slot_ref, attempt_answer)
         game_state.active_slot_id = None
         _store_state(game_state)
+        display_answer = _canonical_answer(attempt_answer, puzzle.language)
+        success_caption = (
+            f"Верно! {info_prefix} - {slot_ref.public_id}: {display_answer}"
+        )
+        if SCORE_PER_WORD:
+            success_caption += f" (+{SCORE_PER_WORD} очков)"
         try:
             image_path = render_puzzle(puzzle, game_state)
             with open(image_path, "rb") as photo:
@@ -1365,14 +1371,14 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
                 context,
                 game_state,
                 photo_bytes,
-                caption=f"Верно! {slot_ref.public_id}",
+                caption=success_caption,
                 exclude_chat_ids={game_state.chat_id},
             )
             try:
                 await context.bot.send_photo(
                     chat_id=game_state.chat_id,
                     photo=photo_bytes,
-                    caption=f"Верно! {slot_ref.public_id}",
+                    caption=success_caption,
                     **_thread_kwargs(game_state),
                 )
             except Exception:  # noqa: BLE001
@@ -1380,14 +1386,12 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
                     "Failed to send puzzle image to primary chat for game %s",
                     game_state.game_id,
                 )
+                await _broadcast_with_primary(success_caption)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to render updated grid after dummy correct answer"
             )
-        success_text = (
-            f"{info_prefix} разгадал {slot_ref.public_id}! (+{SCORE_PER_WORD} очков)"
-        )
-        await _broadcast_with_primary(success_text)
+            await _broadcast_with_primary(success_caption)
         if _all_slots_solved(puzzle, game_state):
             await _finish_game(
                 context,
