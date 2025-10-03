@@ -202,6 +202,7 @@ class AppState:
         self.join_codes: dict[str, str] = {}
         self.generating_chats: set[int] = set()
         self.lobby_messages: dict[str, dict[int, int]] = {}
+        self.lobby_host_invites: dict[str, tuple[int, int]] = {}
         self.lobby_invite_requests: dict[str, int] = {}
         self.scheduled_jobs: dict[str, Job] = {}
         self.lobby_generation_tasks: dict[str, asyncio.Task[None]] = {}
@@ -239,6 +240,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
                 if target == game_id:
                     state.join_codes.pop(code, None)
             state.lobby_messages.pop(game_id, None)
+            state.lobby_host_invites.pop(game_id, None)
             state.lobby_invite_requests.pop(game_id, None)
             if puzzle_id:
                 delete_puzzle(puzzle_id)
@@ -257,6 +259,7 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
             if target == str(chat_id):
                 state.join_codes.pop(code, None)
         state.lobby_messages.pop(str(chat_id), None)
+        state.lobby_host_invites.pop(str(chat_id), None)
         state.lobby_invite_requests.pop(str(chat_id), None)
         if puzzle_id:
             delete_puzzle(puzzle_id)
@@ -293,6 +296,7 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
             if state.player_chats.get(player.user_id) == player.dm_chat_id:
                 state.player_chats.pop(player.user_id, None)
         state.lobby_messages.pop(game_state.game_id, None)
+        state.lobby_host_invites.pop(game_state.game_id, None)
         state.lobby_invite_requests.pop(game_state.game_id, None)
         if game_state.puzzle_id:
             delete_puzzle(game_state.puzzle_id)
@@ -1950,6 +1954,11 @@ async def _send_lobby_invite_controls(
             return None
         sent_message_id = getattr(sent, "message_id", None)
         state.lobby_invite_requests[game_state.game_id] = request_id
+        if sent_message_id is not None:
+            state.lobby_host_invites[game_state.game_id] = (
+                dm_chat_id,
+                sent_message_id,
+            )
     join_code = _find_existing_join_code(game_state)
     _update_host_pending_invite(context, host_id, game_state.game_id, request_id, join_code)
     return sent_message_id
@@ -2006,14 +2015,12 @@ async def _publish_lobby_message(
                 host_chat_id = host_player.dm_chat_id
             else:
                 host_chat_id = _lookup_player_chat(host_id) or host_id
-        invite_message_id = await _send_lobby_invite_controls(
+        await _send_lobby_invite_controls(
             context,
             game_state,
             text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
         )
         mapping: dict[int, int] = {}
-        if host_chat_id is not None and invite_message_id is not None:
-            mapping[host_chat_id] = invite_message_id
         exclude = {host_chat_id} if host_chat_id is not None else set()
         broadcast = await _broadcast_to_players(
             context,
@@ -2054,17 +2061,33 @@ async def _update_lobby_message(
         return
     keyboard = _build_lobby_keyboard(game_state)
     text = _format_lobby_text(game_state)
-    expected_chats: set[int] = set()
+    host_id = getattr(game_state, "host_id", None)
+    stored_invite = state.lobby_host_invites.get(game_state.game_id)
+    previous_host_chat_id: int | None = None
+    previous_host_message_id: int | None = None
+    if isinstance(stored_invite, tuple) and len(stored_invite) == 2:
+        previous_host_chat_id, previous_host_message_id = stored_invite
     host_chat_id: int | None = None
+    if host_id is not None:
+        host_player = game_state.players.get(host_id)
+        if host_player and host_player.dm_chat_id is not None:
+            host_chat_id = host_player.dm_chat_id
+        else:
+            host_chat_id = _lookup_player_chat(host_id)
+            if host_chat_id is None:
+                host_chat_id = host_id
+    elif previous_host_chat_id is not None:
+        host_chat_id = previous_host_chat_id
     if _is_private_multiplayer(game_state):
-        expected_chats = {chat_id for _, chat_id in _iter_player_dm_chats(game_state)}
-        host_id = getattr(game_state, "host_id", None)
-        if host_id is not None:
-            host_player = game_state.players.get(host_id)
-            if host_player and host_player.dm_chat_id is not None:
-                host_chat_id = host_player.dm_chat_id
-            else:
-                host_chat_id = _lookup_player_chat(host_id) or host_id
+        expected_chats = {
+            chat_id
+            for user_id, chat_id in _iter_player_dm_chats(game_state)
+            if host_id is None or user_id != host_id
+        }
+        if previous_host_chat_id is not None:
+            entry.pop(previous_host_chat_id, None)
+        if host_chat_id is not None:
+            entry.pop(host_chat_id, None)
     else:
         expected_chats = {game_state.chat_id}
     existing_chats = set(entry)
@@ -2074,16 +2097,11 @@ async def _update_lobby_message(
             entry.pop(chat_id, None)
             continue
         try:
-            message_text = text
-            markup = keyboard
-            if host_chat_id is not None and chat_id == host_chat_id:
-                message_text = f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}"
-                markup = None
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=message_text,
-                reply_markup=markup,
+                text=text,
+                reply_markup=keyboard,
             )
         except TelegramError:
             logger.exception(
@@ -2094,23 +2112,43 @@ async def _update_lobby_message(
             entry.pop(chat_id, None)
             missing_chats.add(chat_id)
     if _is_private_multiplayer(game_state):
-        if missing_chats:
-            if host_chat_id is not None and host_chat_id in missing_chats:
-                invite_message_id = await _send_lobby_invite_controls(
-                    context,
-                    game_state,
-                    text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
-                    force=True,
+        new_invite_message_id: int | None = None
+        if host_chat_id is not None:
+            new_invite_message_id = await _send_lobby_invite_controls(
+                context,
+                game_state,
+                text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
+                force=True,
+            )
+            if (
+                new_invite_message_id is not None
+                and previous_host_message_id is not None
+                and previous_host_chat_id is not None
+                and (
+                    previous_host_chat_id != host_chat_id
+                    or previous_host_message_id != new_invite_message_id
                 )
-                if invite_message_id is not None:
-                    entry[host_chat_id] = invite_message_id
-                missing_chats.discard(host_chat_id)
+            ):
+                try:
+                    await context.bot.delete_message(
+                        chat_id=previous_host_chat_id,
+                        message_id=previous_host_message_id,
+                    )
+                except TelegramError:
+                    logger.debug(
+                        "Failed to delete previous host invite message for game %s",
+                        game_state.game_id,
+                    )
+        if missing_chats:
             broadcast = await _broadcast_to_players(
                 context,
                 game_state,
                 text,
                 reply_markup=keyboard,
-                exclude_chat_ids=set(entry),
+                exclude_chat_ids=(
+                    set(entry)
+                    | ({host_chat_id} if host_chat_id is not None else set())
+                ),
                 collect_message_ids=True,
             )
             if broadcast and broadcast.message_ids:
@@ -2118,7 +2156,35 @@ async def _update_lobby_message(
         return
     if missing_chats:
         await _publish_lobby_message(context, game_state)
-    await _send_lobby_invite_controls(context, game_state)
+    new_invite_message_id: int | None = None
+    if host_chat_id is not None:
+        new_invite_message_id = await _send_lobby_invite_controls(
+            context,
+            game_state,
+            text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
+            force=True,
+        )
+    if (
+        new_invite_message_id is not None
+        and previous_host_message_id is not None
+        and previous_host_chat_id is not None
+        and (
+            previous_host_chat_id != host_chat_id
+            or previous_host_message_id != new_invite_message_id
+        )
+    ):
+        try:
+            await context.bot.delete_message(
+                chat_id=previous_host_chat_id,
+                message_id=previous_host_message_id,
+            )
+        except TelegramError:
+            logger.debug(
+                "Failed to delete previous host invite message for game %s",
+                game_state.game_id,
+            )
+    if missing_chats:
+        return
 
 
 async def _run_lobby_puzzle_generation(
@@ -3866,6 +3932,7 @@ async def _start_new_group_game(
     game_id = uuid4().hex if is_private_lobby else str(chat.id)
 
     state.lobby_messages.pop(game_id, None)
+    state.lobby_host_invites.pop(game_id, None)
     context.chat_data.pop("lobby_message_id", None)
 
     now = time.time()
@@ -5240,6 +5307,7 @@ async def _launch_admin_test_game(
     _register_player_chat(admin_id, dm_chat_id)
     set_chat_mode(context, MODE_IN_GAME)
     state.lobby_messages.pop(base_state.game_id, None)
+    state.lobby_host_invites.pop(base_state.game_id, None)
     _store_state(admin_state)
     _schedule_game_timers(context, admin_state)
     _store_state(admin_state)
@@ -7011,6 +7079,7 @@ async def _process_lobby_start(
     _schedule_game_timers(context, game_state)
     _store_state(game_state)
     state.lobby_messages.pop(game_state.game_id, None)
+    state.lobby_host_invites.pop(game_state.game_id, None)
     if trigger_query is not None and not query_answered:
         await trigger_query.answer("Игра начинается!")
     elif trigger_query is None:
