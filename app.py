@@ -600,6 +600,7 @@ INLINE_ANSWER_PATTERN = re.compile(
 COMPLETION_CALLBACK_PREFIX = "complete:"
 SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
 NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
+MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
 NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
 NEW_GAME_MODE_SOLO = f"{NEW_GAME_MENU_CALLBACK_PREFIX}solo"
@@ -1653,30 +1654,32 @@ async def _finish_game(
         lines.append("")
         lines.append(f"<i>{html.escape(dummy_summary)}</i>")
     lines.append("")
-    lines.append("Спасибо за игру! Хотите реванш? Используйте кнопки ниже или команду /new.")
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Реванш",
-                    callback_data=f"{SAME_TOPIC_CALLBACK_PREFIX}{game_state.puzzle_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Новая игра",
-                    callback_data=f"{NEW_PUZZLE_CALLBACK_PREFIX}{game_state.puzzle_id}",
-                )
-            ],
-        ]
+    lines.append(
+        "Спасибо за игру! Выберите, что делать дальше — кнопки ниже помогут продолжить."
     )
-    await _broadcast_to_players(
+    text = "\n".join(lines)
+    keyboard = _build_completion_keyboard(puzzle)
+    broadcast = await _broadcast_to_players(
         context,
         game_state,
-        "\n".join(lines),
+        text,
         parse_mode=constants.ParseMode.HTML,
         reply_markup=keyboard,
     )
+    if game_state.chat_id not in broadcast.successful_chats:
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=text,
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=keyboard,
+                **_thread_kwargs(game_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to deliver completion summary to primary chat for game %s",
+                game_state.game_id,
+            )
     _store_state(game_state)
 
 
@@ -1747,7 +1750,9 @@ async def _finish_single_game(
                 f"<code>{html.escape(slot_id)}</code> — <b>{html.escape(answer)}</b>"
             )
     lines.append("")
-    lines.append("🔁 Готовы к новому раунду? Используйте кнопки ниже или отправьте /new.")
+    lines.append(
+        "🔁 Готовы продолжить? Выберите действие с помощью кнопок ниже или отправьте /new."
+    )
 
     text = "\n".join(lines)
 
@@ -2435,12 +2440,19 @@ async def _send_clues_update(
 def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboardMarkup:
     same_topic_data = f"{SAME_TOPIC_CALLBACK_PREFIX}{puzzle.id}"
     new_puzzle_data = f"{NEW_PUZZLE_CALLBACK_PREFIX}{puzzle.id}"
+    menu_data = f"{MENU_CALLBACK_PREFIX}{puzzle.id}"
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Еще один кроссворд на эту же тему",
+                    "Начать новую игру с теми же участниками",
                     callback_data=same_topic_data,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "В меню",
+                    callback_data=menu_data,
                 )
             ],
             [
@@ -2539,7 +2551,7 @@ async def _send_completion_options(
     puzzle: Puzzle | CompositePuzzle,
 ) -> None:
     keyboard = _build_completion_keyboard(puzzle)
-    text = "Продолжить?"
+    text = "Что дальше? Выберите действие:"  
     if message is not None:
         await message.reply_text(text, reply_markup=keyboard)
         return
@@ -3799,6 +3811,68 @@ def _reset_new_game_context(
         context.user_data.pop("pending_join", None)
 
 
+def _build_start_menu_keyboard(
+    is_admin: bool, target_chat_id: int
+) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Отгадывать одному", callback_data=NEW_GAME_MODE_SOLO)],
+        [InlineKeyboardButton("Играть с друзьями", callback_data=NEW_GAME_MODE_GROUP)],
+    ]
+    if is_admin:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "[адм.] Тестовая сессия",
+                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{target_chat_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_start_menu_text(is_admin: bool) -> str:
+    lines = [
+        "<b>Привет! 👋</b>",
+        "Вы попали к боту <b>«Кроссворды»</b>. Выберите режим ниже.",
+        "<b>Выберите, как хотите играть:</b>",
+        "",
+        "<b>Доступные варианты:</b>",
+        "▫️ <b>Одиночная игра</b> — бот подготовит личный кроссворд.",
+        "▫️ <b>Игра с друзьями</b> — создадим комнату для совместной игры.",
+    ]
+    if is_admin:
+        lines.append(
+            "▫️ <b>[адм.] Тестовая сессия</b> — копия текущей игры для проверки."
+        )
+    lines.extend([
+        "",
+        "<i>Нажмите кнопку, чтобы начать.</i>",
+    ])
+    return "\n".join(lines)
+
+
+async def _send_start_menu_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Chat | None,
+    message: Message | None,
+    *,
+    is_admin: bool,
+) -> None:
+    target_chat_id = chat.id if chat else 0
+    keyboard = _build_start_menu_keyboard(is_admin, target_chat_id)
+    text = _format_start_menu_text(is_admin)
+    kwargs = {
+        "reply_markup": keyboard,
+        "disable_web_page_preview": True,
+        "parse_mode": constants.ParseMode.HTML,
+    }
+    if message is not None:
+        await message.reply_text(text, **kwargs)
+        return
+    if chat is not None:
+        await context.bot.send_message(chat_id=chat.id, text=text, **kwargs)
+
+
 @command_entrypoint(fallback=ConversationHandler.END)
 async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _normalise_thread_id(update)
@@ -3818,46 +3892,11 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     admin_id = settings.admin_id if settings else None
     is_admin = user is not None and admin_id is not None and user.id == admin_id
 
-    keyboard_rows = [
-        [InlineKeyboardButton("Отгадывать одному", callback_data=NEW_GAME_MODE_SOLO)],
-        [InlineKeyboardButton("Играть с друзьями", callback_data=NEW_GAME_MODE_GROUP)],
-    ]
-    if is_admin:
-        target_chat_id = chat.id if chat else 0
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    "[адм.] Тестовая сессия",
-                    callback_data=f"{ADMIN_TEST_GAME_CALLBACK_PREFIX}{target_chat_id}",
-                )
-            ]
-        )
-
-    description_lines = [
-        "<b>Привет! 👋</b>",
-        "Вы попали к боту <b>«Кроссворды»</b>. Выберите режим ниже.",
-        "<b>Выберите, как хотите играть:</b>",
-        "",
-        "<b>Доступные варианты:</b>",
-        "▫️ <b>Одиночная игра</b> — бот подготовит личный кроссворд.",
-        "▫️ <b>Игра с друзьями</b> — создадим комнату для совместной игры.",
-    ]
-    if is_admin:
-        description_lines.append(
-            "▫️ <b>[адм.] Тестовая сессия</b> — копия текущей игры для проверки."
-        )
-    description_lines.extend(
-        [
-            "",
-            "<i>Нажмите кнопку, чтобы начать.</i>",
-        ]
-    )
-
-    await message.reply_text(
-        "\n".join(description_lines),
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
-        disable_web_page_preview=True,
-        parse_mode=constants.ParseMode.HTML,
+    await _send_start_menu_prompt(
+        context,
+        chat,
+        message,
+        is_admin=is_admin,
     )
 
     return MENU_STATE
@@ -6176,6 +6215,30 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             )
             context.chat_data["reminder_job"] = job
         _clear_generation_notice(context, chat.id)
+        return
+
+    if data.startswith(MENU_CALLBACK_PREFIX):
+        logger.info("Chat %s requested return to main menu via completion", chat.id)
+        _cancel_reminder(context)
+        if isinstance(getattr(context, "chat_data", None), dict):
+            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
+        _clear_generation_notice(context, chat.id)
+        game_state = _load_state_for_chat(chat.id)
+        if game_state is not None:
+            _cleanup_game_state(game_state)
+        else:
+            _cleanup_chat_resources(chat.id)
+        set_chat_mode(context, MODE_IDLE)
+        settings = state.settings
+        admin_id = settings.admin_id if settings else None
+        user = update.effective_user
+        is_admin = user is not None and admin_id is not None and user.id == admin_id
+        await _send_start_menu_prompt(
+            context,
+            chat,
+            message,
+            is_admin=is_admin,
+        )
         return
 
     if data.startswith(NEW_PUZZLE_CALLBACK_PREFIX):
