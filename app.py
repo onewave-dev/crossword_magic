@@ -53,7 +53,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 
 USER_SHARED_FILTER = getattr(filters.StatusUpdate, "USER_SHARED", None)
 if USER_SHARED_FILTER is None:  # pragma: no cover - compatibility shim
@@ -4983,6 +4983,17 @@ async def lobby_contact_handler(
         except Forbidden:
             error_message = (
                 "Не удалось отправить приглашение: бот ещё не общался с этим пользователем."
+            )
+        except BadRequest as exc:
+            logger.warning(
+                "Failed to deliver contact invite for game %s to %s: %s",
+                game_state.game_id,
+                target_user_id,
+                exc,
+            )
+            error_message = (
+                "Бот не может отправить приглашение этому пользователю, пока он не начнёт чат с ботом. "
+                "Попросите игрока открыть диалог с ботом, нажать «Start» и повторить попытку."
             )
         except TelegramError:
             logger.exception(

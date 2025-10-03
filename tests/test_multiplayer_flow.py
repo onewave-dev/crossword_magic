@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from telegram import InlineKeyboardMarkup, constants
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 from telegram.ext import ConversationHandler
 
 import app
@@ -1024,6 +1025,71 @@ async def test_lobby_contact_handler_uses_reply_keyboard(monkeypatch, fresh_stat
     bot.send_message.assert_awaited_once()
     host_call = message.reply_text.await_args
     assert "Код для подключения: XYZ123" in host_call.args[0]
+    assert host_call.kwargs.get("reply_markup") is not None
+
+
+@pytest.mark.anyio
+async def test_lobby_contact_handler_explains_bad_request(monkeypatch, fresh_state):
+    host_id = 111
+    game_id = "lobby111"
+    request_id = 222
+    chat = SimpleNamespace(id=555, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        user_shared=SimpleNamespace(user_id=777, request_id=request_id),
+        users_shared=None,
+        contact=None,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=host_id, full_name="Организатор"),
+    )
+    bot = SimpleNamespace(
+        get_chat=AsyncMock(return_value=SimpleNamespace(full_name="Участник")),
+        send_message=AsyncMock(side_effect=BadRequest("Chat not found")),
+    )
+    application = SimpleNamespace(user_data={})
+    context = SimpleNamespace(
+        application=application,
+        bot=bot,
+        bot_data={},
+        chat_data={},
+    )
+    user_store = app._ensure_user_store_for(context, host_id)
+    user_store["pending_invite"] = {
+        "request_id": request_id,
+        "game_id": game_id,
+        "code": None,
+    }
+    game_state = GameState(
+        chat_id=-900,
+        puzzle_id="puzzle",
+        host_id=host_id,
+        game_id=game_id,
+        mode="turn_based",
+        status="lobby",
+        players={host_id: Player(user_id=host_id, name="Организатор", dm_chat_id=chat.id)},
+    )
+    state.active_games[game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_id
+
+    def fake_assign(gs: GameState) -> str:
+        gs.join_codes["JOIN42"] = gs.game_id
+        return "JOIN42"
+
+    monkeypatch.setattr(app, "_assign_join_code", fake_assign)
+    monkeypatch.setattr(app, "_store_state", lambda gs: state.active_games.__setitem__(gs.game_id, gs))
+    monkeypatch.setattr(app, "_build_join_link", AsyncMock(return_value=None))
+
+    await app.lobby_contact_handler(update, context)
+
+    bot.send_message.assert_awaited_once()
+    host_call = message.reply_text.await_args
+    host_message = host_call.args[0]
+    assert "бот не может отправить приглашение" in host_message.lower()
+    assert "Код для подключения: JOIN42" in host_message
     assert host_call.kwargs.get("reply_markup") is not None
 
 
