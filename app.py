@@ -4796,10 +4796,15 @@ async def join_name_response_handler(
     if chat.type != ChatType.PRIVATE:
         return
     pending = context.user_data.get("pending_join")
-    if not isinstance(pending, dict):
-        return
     reply = message.reply_to_message
-    if reply is None or reply.from_user is None or reply.from_user.id != context.bot.id:
+    bot_id = getattr(getattr(context, "bot", None), "id", None)
+    if not isinstance(pending, dict):
+        if (
+            reply is None
+            or reply.from_user is None
+            or (bot_id is not None and reply.from_user.id != bot_id)
+        ):
+            return
         return
     game_id = pending.get("game_id")
     if not game_id:
@@ -6776,7 +6781,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(
         MessageHandler(
-            filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            filters.TEXT & ~filters.COMMAND,
             join_name_response_handler,
             block=False,
         )
