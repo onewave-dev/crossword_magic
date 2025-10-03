@@ -4806,16 +4806,16 @@ async def lobby_contact_handler(
         return
     user_store = _ensure_user_store_for(context, user.id)
     pending = user_store.get("pending_invite")
+    expected_request_id: int | None = None
+    game_id: str | None = None
+    code_hint: str | None = None
     if isinstance(pending, dict):
         expected_request_id = pending.get("request_id")
         game_id = pending.get("game_id")
         code_hint = pending.get("code")
     else:
         pending = None
-        expected_request_id = None
-        game_id = None
-        code_hint = None
-        reply_keyboard = (
+    reply_keyboard = (
         _build_lobby_invite_keyboard(expected_request_id)
         if expected_request_id is not None
         else None

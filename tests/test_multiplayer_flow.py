@@ -965,6 +965,69 @@ async def test_lobby_link_callback_sends_code(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_lobby_contact_handler_uses_reply_keyboard(monkeypatch, fresh_state):
+    host_id = 321
+    game_id = "lobby321"
+    request_id = 987
+    chat = SimpleNamespace(id=999, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        user_shared=SimpleNamespace(user_id=654, request_id=request_id),
+        users_shared=None,
+        contact=None,
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=host_id, full_name="Хост", username="host"),
+    )
+    bot = SimpleNamespace(
+        get_chat=AsyncMock(return_value=SimpleNamespace(full_name="Игрок")),
+        send_message=AsyncMock(),
+    )
+    application = SimpleNamespace(user_data={})
+    context = SimpleNamespace(
+        application=application,
+        bot=bot,
+        bot_data={},
+        chat_data={},
+    )
+    user_store = app._ensure_user_store_for(context, host_id)
+    user_store["pending_invite"] = {
+        "request_id": request_id,
+        "game_id": game_id,
+        "code": None,
+    }
+    game_state = GameState(
+        chat_id=-500,
+        puzzle_id="puzzle",
+        host_id=host_id,
+        game_id=game_id,
+        mode="turn_based",
+        status="lobby",
+        players={host_id: Player(user_id=host_id, name="Хост", dm_chat_id=chat.id)},
+    )
+    state.active_games[game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_id
+
+    def fake_assign(gs: GameState) -> str:
+        gs.join_codes["XYZ123"] = gs.game_id
+        return "XYZ123"
+
+    monkeypatch.setattr(app, "_assign_join_code", fake_assign)
+    monkeypatch.setattr(app, "_store_state", lambda gs: state.active_games.__setitem__(gs.game_id, gs))
+    monkeypatch.setattr(app, "_build_join_link", AsyncMock(return_value="https://t.me/bot?start=join_XYZ123"))
+
+    await app.lobby_contact_handler(update, context)
+
+    bot.send_message.assert_awaited_once()
+    host_call = message.reply_text.await_args
+    assert "Код для подключения: XYZ123" in host_call.args[0]
+    assert host_call.kwargs.get("reply_markup") is not None
+
+
+@pytest.mark.anyio
 async def test_turn_based_rejects_non_current_answer(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(-600, puzzle)
