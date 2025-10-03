@@ -22,9 +22,11 @@ from app import (
     Settings,
     finish_command,
     hint_command,
+    inline_answer_handler,
     join_command,
     lobby_link_callback_handler,
     lobby_start_callback_handler,
+    lobby_start_button_handler,
     new_game_menu_admin_proxy_handler,
     new_game_menu_callback_handler,
     start_new_game,
@@ -958,6 +960,57 @@ async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_
     sent_chats = {call.kwargs["chat_id"] for call in send_message_mock.await_args_list}
     assert sent_chats == expected_dm_chats
     assert send_message_mock.await_count == len(expected_dm_chats)
+
+
+@pytest.mark.anyio
+async def test_lobby_start_button_triggers_start_without_inline_error(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-575, puzzle)
+    game_state.status = "lobby"
+
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+    host_dm_chat = game_state.players[game_state.host_id].dm_chat_id
+    state.dm_chat_to_game[host_dm_chat] = game_state.game_id
+
+    chat = SimpleNamespace(id=host_dm_chat, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text=app.LOBBY_START_BUTTON_TEXT,
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=77,
+    )
+    user = SimpleNamespace(id=game_state.host_id, full_name="Хост", username="host")
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(user_data={}, chat_data={}, bot=SimpleNamespace(), job_queue=None)
+
+    submission_mock = AsyncMock()
+    monkeypatch.setattr(app, "_handle_answer_submission", submission_mock)
+
+    def fake_load_state(chat_id: int):
+        if chat_id in {game_state.chat_id, host_dm_chat}:
+            return game_state
+        return None
+
+    monkeypatch.setattr(app, "_load_state_for_chat", fake_load_state)
+    process_mock = AsyncMock()
+    monkeypatch.setattr(app, "_process_lobby_start", process_mock)
+
+    await inline_answer_handler(update, context)
+
+    submission_mock.assert_not_awaited()
+    message.reply_text.assert_not_awaited()
+
+    await lobby_start_button_handler(update, context)
+
+    process_mock.assert_awaited_once()
+    args, kwargs = process_mock.await_args
+    assert args == (context, game_state, user)
+    assert kwargs == {"trigger_message": message}
 
 
 @pytest.mark.anyio

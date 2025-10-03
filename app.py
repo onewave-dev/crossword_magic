@@ -657,6 +657,13 @@ LOBBY_INVITE_INSTRUCTION = (
     "или создать ссылку."
 )
 
+LOBBY_CONTROL_CAPTIONS = {
+    LOBBY_INVITE_BUTTON_TEXT,
+    LOBBY_LINK_BUTTON_TEXT,
+    LOBBY_SHARE_CONTACT_BUTTON_TEXT,
+    LOBBY_START_BUTTON_TEXT,
+}
+
 MAX_LOBBY_PLAYERS = 6
 
 JOIN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -6125,6 +6132,18 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
             extra={
                 "chat_id": chat.id,
                 "message_id": message.message_id,
+            },
+        )
+        return
+
+    trimmed_text = raw_text.strip()
+    if trimmed_text in LOBBY_CONTROL_CAPTIONS:
+        logger.debug(
+            "Inline answer handler ignored lobby control caption",
+            extra={
+                "chat_id": chat.id,
+                "message_id": message.message_id,
+                "text": trimmed_text,
             },
         )
         return
