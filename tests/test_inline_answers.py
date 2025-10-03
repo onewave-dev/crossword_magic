@@ -13,6 +13,10 @@ from telegram.ext import ConversationHandler
 from app import (
     GENERATION_NOTICE_KEY,
     GENERATION_TOKEN_KEY,
+    LOBBY_INVITE_BUTTON_TEXT,
+    LOBBY_LINK_BUTTON_TEXT,
+    LOBBY_SHARE_CONTACT_BUTTON_TEXT,
+    LOBBY_START_BUTTON_TEXT,
     _parse_inline_answer,
     handle_theme,
     inline_answer_handler,
@@ -113,6 +117,37 @@ async def test_inline_handler_replies_when_parse_fails_with_active_game():
     reply_call = message.reply_text.await_args
     assert reply_call.args
     assert "A1 - слово" in reply_call.args[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "caption",
+    [
+        LOBBY_INVITE_BUTTON_TEXT,
+        LOBBY_LINK_BUTTON_TEXT,
+        LOBBY_SHARE_CONTACT_BUTTON_TEXT,
+        LOBBY_START_BUTTON_TEXT,
+    ],
+)
+async def test_inline_handler_ignores_lobby_control_captions(caption, monkeypatch):
+    chat = SimpleNamespace(id=777, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text=caption,
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        message_id=8,
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+    context = SimpleNamespace(user_data={}, chat_data={})
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: SimpleNamespace())
+    submission_mock = AsyncMock()
+    monkeypatch.setattr(app, "_handle_answer_submission", submission_mock)
+
+    await inline_answer_handler(update, context)
+
+    submission_mock.assert_not_awaited()
+    message.reply_text.assert_not_awaited()
 
 
 @pytest.mark.anyio
