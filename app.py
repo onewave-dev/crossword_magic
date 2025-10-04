@@ -4491,15 +4491,15 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if is_admin_flow:
             state.lobby_generation_tasks.pop(game_state.game_id, None)
             await message.reply_text(
-                "[адм.] Готовлю тестовый кроссворд, это может занять немного времени.",
-            )
-            await message.reply_text(
                 "\n".join(
                     [
                         "[адм.] Тестовая игра 1×1 запущена!",
                         f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
                     ]
                 )
+            )
+            await message.reply_text(
+                "[адм.] Готовлю тестовый кроссворд, это может занять немного времени.",
             )
             loop = asyncio.get_running_loop()
             puzzle: Puzzle | CompositePuzzle | None = None
