@@ -374,8 +374,9 @@ GENERATION_TYPING_ACTIONS = (
     constants.ChatAction.TYPING,
     constants.ChatAction.CHOOSE_STICKER,
 )
-GAME_TIME_LIMIT_SECONDS = 10 * 60
-GAME_WARNING_SECONDS = 60
+# Unlimited game duration; keep per-turn timers only.
+GAME_TIME_LIMIT_SECONDS = 0
+GAME_WARNING_SECONDS = 0
 TURN_TIME_LIMIT_SECONDS = 60
 TURN_WARNING_SECONDS = 15
 HINT_PENALTY = 1
@@ -1152,6 +1153,8 @@ def _schedule_game_timers(
     if job_queue is None:
         return
     _cancel_game_timers(game_state)
+    if GAME_TIME_LIMIT_SECONDS <= 0:
+        return
     data = {"game_id": game_state.game_id}
     if GAME_TIME_LIMIT_SECONDS > GAME_WARNING_SECONDS > 0:
         warn_name = f"game-warn-{game_state.game_id}"
@@ -1678,7 +1681,6 @@ async def _finish_game(
     revealed_now = _solve_remaining_slots(game_state, puzzle)
     unsolved_count = len(revealed_now)
     total_hints = _total_hint_usage(game_state)
-    duration_seconds = max(0.0, time.time() - game_state.started_at)
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
         logger.info(
             "Game finished: solved=%s/%s unsolved=%s hints=%s",
@@ -1704,7 +1706,6 @@ async def _finish_game(
     lines.append(f"• Слов разгадано: <b>{solved_before_count}</b> из {total_slots}")
     lines.append(f"• Осталось без ответа: <b>{unsolved_count}</b>")
     lines.append(f"• Подсказок использовано: <b>{total_hints}</b>")
-    lines.append(f"• Время: <b>{_format_duration(duration_seconds)}</b>")
     lines.append("")
     lines.append("🏆 <b>Лидерборд</b>")
     lines.append(summary)
@@ -1798,7 +1799,6 @@ async def _finish_single_game(
         if player_id is not None
         else game_state.score
     )
-    duration_seconds = max(0.0, time.time() - game_state.started_at)
     language_text = html.escape((puzzle.language or "?").upper())
     theme_text = html.escape(puzzle.theme or "Без темы")
     reason_line = (
@@ -1826,7 +1826,6 @@ async def _finish_single_game(
         f"• Слов разгадано: <b>{solved_before_count}</b> из {total_slots}",
         f"• Осталось без ответа: <b>{unsolved_count}</b>",
         f"• Подсказок использовано: <b>{total_hints}</b>",
-        f"• Время: <b>{_format_duration(duration_seconds)}</b>",
     ]
     if revealed_now:
         lines.append("")
