@@ -1647,7 +1647,7 @@ def _format_leaderboard(game_state: GameState) -> str:
         lines.append(
             f"{index}. <b>{display_name}</b> — {score} очков • ✅ {solved} • 💡 {hints}"
         )
-    return "<br/>".join(lines)
+    return "\n".join(lines)
 
 
 async def _finish_game(
