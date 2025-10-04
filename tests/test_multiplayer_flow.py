@@ -28,6 +28,7 @@ from app import (
     inline_answer_handler,
     join_command,
     button_language_handler,
+    button_theme_handler,
     lobby_link_callback_handler,
     lobby_start_callback_handler,
     lobby_start_button_handler,
@@ -469,6 +470,76 @@ async def test_join_name_after_button_flow_keeps_wrapper(monkeypatch, fresh_stat
     broadcast_mock.assert_awaited()
     update_mock.assert_awaited()
     assert stored_states and stored_states[-1] is game_state
+
+
+@pytest.mark.anyio
+async def test_button_language_ignores_during_pending_join(monkeypatch, fresh_state):
+    user_id = 9100
+    chat = SimpleNamespace(id=user_id, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, text="ru", reply_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    flow_state = {app.BUTTON_STEP_KEY: app.BUTTON_STEP_LANGUAGE}
+    user_store = {
+        app.BUTTON_NEW_GAME_KEY: flow_state,
+        "pending_join": {"game_id": "game-9100", "code": "WXYZ"},
+    }
+    context = SimpleNamespace(chat_data={}, user_data=user_store, bot=SimpleNamespace())
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _chat_id: None)
+
+    await button_language_handler(update, context)
+
+    message.reply_text.assert_not_awaited()
+    assert flow_state[app.BUTTON_STEP_KEY] == app.BUTTON_STEP_LANGUAGE
+    assert app.BUTTON_LANGUAGE_KEY not in flow_state
+    assert "new_game_language" not in user_store
+    assert "chat_mode" not in context.chat_data
+    assert "pending_join" in user_store
+
+
+@pytest.mark.anyio
+async def test_button_theme_ignores_during_pending_join(monkeypatch, fresh_state):
+    user_id = 9200
+    chat = SimpleNamespace(id=user_id, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, text="Space", reply_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    flow_state = {
+        app.BUTTON_STEP_KEY: app.BUTTON_STEP_THEME,
+        app.BUTTON_LANGUAGE_KEY: "ru",
+    }
+    user_store = {
+        app.BUTTON_NEW_GAME_KEY: flow_state,
+        "pending_join": {"game_id": "game-9200", "code": "ABCD"},
+        "new_game_language": "ru",
+    }
+    context = SimpleNamespace(
+        chat_data={},
+        user_data=user_store,
+        bot=SimpleNamespace(send_message=AsyncMock()),
+        job_queue=None,
+    )
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _chat_id: None)
+    send_notice_mock = AsyncMock()
+    generate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_send_generation_notice", send_notice_mock)
+    monkeypatch.setattr(app, "_run_generate_puzzle", generate_mock)
+
+    await button_theme_handler(update, context)
+
+    message.reply_text.assert_not_awaited()
+    send_notice_mock.assert_not_awaited()
+    generate_mock.assert_not_awaited()
+    assert flow_state[app.BUTTON_STEP_KEY] == app.BUTTON_STEP_THEME
+    assert user_store["new_game_language"] == "ru"
+    assert "chat_mode" not in context.chat_data
+    assert "pending_join" in user_store
 
 
 @pytest.mark.anyio

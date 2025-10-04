@@ -4467,6 +4467,15 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
     flow_state = _ensure_button_flow_state(context, chat)
     if flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
         return
+    user = getattr(update, "effective_user", None)
+    if user is not None:
+        user_store = _ensure_user_store_for(context, user.id)
+        if user_store.get("pending_join"):
+            logger.debug(
+                "Ignoring button language input for user %s while join pending",
+                user.id,
+            )
+            return
     language = message.text.strip().lower()
     if not language or not language.isalpha():
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
@@ -4771,6 +4780,15 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.effective_message
     if chat is None or message is None or not message.text:
         return
+    user = getattr(update, "effective_user", None)
+    if user is not None:
+        user_store = _ensure_user_store_for(context, user.id)
+        if user_store.get("pending_join"):
+            logger.debug(
+                "Ignoring button theme input for user %s while join pending",
+                user.id,
+            )
+            return
     if chat.type in GROUP_CHAT_TYPES:
         await handle_theme(update, context)
         flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
