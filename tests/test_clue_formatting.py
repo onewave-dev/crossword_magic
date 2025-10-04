@@ -2,7 +2,7 @@
 
 from utils.crossword import Cell, Direction, Puzzle, Slot, SlotRef
 
-from app import _format_clue_section, _format_clues_message
+from app import ANSWER_HELP_PROMPT, _format_clue_section, _format_clues_message
 
 
 def _build_puzzle_with_slots() -> Puzzle:
@@ -62,4 +62,7 @@ def test_format_clues_message_without_length_hint() -> None:
     message = _format_clues_message(puzzle)
 
     assert "(2)" not in message
-    assert message == "Across:\nA1: Across clue\n\nDown:\nD2: Down clue"
+    assert message == (
+        "Across:\nA1: Across clue\n\nDown:\nD2: Down clue\n\n"
+        f"{ANSWER_HELP_PROMPT}"
+    )

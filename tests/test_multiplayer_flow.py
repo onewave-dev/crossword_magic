@@ -11,6 +11,8 @@ from telegram.ext import ConversationHandler
 
 import app
 from app import (
+    ANSWER_HELP_CALLBACK_DATA,
+    ANSWER_HELP_PROMPT,
     HINT_PENALTY,
     LANGUAGE_STATE,
     LOBBY_START_CALLBACK_PREFIX,
@@ -1413,12 +1415,23 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     updated_clues = app._format_clues_message(puzzle, game_state)
     assert first_call.args[2] == updated_clues
     assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert ANSWER_HELP_PROMPT in updated_clues
+    first_markup = first_call.kwargs.get("reply_markup")
+    assert first_markup is not None
+    assert first_markup.to_dict()["inline_keyboard"] == [
+        [{"text": "Как отвечать?", "callback_data": ANSWER_HELP_CALLBACK_DATA}]
+    ]
     assert "Ход игрока" in second_call.args[2]
 
     send_calls = bot.send_message.await_args_list
     assert len(send_calls) >= 2
     assert send_calls[0].kwargs.get("text") == updated_clues
     assert send_calls[0].kwargs.get("parse_mode") == constants.ParseMode.HTML
+    markup = send_calls[0].kwargs.get("reply_markup")
+    assert markup is not None
+    assert markup.to_dict()["inline_keyboard"] == [
+        [{"text": "Как отвечать?", "callback_data": ANSWER_HELP_CALLBACK_DATA}]
+    ]
     assert "Ход игрока" in send_calls[1].kwargs.get("text", "")
 
     assert stored_states, "Game state should be stored after correct answer"
