@@ -1,6 +1,8 @@
 import asyncio
 import time
+from collections.abc import MutableMapping, Mapping
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -25,6 +27,7 @@ from app import (
     finish_command,
     inline_answer_handler,
     join_command,
+    button_language_handler,
     lobby_link_callback_handler,
     lobby_start_callback_handler,
     lobby_start_button_handler,
@@ -94,6 +97,26 @@ class DummyJobQueue:
 class FalseyJobQueue(DummyJobQueue):
     def __bool__(self) -> bool:
         return False
+
+
+class MappingWrapper(MutableMapping[str, Any]):
+    def __init__(self, initial: Mapping[str, Any] | None = None) -> None:
+        self._data: dict[str, Any] = dict(initial or {})
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._data[key]
+
+    def __iter__(self):  # noqa: ANN204 - required by MutableMapping
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 def _make_turn_puzzle() -> Puzzle:
@@ -371,6 +394,81 @@ async def test_join_command_invokes_process(monkeypatch, fresh_state):
     await join_command(update, context)
 
     process_mock.assert_awaited_once_with(update, context, "XYZ789")
+
+
+@pytest.mark.anyio
+async def test_join_name_after_button_flow_keeps_wrapper(monkeypatch, fresh_state):
+    user_id = 4242
+    chat = SimpleNamespace(id=user_id, type=ChatType.PRIVATE)
+    language_message = SimpleNamespace(
+        message_thread_id=None,
+        text="ru",
+        reply_text=AsyncMock(),
+    )
+    language_update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=language_message,
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    user_store = MappingWrapper()
+    pending_game_id = "game-4242"
+    user_store["pending_join"] = {"game_id": pending_game_id, "code": "ABCD"}
+    context = SimpleNamespace(
+        chat_data={},
+        user_data=user_store,
+        bot=SimpleNamespace(id=9000, username="bot"),
+    )
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _chat_id: None)
+
+    await button_language_handler(language_update, context)
+
+    assert "pending_join" in user_store, "button flow should not drop pending join"
+
+    game_state = GameState(
+        chat_id=-999,
+        puzzle_id="demo",
+        mode="turn_based",
+        status="lobby",
+        players={},
+        host_id=None,
+        game_id=pending_game_id,
+    )
+    state.active_games[game_state.game_id] = game_state
+
+    broadcast_mock = AsyncMock()
+    update_mock = AsyncMock()
+    stored_states: list[GameState] = []
+
+    def fake_store(stored: GameState) -> None:
+        stored_states.append(stored)
+        state.active_games[stored.game_id] = stored
+
+    monkeypatch.setattr(app, "_store_state", fake_store)
+    monkeypatch.setattr(app, "_broadcast_to_players", broadcast_mock)
+    monkeypatch.setattr(app, "_update_lobby_message", update_mock)
+
+    name_message = SimpleNamespace(
+        message_thread_id=None,
+        text="Игрок",
+        reply_text=AsyncMock(),
+        reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=context.bot.id)),
+    )
+    name_update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=name_message,
+        effective_user=SimpleNamespace(id=user_id, full_name="Игрок"),
+    )
+
+    await app.join_name_response_handler(name_update, context)
+
+    assert user_id in game_state.players
+    assert game_state.players[user_id].name == "Игрок"
+    assert "pending_join" not in user_store
+    assert user_store.get("player_name") == "Игрок"
+    name_message.reply_text.assert_awaited()
+    broadcast_mock.assert_awaited()
+    update_mock.assert_awaited()
+    assert stored_states and stored_states[-1] is game_state
 
 
 @pytest.mark.anyio
