@@ -623,6 +623,13 @@ SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
 NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
 MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
+ANSWER_HELP_CALLBACK_DATA = "answer_help"
+ANSWER_HELP_ALERT_TEXT = (
+    "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
+    "Если удобнее, можно пользоваться и командой /answer."
+)
+ANSWER_HELP_PROMPT = "Как отвечать? Нажмите кнопку ниже."
+
 NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
 NEW_GAME_MODE_SOLO = f"{NEW_GAME_MENU_CALLBACK_PREFIX}solo"
 NEW_GAME_MODE_GROUP = f"{NEW_GAME_MENU_CALLBACK_PREFIX}group"
@@ -2614,7 +2621,8 @@ def _format_clues_message(
                 f"Down:\n{_format_clue_section(down, solved_ids)}"
             )
             sections.append(section)
-        return "\n\n".join(sections)
+        body = "\n\n".join(sections)
+        return f"{body}\n\n{ANSWER_HELP_PROMPT}"
 
     across = [
         ref for ref in iter_slot_refs(puzzle) if ref.slot.direction is Direction.ACROSS
@@ -2624,7 +2632,36 @@ def _format_clues_message(
     ]
     across_text = _format_clue_section(across, solved_ids)
     down_text = _format_clue_section(down, solved_ids)
-    return f"Across:\n{across_text}\n\nDown:\n{down_text}"
+    body = f"Across:\n{across_text}\n\nDown:\n{down_text}"
+    return f"{body}\n\n{ANSWER_HELP_PROMPT}"
+
+
+def _build_answer_help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Как отвечать?",
+                    callback_data=ANSWER_HELP_CALLBACK_DATA,
+                )
+            ]
+        ]
+    )
+
+
+async def answer_help_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show instructions for submitting answers when help button is pressed."""
+
+    del context  # context is unused but kept for signature parity
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer(ANSWER_HELP_ALERT_TEXT, show_alert=True)
+    except TelegramError:  # pragma: no cover - network errors are logged elsewhere
+        logger.exception("Failed to send answer help alert")
 
 
 async def _broadcast_clues_message(
@@ -2637,12 +2674,14 @@ async def _broadcast_clues_message(
     """Broadcast formatted clues to players and the primary chat."""
 
     text = _format_clues_message(puzzle, game_state)
+    reply_markup = _build_answer_help_keyboard()
     try:
         broadcast = await _broadcast_to_players(
             context,
             game_state,
             text,
             parse_mode=constants.ParseMode.HTML,
+            reply_markup=reply_markup,
             exclude_chat_ids=exclude_chat_ids,
         )
     except Exception:  # noqa: BLE001
@@ -2660,6 +2699,7 @@ async def _broadcast_clues_message(
                 chat_id=game_state.chat_id,
                 text=text,
                 parse_mode=constants.ParseMode.HTML,
+                reply_markup=reply_markup,
                 **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
@@ -2730,7 +2770,11 @@ async def _send_clues_update(
                 extras.append("Очки: " + ", ".join(board_parts))
         if extras:
             text = f"{text}\n\n" + "\n".join(extras)
-    await message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+    await message.reply_text(
+        text,
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=_build_answer_help_keyboard(),
+    )
 
 
 def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboardMarkup:
@@ -3035,13 +3079,7 @@ async def _deliver_puzzle_via_bot(
                 chat_id=chat_id,
                 text=_format_clues_message(puzzle, game_state),
                 parse_mode=constants.ParseMode.HTML,
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
-                    "Если удобнее, можно пользоваться и командой /answer."
-                ),
+                reply_markup=_build_answer_help_keyboard(),
             )
             logger.info("Delivered freshly generated puzzle to chat %s", chat_id)
             return True
@@ -3941,6 +3979,7 @@ async def _start_new_private_game(
                     await message.reply_text(
                         _format_clues_message(puzzle, game_state),
                         parse_mode=constants.ParseMode.HTML,
+                        reply_markup=_build_answer_help_keyboard(),
                     )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to resend active puzzle to chat %s", chat_id)
@@ -5429,15 +5468,7 @@ async def _launch_admin_test_game(
             admin_state,
             clues_message,
             parse_mode=constants.ParseMode.HTML,
-            exclude_chat_ids={admin_state.chat_id},
-        )
-        await _broadcast_to_players(
-            context,
-            admin_state,
-            (
-                "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
-                "Если удобнее, можно пользоваться и командой /answer."
-            ),
+            reply_markup=_build_answer_help_keyboard(),
             exclude_chat_ids={admin_state.chat_id},
         )
 
@@ -5581,6 +5612,7 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text(
             _format_clues_message(puzzle, game_state),
             parse_mode=constants.ParseMode.HTML,
+            reply_markup=_build_answer_help_keyboard(),
         )
 
 
@@ -6738,6 +6770,13 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(
         CallbackQueryHandler(track_player_callback, pattern=".*", block=False),
         group=-1,
+    )
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            answer_help_callback_handler,
+            pattern=fr"^{ANSWER_HELP_CALLBACK_DATA}$",
+            block=False,
+        )
     )
     telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
