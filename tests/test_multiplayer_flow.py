@@ -11,8 +11,7 @@ from telegram.ext import ConversationHandler
 
 import app
 from app import (
-    ANSWER_HELP_CALLBACK_DATA,
-    ANSWER_HELP_PROMPT,
+    ANSWER_INSTRUCTIONS_TEXT,
     HINT_PENALTY,
     LANGUAGE_STATE,
     LOBBY_START_CALLBACK_PREFIX,
@@ -1384,7 +1383,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     monkeypatch.setattr(app, "_store_state", fake_store)
 
     broadcast_mock = AsyncMock(
-        side_effect=[app.BroadcastResult(successful_chats=set()) for _ in range(2)]
+        side_effect=[app.BroadcastResult(successful_chats=set()) for _ in range(3)]
     )
     monkeypatch.setattr(app, "_broadcast_to_players", broadcast_mock)
 
@@ -1408,31 +1407,26 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert broadcast_mock.await_count == 2
+    assert broadcast_mock.await_count == 3
     first_call = broadcast_mock.await_args_list[0]
     second_call = broadcast_mock.await_args_list[1]
+    third_call = broadcast_mock.await_args_list[2]
 
     updated_clues = app._format_clues_message(puzzle, game_state)
     assert first_call.args[2] == updated_clues
     assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
-    assert ANSWER_HELP_PROMPT in updated_clues
-    first_markup = first_call.kwargs.get("reply_markup")
-    assert first_markup is not None
-    assert first_markup.to_dict()["inline_keyboard"] == [
-        [{"text": "Как отвечать?", "callback_data": ANSWER_HELP_CALLBACK_DATA}]
-    ]
-    assert "Ход игрока" in second_call.args[2]
+    assert second_call.args[2] == ANSWER_INSTRUCTIONS_TEXT
+    assert "Ход игрока" in third_call.args[2]
 
     send_calls = bot.send_message.await_args_list
-    assert len(send_calls) >= 2
-    assert send_calls[0].kwargs.get("text") == updated_clues
-    assert send_calls[0].kwargs.get("parse_mode") == constants.ParseMode.HTML
-    markup = send_calls[0].kwargs.get("reply_markup")
-    assert markup is not None
-    assert markup.to_dict()["inline_keyboard"] == [
-        [{"text": "Как отвечать?", "callback_data": ANSWER_HELP_CALLBACK_DATA}]
-    ]
-    assert "Ход игрока" in send_calls[1].kwargs.get("text", "")
+    assert len(send_calls) >= 3
+    first_kwargs = send_calls[0].kwargs
+    assert first_kwargs.get("text") == updated_clues
+    assert first_kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert first_kwargs.get("reply_markup") is None
+    assert send_calls[1].kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
+    assert send_calls[1].kwargs.get("parse_mode") is None
+    assert "Ход игрока" in send_calls[2].kwargs.get("text", "")
 
     assert stored_states, "Game state should be stored after correct answer"
 
@@ -1526,17 +1520,20 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
 
     await app._announce_turn(context, game_state, puzzle)
 
-    assert announce_mock.await_count == 2
+    assert announce_mock.await_count == 3
     first_call = announce_mock.await_args_list[0]
     second_call = announce_mock.await_args_list[1]
+    third_call = announce_mock.await_args_list[2]
     assert first_call.kwargs.get("text") == app._format_clues_message(puzzle, game_state)
     assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
-    announce_kwargs = second_call.kwargs
+    assert second_call.kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
+    assert second_call.kwargs.get("parse_mode") is None
+    announce_kwargs = third_call.kwargs
     assert announce_kwargs["chat_id"] == chat_id
     assert "message_thread_id" not in announce_kwargs
     text = announce_kwargs.get("text", "")
     assert "Отправьте ответ прямо в чат" in text
-    assert "Как отвечать?" in text
+    assert "A1 - париж" in text
     assert "/answer" not in text
     assert announce_kwargs.get("reply_markup") is None
 
@@ -2272,9 +2269,15 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, fresh_sta
 
     assert attempted == [
         player.dm_chat_id,
+        player.dm_chat_id,
+        game_state.chat_id,
         game_state.chat_id,
         player.dm_chat_id,
         game_state.chat_id,
     ]
-    assert delivered == [game_state.chat_id, game_state.chat_id]
+    assert delivered == [
+        game_state.chat_id,
+        game_state.chat_id,
+        game_state.chat_id,
+    ]
 
