@@ -709,9 +709,9 @@ async def test_handle_theme_admin_test_launch(monkeypatch, fresh_state):
     assert result == ConversationHandler.END
     run_generate_mock.assert_awaited_once()
     assert message.reply_text.await_count == 2
-    wait_text, start_text = [call.args[0] for call in message.reply_text.await_args_list]
-    assert "Готовлю тестовый кроссворд" in wait_text
+    start_text, wait_text = [call.args[0] for call in message.reply_text.await_args_list]
     assert "Тестовая игра 1×1" in start_text
+    assert "Готовлю тестовый кроссворд" in wait_text
     send_calls = context.bot.send_message.await_args_list
     assert len(send_calls) == 0
     assert app.PENDING_ADMIN_TEST_KEY not in context.chat_data
