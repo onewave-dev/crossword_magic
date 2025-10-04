@@ -6585,15 +6585,13 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             )
             return
         puzzle = _load_puzzle_for_state(game_state)
+        language = puzzle.language if puzzle else None
+        theme = puzzle.theme if puzzle else None
         if puzzle is None:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text="Не удалось загрузить предыдущий кроссворд. Попробуйте начать новую игру командой /new.",
+                text="Не удалось загрузить предыдущий кроссворд. Подберём новый!",
             )
-            _cleanup_game_state(game_state)
-            return
-        language = puzzle.language
-        theme = puzzle.theme
         logger.info(
             "Chat %s requested another puzzle for same theme (%s, %s)",
             chat.id,
@@ -6607,74 +6605,58 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
             )
             return
         _cancel_reminder(context)
-        _cleanup_game_state(game_state)
-        set_chat_mode(context, MODE_AWAIT_THEME)
-        await _send_generation_notice(
-            context,
-            chat.id,
-            f"Готовлю новый кроссворд на тему «{theme}» на языке {language.upper()}...",
-        )
-        loop = asyncio.get_running_loop()
-        new_puzzle: Puzzle | CompositePuzzle | None = None
-        new_state: GameState | None = None
-        state.generating_chats.add(chat.id)
-        generation_token = secrets.token_hex(16)
-        context.chat_data[GENERATION_TOKEN_KEY] = generation_token
-        try:
-            new_puzzle, new_state = await _run_generate_puzzle(
-                loop,
-                chat.id,
-                language,
-                theme,
-                state.chat_threads.get(chat.id, 0),
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to regenerate puzzle for chat %s on same theme", chat.id
-            )
-            _cleanup_chat_resources(chat.id)
-            _clear_generation_notice(context, chat.id)
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже.",
-            )
-            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-            return
-        finally:
-            state.generating_chats.discard(chat.id)
-        stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
-        if stored_token != generation_token:
-            logger.info(
-                "Skipping completion delivery for chat %s due to cancellation",
-                chat.id,
-            )
-            set_chat_mode(context, MODE_IDLE)
-            if new_state is not None:
-                _cleanup_game_state(new_state)
-            _clear_generation_notice(context, chat.id)
-            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-            return
+        _cancel_turn_timers(game_state)
+        _cancel_game_timers(game_state)
+        _cancel_dummy_job(game_state)
+        _cancel_job(game_state.timer_job_id)
+        _cancel_job(game_state.warn_job_id)
+        game_state.timer_job_id = None
+        game_state.warn_job_id = None
+        previous_puzzle_id = game_state.puzzle_id
+        if previous_puzzle_id:
+            delete_puzzle(previous_puzzle_id)
+        game_state.puzzle_id = ""
+        game_state.puzzle_ids = None
+        game_state.filled_cells.clear()
+        game_state.solved_slots.clear()
+        game_state.hinted_cells = set()
+        game_state.hints_used.clear()
+        game_state.score = 0
+        game_state.scoreboard = {player_id: 0 for player_id in game_state.players}
+        game_state.turn_index = 0
+        game_state.active_slot_id = None
+        game_state.language = None
+        game_state.theme = None
+        game_state.last_update = time.time()
+        game_state.started_at = time.time()
+        game_state.dummy_turn_started_at = None
+        game_state.dummy_planned_delay = 0.0
+        game_state.dummy_turns = 0
+        game_state.dummy_successes = 0
+        game_state.dummy_failures = 0
+        game_state.dummy_total_delay = 0.0
+        if game_state.mode == "turn_based":
+            game_state.status = "lobby"
+        else:
+            game_state.status = "finished"
+        existing_task = state.lobby_generation_tasks.pop(game_state.game_id, None)
+        if existing_task is not None and not existing_task.done():
+            existing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await existing_task
+        _store_state(game_state)
         context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-        set_chat_mode(context, MODE_IN_GAME)
-        delivered = await _deliver_puzzle_via_bot(context, chat.id, new_puzzle, new_state)
-        if not delivered:
-            set_chat_mode(context, MODE_IDLE)
-            _cleanup_game_state(new_state)
-            _clear_generation_notice(context, chat.id)
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new.",
-            )
-            return
-        if context.job_queue:
-            job = context.job_queue.run_once(
-                _reminder_job,
-                REMINDER_DELAY_SECONDS,
-                chat_id=chat.id,
-                name=f"hint-reminder-{chat.id}",
-            )
-            context.chat_data["reminder_job"] = job
-        _clear_generation_notice(context, chat.id)
+        _clear_pending_language(context, chat)
+        _set_button_flow_state(
+            context,
+            chat,
+            {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE},
+        )
+        set_chat_mode(context, MODE_AWAIT_LANGUAGE)
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Выберите язык кроссворда (например: ru, en, it, es).",
+        )
         return
 
     if data.startswith(MENU_CALLBACK_PREFIX):
