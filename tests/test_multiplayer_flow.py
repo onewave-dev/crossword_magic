@@ -23,7 +23,6 @@ from app import (
     THEME_STATE,
     Settings,
     finish_command,
-    hint_command,
     inline_answer_handler,
     join_command,
     lobby_link_callback_handler,
@@ -154,6 +153,26 @@ def _make_group_update(chat_id: int, user_id: int):
     message = SimpleNamespace(
         message_thread_id=None,
         message_id=42,
+        reply_text=AsyncMock(),
+        reply_photo=AsyncMock(),
+        from_user=SimpleNamespace(id=user_id),
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=message.from_user,
+        callback_query=None,
+    )
+    return update, chat, message
+
+
+def _make_private_update(chat_id: int, user_id: int, text: str = ""):
+    chat = SimpleNamespace(id=chat_id, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        message_id=99,
+        text=text,
+        caption=None,
         reply_text=AsyncMock(),
         reply_photo=AsyncMock(),
         from_user=SimpleNamespace(id=user_id),
@@ -1602,10 +1621,16 @@ async def test_turn_based_hint_limits_players(monkeypatch, fresh_state):
     monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
 
-    update, chat, message = _make_group_update(game_state.chat_id, user_id=2)
-    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()), args=[], job_queue=DummyJobQueue())
+    dm_chat = game_state.players[2].dm_chat_id or 202
+    update, chat, message = _make_private_update(dm_chat, user_id=2, text="?A1")
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_chat_action=AsyncMock()),
+        chat_data={},
+        user_data={},
+        job_queue=DummyJobQueue(),
+    )
 
-    await hint_command(update, context)
+    await inline_answer_handler(update, context)
 
     message.reply_text.assert_awaited()
     assert "ход" in message.reply_text.await_args.args[0]
@@ -1625,11 +1650,19 @@ async def test_turn_based_hint_penalises_current_player(monkeypatch, tmp_path, f
     image_path = tmp_path / "hint.png"
     image_path.write_bytes(b"png")
     monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
 
-    update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
-    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()), args=[], job_queue=DummyJobQueue())
+    update, chat, message = _make_private_update(
+        game_state.players[1].dm_chat_id or 101, user_id=1, text="?A1"
+    )
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_chat_action=AsyncMock()),
+        chat_data={},
+        user_data={},
+        job_queue=DummyJobQueue(),
+    )
 
-    await hint_command(update, context)
+    await inline_answer_handler(update, context)
 
     assert game_state.scoreboard[1] == -HINT_PENALTY
     assert game_state.score == -HINT_PENALTY
@@ -1652,17 +1685,16 @@ async def test_turn_based_hint_explicit_slot(monkeypatch, tmp_path, fresh_state)
     image_path.write_bytes(b"png")
     monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
 
-    update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
-    message.reply_photo = AsyncMock()
-    message.reply_text = AsyncMock()
-
+    dm_chat = game_state.players[1].dm_chat_id or 101
+    update, chat, message = _make_private_update(dm_chat, user_id=1, text="?A1")
     context = SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
-        args=["A1"],
+        chat_data={},
+        user_data={},
         job_queue=DummyJobQueue(),
     )
 
-    await hint_command(update, context)
+    await inline_answer_handler(update, context)
 
     assert message.reply_text.await_count == 0
     assert message.reply_photo.await_count == 1
