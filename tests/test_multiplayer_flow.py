@@ -1534,7 +1534,10 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     announce_kwargs = second_call.kwargs
     assert announce_kwargs["chat_id"] == chat_id
     assert "message_thread_id" not in announce_kwargs
-    assert "/answer" in announce_kwargs.get("text", "")
+    text = announce_kwargs.get("text", "")
+    assert "Отправьте ответ прямо в чат" in text
+    assert "Как отвечать?" in text
+    assert "/answer" not in text
     assert announce_kwargs.get("reply_markup") is None
 
     warning_mock = AsyncMock()

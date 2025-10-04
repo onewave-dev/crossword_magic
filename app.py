@@ -625,8 +625,8 @@ MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
 ANSWER_HELP_CALLBACK_DATA = "answer_help"
 ANSWER_HELP_ALERT_TEXT = (
-    "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
-    "Если удобнее, можно пользоваться и командой /answer."
+    "Отправляйте ответы прямо в чат. Подходят варианты: «A1 париж», "
+    "«A1 - париж», «A1: париж», «1 париж»."
 )
 ANSWER_HELP_PROMPT = "Как отвечать? Нажмите кнопку ниже."
 
@@ -1541,7 +1541,8 @@ async def _announce_turn(
         parts.append(prefix)
     parts.append(
         "Ход игрока "
-        f"{player.name}. Ответьте командой /answer <слот> <слово> или запросите подсказку через /hint <слот>."
+        f"{player.name}. Отправьте ответ прямо в чат (например: «A1 париж»). "
+        "Нужен формат — воспользуйтесь подсказкой «Как отвечать?» или запросите подсказку через /hint <слот>."
     )
     text = "\n".join(parts)
     try:
@@ -6114,24 +6115,6 @@ async def admin_answer_request_handler(update: Update, context: ContextTypes.DEF
 
 
 @command_entrypoint()
-async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _normalise_thread_id(update)
-    chat = update.effective_chat
-    message = update.effective_message
-    if chat is None or message is None:
-        return
-    if not await _reject_group_chat(update):
-        return
-    if not context.args or len(context.args) < 2:
-        await message.reply_text("Использование: /answer <слот> <слово>")
-        return
-
-    slot_id = context.args[0]
-    raw_answer = " ".join(context.args[1:])
-    await _handle_answer_submission(context, chat, message, slot_id, raw_answer)
-
-
-@command_entrypoint()
 async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -6252,7 +6235,8 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 },
             )
             await message.reply_text(
-                "Не удалось распознать ответ. Используйте формат «A1 - слово»."
+                "Не удалось распознать ответ. Нажмите «Как отвечать?» или "
+                "отправьте в формате «A1 париж», «A1 - париж», «A1: париж», «1 париж»."
             )
         else:
             logger.debug(
@@ -6834,7 +6818,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
     telegram_application.add_handler(CommandHandler("state", send_state_image))
-    telegram_application.add_handler(CommandHandler("answer", answer_command))
     telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("finish", finish_command))

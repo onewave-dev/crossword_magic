@@ -46,6 +46,9 @@ from utils.storage import GameState
         ("А1:шпиц", ("A1", "шпиц")),
         ("А1:  шпиц", ("A1", "шпиц")),
         ("1 шпиц", ("1", "шпиц")),
+        ("1 - шпиц", ("1", "шпиц")),
+        ("1:шпиц", ("1", "шпиц")),
+        ("1: шпиц", ("1", "шпиц")),
         ("  15   ответ  ", ("15", "ответ")),
     ],
 )
@@ -116,7 +119,7 @@ async def test_inline_handler_replies_when_parse_fails_with_active_game():
     message.reply_text.assert_awaited_once()
     reply_call = message.reply_text.await_args
     assert reply_call.args
-    assert "A1 - слово" in reply_call.args[0]
+    assert "Как отвечать?" in reply_call.args[0]
 
 
 @pytest.mark.anyio
