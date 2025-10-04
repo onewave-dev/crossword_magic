@@ -11,6 +11,8 @@ from telegram.constants import ChatType
 from telegram.ext import ConversationHandler
 
 from app import (
+    ANSWER_FORMAT_EXAMPLES,
+    HOW_TO_ANSWER_LABEL,
     GENERATION_NOTICE_KEY,
     GENERATION_TOKEN_KEY,
     LOBBY_INVITE_BUTTON_TEXT,
@@ -46,6 +48,10 @@ from utils.storage import GameState
         ("А1:шпиц", ("A1", "шпиц")),
         ("А1:  шпиц", ("A1", "шпиц")),
         ("1 шпиц", ("1", "шпиц")),
+        ("1 - шпиц", ("1", "шпиц")),
+        ("1:шпиц", ("1", "шпиц")),
+        ("1- шпиц", ("1", "шпиц")),
+        ("1 : шпиц", ("1", "шпиц")),
         ("  15   ответ  ", ("15", "ответ")),
     ],
 )
@@ -116,7 +122,10 @@ async def test_inline_handler_replies_when_parse_fails_with_active_game():
     message.reply_text.assert_awaited_once()
     reply_call = message.reply_text.await_args
     assert reply_call.args
-    assert "A1 - слово" in reply_call.args[0]
+    reply_text = reply_call.args[0]
+    assert HOW_TO_ANSWER_LABEL in reply_text
+    for example in ("A1 париж", "A1 - париж", "A1: париж", "1 париж"):
+        assert example in reply_text or ANSWER_FORMAT_EXAMPLES in reply_text
 
 
 @pytest.mark.anyio

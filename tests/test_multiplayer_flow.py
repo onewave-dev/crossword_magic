@@ -11,6 +11,7 @@ from telegram.ext import ConversationHandler
 
 import app
 from app import (
+    HOW_TO_ANSWER_LABEL,
     HINT_PENALTY,
     LANGUAGE_STATE,
     LOBBY_START_CALLBACK_PREFIX,
@@ -1521,7 +1522,9 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     announce_kwargs = second_call.kwargs
     assert announce_kwargs["chat_id"] == chat_id
     assert "message_thread_id" not in announce_kwargs
-    assert "/answer" in announce_kwargs.get("text", "")
+    turn_text = announce_kwargs.get("text", "")
+    assert HOW_TO_ANSWER_LABEL in turn_text
+    assert "прямо в чат" in turn_text
     assert announce_kwargs.get("reply_markup") is None
 
     warning_mock = AsyncMock()

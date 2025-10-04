@@ -657,6 +657,13 @@ LOBBY_INVITE_INSTRUCTION = (
     "или создать ссылку."
 )
 
+HOW_TO_ANSWER_LABEL = "Как отвечать?"
+ANSWER_CHAT_PROMPT = (
+    "Отправляйте ответы прямо в чат в формате «A1 - слово». "
+    f"Если сомневаетесь, нажмите «{HOW_TO_ANSWER_LABEL}»."
+)
+ANSWER_FORMAT_EXAMPLES = "A1 париж / A1 - париж / A1: париж / 1 париж"
+
 LOBBY_CONTROL_CAPTIONS = {
     LOBBY_INVITE_BUTTON_TEXT,
     LOBBY_LINK_BUTTON_TEXT,
@@ -1534,7 +1541,8 @@ async def _announce_turn(
         parts.append(prefix)
     parts.append(
         "Ход игрока "
-        f"{player.name}. Ответьте командой /answer <слот> <слово> или запросите подсказку через /hint <слот>."
+        f"{player.name}. Отправьте ответ прямо в чат (подсказка «{HOW_TO_ANSWER_LABEL}» "
+        "подскажет формат) или запросите подсказку через /hint <слот>."
     )
     text = "\n".join(parts)
     try:
@@ -3038,10 +3046,7 @@ async def _deliver_puzzle_via_bot(
             )
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
-                    "Если удобнее, можно пользоваться и командой /answer."
-                ),
+                text=ANSWER_CHAT_PROMPT,
             )
             logger.info("Delivered freshly generated puzzle to chat %s", chat_id)
             return True
@@ -5434,10 +5439,7 @@ async def _launch_admin_test_game(
         await _broadcast_to_players(
             context,
             admin_state,
-            (
-                "Отправляйте ответы прямо в чат в формате «A1 - ответ». "
-                "Если удобнее, можно пользоваться и командой /answer."
-            ),
+            ANSWER_CHAT_PROMPT,
             exclude_chat_ids={admin_state.chat_id},
         )
 
@@ -6082,24 +6084,6 @@ async def admin_answer_request_handler(update: Update, context: ContextTypes.DEF
 
 
 @command_entrypoint()
-async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _normalise_thread_id(update)
-    chat = update.effective_chat
-    message = update.effective_message
-    if chat is None or message is None:
-        return
-    if not await _reject_group_chat(update):
-        return
-    if not context.args or len(context.args) < 2:
-        await message.reply_text("Использование: /answer <слот> <слово>")
-        return
-
-    slot_id = context.args[0]
-    raw_answer = " ".join(context.args[1:])
-    await _handle_answer_submission(context, chat, message, slot_id, raw_answer)
-
-
-@command_entrypoint()
 async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
     if not await _reject_group_chat(update):
@@ -6220,7 +6204,8 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 },
             )
             await message.reply_text(
-                "Не удалось распознать ответ. Используйте формат «A1 - слово»."
+                f"Не удалось распознать ответ. Нажмите «{HOW_TO_ANSWER_LABEL}» или "
+                f"попробуйте варианты: {ANSWER_FORMAT_EXAMPLES}."
             )
         else:
             logger.debug(
@@ -6795,7 +6780,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
     telegram_application.add_handler(CommandHandler("state", send_state_image))
-    telegram_application.add_handler(CommandHandler("answer", answer_command))
     telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("finish", finish_command))
