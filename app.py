@@ -52,6 +52,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.ext.filters import MessageFilter
 from telegram.request import HTTPXRequest
 from telegram.error import BadRequest, Forbidden, TelegramError
 
@@ -207,9 +208,38 @@ class AppState:
         self.scheduled_jobs: dict[str, Job] = {}
         self.lobby_generation_tasks: dict[str, asyncio.Task[None]] = {}
         self.chat_threads: dict[int, int] = {}
+        self.pending_join_replies: dict[int, dict[str, Any]] = {}
 
 
 state = AppState()
+
+
+class PendingJoinFilter(MessageFilter):
+    """Filter messages that respond to a pending join ForceReply."""
+
+    name = "pending_join_filter"
+
+    def filter(self, message: Message) -> bool:  # type: ignore[override]
+        if message is None or message.from_user is None or message.chat is None:
+            return False
+        if message.chat.type != ChatType.PRIVATE:
+            return False
+        entry = state.pending_join_replies.get(message.from_user.id)
+        if not entry:
+            return False
+        expected_chat = entry.get("chat_id")
+        if expected_chat is not None and expected_chat != message.chat.id:
+            return False
+        expected_reply_id = entry.get("prompt_message_id")
+        if expected_reply_id is None:
+            return True
+        reply = message.reply_to_message
+        if reply is None:
+            return False
+        return reply.message_id == expected_reply_id
+
+
+PENDING_JOIN_FILTER = PendingJoinFilter()
 
 
 def get_telegram_application() -> Application:
@@ -242,6 +272,9 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
             state.lobby_messages.pop(game_id, None)
             state.lobby_host_invites.pop(game_id, None)
             state.lobby_invite_requests.pop(game_id, None)
+            for user_id, pending in list(state.pending_join_replies.items()):
+                if pending.get("chat_id") == chat_id or pending.get("game_id") == game_id:
+                    state.pending_join_replies.pop(user_id, None)
             if puzzle_id:
                 delete_puzzle(puzzle_id)
             logger.info("Cleaned up resources for chat %s", chat_id)
@@ -261,6 +294,9 @@ def _cleanup_chat_resources(chat_id: int, puzzle_id: str | None = None) -> None:
         state.lobby_messages.pop(str(chat_id), None)
         state.lobby_host_invites.pop(str(chat_id), None)
         state.lobby_invite_requests.pop(str(chat_id), None)
+        for user_id, pending in list(state.pending_join_replies.items()):
+            if pending.get("chat_id") == chat_id or pending.get("game_id") == str(chat_id):
+                state.pending_join_replies.pop(user_id, None)
         if puzzle_id:
             delete_puzzle(puzzle_id)
         logger.info("Cleaned up resources for chat %s", chat_id)
@@ -286,6 +322,9 @@ def _cleanup_game_state(game_state: GameState | None) -> None:
         for code, target in list(state.join_codes.items()):
             if target == game_state.game_id:
                 state.join_codes.pop(code, None)
+        for user_id, pending in list(state.pending_join_replies.items()):
+            if pending.get("game_id") == game_state.game_id:
+                state.pending_join_replies.pop(user_id, None)
         for user_id, mapped_chat in list(state.player_chats.items()):
             if mapped_chat == game_state.chat_id:
                 state.player_chats.pop(user_id, None)
@@ -779,6 +818,10 @@ def _register_player_chat(user_id: int, chat_id: int | None) -> None:
     if chat_id is None:
         return
     state.player_chats[user_id] = chat_id
+
+
+def _clear_pending_join_for(user_id: int) -> None:
+    state.pending_join_replies.pop(user_id, None)
 
 
 def _lookup_player_chat(user_id: int) -> int | None:
@@ -4170,6 +4213,7 @@ async def _process_join_code(
             game_state,
             f"{existing.name} снова с нами!",
         )
+        _clear_pending_join_for(user.id)
         return
 
     user_store = _ensure_user_store_for(context, user.id)
@@ -4186,14 +4230,36 @@ async def _process_join_code(
             f"{player.name} подключился к игре!",
         )
         await _update_lobby_message(context, game_state)
+        _clear_pending_join_for(user.id)
         return
 
-    user_store["pending_join"] = {
+    with logging_context(chat_id=chat.id, puzzle_id=game_state.puzzle_id):
+        logger.info(
+            "Prompting user %s to provide display name for game %s via code %s",
+            user.id,
+            game_state.game_id,
+            code_upper,
+        )
+    response = await message.reply_text(
+        "Как вас представить другим игрокам?", reply_markup=ForceReply(selective=True)
+    )
+    prompt_message_id = getattr(response, "message_id", None)
+    pending_payload = {
         "game_id": game_state.game_id,
         "code": code_upper,
+        "prompt_message_id": prompt_message_id,
     }
-    await message.reply_text(
-        "Как вас представить другим игрокам?", reply_markup=ForceReply(selective=True)
+    user_store["pending_join"] = pending_payload
+    state.pending_join_replies[user.id] = {
+        "game_id": game_state.game_id,
+        "chat_id": chat.id,
+        "code": code_upper,
+        "prompt_message_id": prompt_message_id,
+    }
+    logger.info(
+        "Waiting for join name from user %s for game %s",
+        user.id,
+        game_state.game_id,
     )
 
 
@@ -4214,6 +4280,9 @@ def _reset_new_game_context(
     set_chat_mode(context, MODE_IDLE)
     if isinstance(getattr(context, "user_data", None), dict):
         context.user_data.pop("pending_join", None)
+    user = update.effective_user
+    if user is not None:
+        _clear_pending_join_for(user.id)
 
 
 def _build_start_menu_keyboard(
@@ -4921,40 +4990,83 @@ async def join_name_response_handler(
     if chat.type != ChatType.PRIVATE:
         return
     user_store = _ensure_user_store_for(context, user.id)
-    pending = user_store.get("pending_join")
-    reply = message.reply_to_message
-    bot_id = getattr(getattr(context, "bot", None), "id", None)
-    if not isinstance(pending, dict):
-        if (
-            reply is None
-            or reply.from_user is None
-            or (bot_id is not None and reply.from_user.id != bot_id)
-        ):
-            return
-        return
-    game_id = pending.get("game_id")
-    if not game_id:
+    pending_store = user_store.get("pending_join")
+    pending_entry = state.pending_join_replies.get(user.id)
+    if not isinstance(pending_store, dict) or pending_entry is None:
+        logger.info(
+            "Ignoring join reply from user %s: no pending join context",
+            user.id,
+        )
         user_store.pop("pending_join", None)
+        _clear_pending_join_for(user.id)
+        return
+    game_id = pending_store.get("game_id") or pending_entry.get("game_id")
+    if not game_id:
+        logger.info(
+            "Discarding join reply from user %s: missing game identifier",
+            user.id,
+        )
+        user_store.pop("pending_join", None)
+        _clear_pending_join_for(user.id)
+        return
+    if pending_entry.get("chat_id") not in (None, chat.id):
+        logger.info(
+            "Ignoring join reply from user %s in unexpected chat %s (expected %s)",
+            user.id,
+            chat.id,
+            pending_entry.get("chat_id"),
+        )
         return
     name = message.text.strip() if message.text else ""
     if not name:
-        await message.reply_text(
+        logger.info(
+            "User %s submitted empty join name for game %s, prompting again",
+            user.id,
+            game_id,
+        )
+        response = await message.reply_text(
             "Имя не может быть пустым. Попробуйте снова.",
             reply_markup=ForceReply(selective=True),
         )
+        prompt_message_id = getattr(response, "message_id", None)
+        pending_store["prompt_message_id"] = prompt_message_id
+        state.pending_join_replies[user.id] = {
+            "game_id": game_id,
+            "chat_id": chat.id,
+            "code": pending_entry.get("code"),
+            "prompt_message_id": prompt_message_id,
+        }
         return
     user_store["player_name"] = name
     user_store.pop("pending_join", None)
+    _clear_pending_join_for(user.id)
     game_state = _load_state_by_game_id(game_id)
     if not game_state or game_state.status != "lobby":
+        logger.info(
+            "Join reply from user %s ignored: lobby %s unavailable",
+            user.id,
+            game_id,
+        )
         await message.reply_text("Игра уже недоступна для присоединения.")
         return
     if len(game_state.players) >= MAX_LOBBY_PLAYERS and user.id not in game_state.players:
+        logger.info(
+            "Join reply from user %s rejected: lobby %s is full",
+            user.id,
+            game_id,
+        )
         await message.reply_text("К сожалению, комната уже заполнена.")
         return
     _register_player_chat(user.id, chat.id)
     player = _ensure_player_entry(game_state, user, name, chat.id)
     _store_state(game_state)
+    with logging_context(chat_id=chat.id, puzzle_id=game_state.puzzle_id):
+        logger.info(
+            "User %s joined game %s as %s",
+            user.id,
+            game_state.game_id,
+            player.name,
+        )
     await message.reply_text(
         f"Приятно познакомиться, {player.name}! Ждите начала игры.",
         reply_markup=ReplyKeyboardRemove(),
@@ -6894,6 +7006,13 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         group=-1,
     )
     telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & PENDING_JOIN_FILTER,
+            join_name_response_handler,
+            block=False,
+        )
+    )
+    telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
     )
     telegram_application.add_handler(
@@ -6930,13 +7049,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
             filters.TEXT
             & filters.Regex(fr"^{re.escape(LOBBY_START_BUTTON_TEXT)}$"),
             lobby_start_button_handler,
-            block=False,
-        )
-    )
-    telegram_application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            join_name_response_handler,
             block=False,
         )
     )
