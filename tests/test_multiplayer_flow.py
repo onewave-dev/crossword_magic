@@ -708,12 +708,12 @@ async def test_handle_theme_admin_test_launch(monkeypatch, fresh_state):
 
     assert result == ConversationHandler.END
     run_generate_mock.assert_awaited_once()
-    assert message.reply_text.await_count == 1
-    assert "Подбираю" in message.reply_text.await_args_list[0].args[0]
+    assert message.reply_text.await_count == 2
+    wait_text, start_text = [call.args[0] for call in message.reply_text.await_args_list]
+    assert "Готовлю тестовый кроссворд" in wait_text
+    assert "Тестовая игра 1×1" in start_text
     send_calls = context.bot.send_message.await_args_list
-    assert len(send_calls) == 1
-    assert "Тестовая игра 1×1" in send_calls[0].kwargs["text"]
-    assert send_calls[0].kwargs["chat_id"] == chat_id
+    assert len(send_calls) == 0
     assert app.PENDING_ADMIN_TEST_KEY not in context.chat_data
     announce_mock.assert_awaited()
     assert stored_states, "Admin state should be stored"

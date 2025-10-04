@@ -1528,11 +1528,13 @@ async def _announce_turn(
     puzzle: Puzzle | CompositePuzzle,
     *,
     prefix: str | None = None,
+    send_clues: bool = True,
 ) -> None:
     player = _current_player(game_state)
     if player is None:
         return
-    await _broadcast_clues_message(context, game_state, puzzle)
+    if send_clues:
+        await _broadcast_clues_message(context, game_state, puzzle)
     parts = []
     if prefix:
         parts.append(prefix)
@@ -4489,7 +4491,15 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if is_admin_flow:
             state.lobby_generation_tasks.pop(game_state.game_id, None)
             await message.reply_text(
-                "[адм.] Подбираю тестовую игру, это может занять немного времени.",
+                "[адм.] Готовлю тестовый кроссворд, это может занять немного времени.",
+            )
+            await message.reply_text(
+                "\n".join(
+                    [
+                        "[адм.] Тестовая игра 1×1 запущена!",
+                        f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
+                    ]
+                )
             )
             loop = asyncio.get_running_loop()
             puzzle: Puzzle | CompositePuzzle | None = None
@@ -4540,6 +4550,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     puzzle=puzzle,
                     admin_user=user,
                     source_chat=chat,
+                    announce_start=False,
                 )
             except PermissionError:
                 await message.reply_text(
@@ -5350,6 +5361,7 @@ async def _launch_admin_test_game(
     puzzle: Puzzle | CompositePuzzle,
     admin_user: User,
     source_chat: Chat | None = None,
+    announce_start: bool = True,
 ) -> tuple[GameState, Puzzle | CompositePuzzle]:
     """Prepare and start an admin test game derived from an existing puzzle."""
 
@@ -5462,22 +5474,23 @@ async def _launch_admin_test_game(
             exclude_chat_ids={admin_state.chat_id},
         )
 
-    intro_lines = [
-        "[адм.] Тестовая игра 1×1 запущена!",
-        f"Игроки: {_user_display_name(admin_user)} и {DUMMY_NAME}.",
-    ]
     first_player = admin_state.players.get(admin_state.turn_order[0])
-    try:
-        await context.bot.send_message(
-            chat_id=base_state.chat_id,
-            text="\n".join(intro_lines),
-            **_thread_kwargs(base_state),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to announce admin test game start for chat %s",
-            base_state.chat_id,
-        )
+    if announce_start:
+        intro_lines = [
+            "[адм.] Тестовая игра 1×1 запущена!",
+            f"Игроки: {_user_display_name(admin_user)} и {DUMMY_NAME}.",
+        ]
+        try:
+            await context.bot.send_message(
+                chat_id=base_state.chat_id,
+                text="\n".join(intro_lines),
+                **_thread_kwargs(base_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to announce admin test game start for chat %s",
+                base_state.chat_id,
+            )
 
     await _announce_turn(
         context,
@@ -5488,6 +5501,7 @@ async def _launch_admin_test_game(
             if first_player
             else "Игра начинается!"
         ),
+        send_clues=False,
     )
 
     return admin_state, cloned_puzzle
