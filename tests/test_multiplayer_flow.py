@@ -1435,7 +1435,8 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert first_call.args[2] == updated_clues
     assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
     assert second_call.args[2] == ANSWER_INSTRUCTIONS_TEXT
-    assert "Ход игрока" in third_call.args[2]
+    expected_turn_text = "Ход игрока Игрок 2."
+    assert third_call.args[2] == expected_turn_text
 
     send_calls = bot.send_message.await_args_list
     assert len(send_calls) >= 3
@@ -1445,7 +1446,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert first_kwargs.get("reply_markup") is None
     assert send_calls[1].kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
     assert send_calls[1].kwargs.get("parse_mode") is None
-    assert "Ход игрока" in send_calls[2].kwargs.get("text", "")
+    assert send_calls[2].kwargs.get("text", "") == expected_turn_text
 
     assert stored_states, "Game state should be stored after correct answer"
 
@@ -1551,8 +1552,8 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     assert announce_kwargs["chat_id"] == chat_id
     assert "message_thread_id" not in announce_kwargs
     text = announce_kwargs.get("text", "")
-    assert "Отправьте ответ прямо в чат" in text
-    assert "A1 - париж" in text
+    expected_turn_text = "Ход игрока Игрок 1."
+    assert text == expected_turn_text
     assert "/answer" not in text
     assert announce_kwargs.get("reply_markup") is None
 
