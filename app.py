@@ -623,12 +623,9 @@ SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
 NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
 MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
-ANSWER_HELP_CALLBACK_DATA = "answer_help"
-ANSWER_HELP_ALERT_TEXT = (
-    "Отправляйте ответы прямо в чат. Подходят варианты: «A1 париж», "
-    "«A1 - париж», «A1: париж», «1 париж»."
+ANSWER_INSTRUCTIONS_TEXT = (
+    'Отвечайте в формате:  "А1 - париж",   "А1 париж", или просто "1 париж".'
 )
-ANSWER_HELP_PROMPT = "Как отвечать? Нажмите кнопку ниже."
 
 NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
 NEW_GAME_MODE_SOLO = f"{NEW_GAME_MENU_CALLBACK_PREFIX}solo"
@@ -1539,10 +1536,11 @@ async def _announce_turn(
     parts = []
     if prefix:
         parts.append(prefix)
+    player_name = html.escape(player.name if player.name else "игрок")
     parts.append(
         "Ход игрока "
-        f"{player.name}. Отправьте ответ прямо в чат (например: «A1 париж»). "
-        "Нужен формат — воспользуйтесь подсказкой «Как отвечать?» или запросите подсказку через /hint <слот>."
+        f"{player_name}. Отправьте ответ прямо в чат — например: «A1 париж», "
+        "«A1 - париж» или «1 париж». Для подсказки используйте /hint <слот>."
     )
     text = "\n".join(parts)
     try:
@@ -2622,8 +2620,7 @@ def _format_clues_message(
                 f"Down:\n{_format_clue_section(down, solved_ids)}"
             )
             sections.append(section)
-        body = "\n\n".join(sections)
-        return f"{body}\n\n{ANSWER_HELP_PROMPT}"
+        return "\n\n".join(sections)
 
     across = [
         ref for ref in iter_slot_refs(puzzle) if ref.slot.direction is Direction.ACROSS
@@ -2633,38 +2630,7 @@ def _format_clues_message(
     ]
     across_text = _format_clue_section(across, solved_ids)
     down_text = _format_clue_section(down, solved_ids)
-    body = f"Across:\n{across_text}\n\nDown:\n{down_text}"
-    return f"{body}\n\n{ANSWER_HELP_PROMPT}"
-
-
-def _build_answer_help_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Как отвечать?",
-                    callback_data=ANSWER_HELP_CALLBACK_DATA,
-                )
-            ]
-        ]
-    )
-
-
-async def answer_help_callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Show instructions for submitting answers when help button is pressed."""
-
-    del context  # context is unused but kept for signature parity
-    query = update.callback_query
-    if query is None:
-        return
-    try:
-        await query.answer(ANSWER_HELP_ALERT_TEXT, show_alert=True)
-    except TelegramError:  # pragma: no cover - network errors are logged elsewhere
-        logger.exception("Failed to send answer help alert")
-
-
+    return f"Across:\n{across_text}\n\nDown:\n{down_text}"
 async def _broadcast_clues_message(
     context: ContextTypes.DEFAULT_TYPE,
     game_state: GameState,
@@ -2675,14 +2641,13 @@ async def _broadcast_clues_message(
     """Broadcast formatted clues to players and the primary chat."""
 
     text = _format_clues_message(puzzle, game_state)
-    reply_markup = _build_answer_help_keyboard()
+    instructions = ANSWER_INSTRUCTIONS_TEXT
     try:
         broadcast = await _broadcast_to_players(
             context,
             game_state,
             text,
             parse_mode=constants.ParseMode.HTML,
-            reply_markup=reply_markup,
             exclude_chat_ids=exclude_chat_ids,
         )
     except Exception:  # noqa: BLE001
@@ -2691,6 +2656,18 @@ async def _broadcast_clues_message(
             game_state.game_id,
         )
         broadcast = BroadcastResult(successful_chats=set())
+    try:
+        await _broadcast_to_players(
+            context,
+            game_state,
+            instructions,
+            exclude_chat_ids=exclude_chat_ids,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to broadcast answer instructions for game %s",
+            game_state.game_id,
+        )
     if (
         not broadcast.successful_chats
         or game_state.chat_id not in broadcast.successful_chats
@@ -2700,7 +2677,11 @@ async def _broadcast_clues_message(
                 chat_id=game_state.chat_id,
                 text=text,
                 parse_mode=constants.ParseMode.HTML,
-                reply_markup=reply_markup,
+                **_thread_kwargs(game_state),
+            )
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=instructions,
                 **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
@@ -2774,8 +2755,8 @@ async def _send_clues_update(
     await message.reply_text(
         text,
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=_build_answer_help_keyboard(),
     )
+    await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
 
 
 def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboardMarkup:
@@ -3080,7 +3061,10 @@ async def _deliver_puzzle_via_bot(
                 chat_id=chat_id,
                 text=_format_clues_message(puzzle, game_state),
                 parse_mode=constants.ParseMode.HTML,
-                reply_markup=_build_answer_help_keyboard(),
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=ANSWER_INSTRUCTIONS_TEXT,
             )
             logger.info("Delivered freshly generated puzzle to chat %s", chat_id)
             return True
@@ -3980,8 +3964,8 @@ async def _start_new_private_game(
                     await message.reply_text(
                         _format_clues_message(puzzle, game_state),
                         parse_mode=constants.ParseMode.HTML,
-                        reply_markup=_build_answer_help_keyboard(),
                     )
+                    await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to resend active puzzle to chat %s", chat_id)
             if message:
@@ -5469,7 +5453,12 @@ async def _launch_admin_test_game(
             admin_state,
             clues_message,
             parse_mode=constants.ParseMode.HTML,
-            reply_markup=_build_answer_help_keyboard(),
+            exclude_chat_ids={admin_state.chat_id},
+        )
+        await _broadcast_to_players(
+            context,
+            admin_state,
+            ANSWER_INSTRUCTIONS_TEXT,
             exclude_chat_ids={admin_state.chat_id},
         )
 
@@ -5613,8 +5602,8 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text(
             _format_clues_message(puzzle, game_state),
             parse_mode=constants.ParseMode.HTML,
-            reply_markup=_build_answer_help_keyboard(),
         )
+        await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
 
 
 @command_entrypoint()
@@ -6235,8 +6224,7 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 },
             )
             await message.reply_text(
-                "Не удалось распознать ответ. Нажмите «Как отвечать?» или "
-                "отправьте в формате «A1 париж», «A1 - париж», «A1: париж», «1 париж»."
+                f"Не удалось распознать ответ. {ANSWER_INSTRUCTIONS_TEXT}"
             )
         else:
             logger.debug(
@@ -6736,13 +6724,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(
         CallbackQueryHandler(track_player_callback, pattern=".*", block=False),
         group=-1,
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            answer_help_callback_handler,
-            pattern=fr"^{ANSWER_HELP_CALLBACK_DATA}$",
-            block=False,
-        )
     )
     telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
