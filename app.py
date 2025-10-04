@@ -1066,6 +1066,67 @@ async def _broadcast_photo_to_players(
             )
 
 
+async def _mirror_primary_chat_if_needed(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    source_chat_id: int | None,
+    broadcast_result: BroadcastResult | None,
+    text: str | None = None,
+    photo_bytes: bytes | None = None,
+    caption: str | None = None,
+    parse_mode: str | None = None,
+) -> None:
+    """Ensure the primary chat receives an update when direct delivery fails."""
+
+    if source_chat_id == game_state.chat_id:
+        return
+
+    need_primary = False
+    successful_chats: set[int] = set()
+    if broadcast_result is None:
+        need_primary = True
+    else:
+        successful_chats = broadcast_result.successful_chats
+        if not successful_chats or game_state.chat_id not in successful_chats:
+            need_primary = True
+
+    if not need_primary:
+        return
+
+    thread_kwargs = _thread_kwargs(game_state)
+    if text:
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                **thread_kwargs,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to mirror text update to primary chat for game %s",
+                game_state.game_id,
+            )
+
+    if photo_bytes is None:
+        return
+
+    try:
+        await context.bot.send_photo(
+            chat_id=game_state.chat_id,
+            photo=photo_bytes,
+            caption=caption or text,
+            parse_mode=parse_mode,
+            **thread_kwargs,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to mirror photo update to primary chat for game %s",
+            game_state.game_id,
+        )
+
+
 def _remember_job(job: Job | None) -> None:
     if job is None:
         return
@@ -5916,8 +5977,9 @@ async def _handle_answer_submission(
                 )
                 await message.reply_text(failure_announcement)
                 await refresh_clues_if_needed()
+                broadcast_result: BroadcastResult | None = None
                 try:
-                    await _broadcast_to_players(
+                    broadcast_result = await _broadcast_to_players(
                         context,
                         game_state,
                         failure_announcement,
@@ -5928,6 +5990,14 @@ async def _handle_answer_submission(
                         "Failed to broadcast incorrect answer announcement for game %s",
                         game_state.game_id,
                     )
+                    broadcast_result = None
+                await _mirror_primary_chat_if_needed(
+                    context,
+                    game_state,
+                    source_chat_id=chat.id,
+                    broadcast_result=broadcast_result,
+                    text=failure_announcement,
+                )
                 _cancel_turn_timers(game_state)
                 _advance_turn(game_state)
                 _store_state(game_state)
@@ -5979,6 +6049,30 @@ async def _handle_answer_submission(
             await message.reply_photo(
                 photo=photo_bytes, caption=success_caption
             )
+            broadcast_result: BroadcastResult | None = None
+            if in_turn_mode:
+                try:
+                    broadcast_result = await _broadcast_to_players(
+                        context,
+                        game_state,
+                        success_caption,
+                        exclude_chat_ids={chat.id},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to broadcast correct answer announcement for game %s",
+                        game_state.game_id,
+                    )
+                    broadcast_result = None
+                await _mirror_primary_chat_if_needed(
+                    context,
+                    game_state,
+                    source_chat_id=chat.id,
+                    broadcast_result=broadcast_result,
+                    text=success_caption,
+                    photo_bytes=photo_bytes,
+                    caption=success_caption,
+                )
             if in_turn_mode:
                 await _broadcast_photo_to_players(
                     context,

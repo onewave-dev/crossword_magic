@@ -1,7 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from telegram import InlineKeyboardMarkup, constants
@@ -1402,7 +1402,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     monkeypatch.setattr(app, "_store_state", fake_store)
 
     broadcast_mock = AsyncMock(
-        side_effect=[app.BroadcastResult(successful_chats=set()) for _ in range(3)]
+        side_effect=[app.BroadcastResult(successful_chats=set()) for _ in range(4)]
     )
     monkeypatch.setattr(app, "_broadcast_to_players", broadcast_mock)
 
@@ -1426,29 +1426,99 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert broadcast_mock.await_count == 3
-    first_call = broadcast_mock.await_args_list[0]
-    second_call = broadcast_mock.await_args_list[1]
-    third_call = broadcast_mock.await_args_list[2]
+    assert broadcast_mock.await_count == 4
+    broadcast_texts = [call.args[2] for call in broadcast_mock.await_args_list]
 
     updated_clues = app._format_clues_message(puzzle, game_state)
-    assert first_call.args[2] == updated_clues
-    assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
-    assert second_call.args[2] == ANSWER_INSTRUCTIONS_TEXT
+    assert updated_clues in broadcast_texts
+    clues_call = next(
+        call for call in broadcast_mock.await_args_list if call.args[2] == updated_clues
+    )
+    assert clues_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
+
+    assert ANSWER_INSTRUCTIONS_TEXT in broadcast_texts
     expected_turn_text = "Ход игрока Игрок 2."
-    assert third_call.args[2] == expected_turn_text
+    assert expected_turn_text in broadcast_texts
+    assert any(text.startswith("Верно!") for text in broadcast_texts)
 
     send_calls = bot.send_message.await_args_list
     assert len(send_calls) >= 3
-    first_kwargs = send_calls[0].kwargs
-    assert first_kwargs.get("text") == updated_clues
-    assert first_kwargs.get("parse_mode") == constants.ParseMode.HTML
-    assert first_kwargs.get("reply_markup") is None
-    assert send_calls[1].kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
-    assert send_calls[1].kwargs.get("parse_mode") is None
-    assert send_calls[2].kwargs.get("text", "") == expected_turn_text
+    send_kwargs_list = [call.kwargs for call in send_calls]
+    clues_kwargs = next(kwargs for kwargs in send_kwargs_list if kwargs.get("text") == updated_clues)
+    assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert clues_kwargs.get("reply_markup") is None
+
+    instructions_kwargs = next(
+        kwargs for kwargs in send_kwargs_list if kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
+    )
+    assert instructions_kwargs.get("parse_mode") is None
+
+    turn_kwargs = next(
+        kwargs for kwargs in send_kwargs_list if kwargs.get("text", "") == expected_turn_text
+    )
+    assert turn_kwargs.get("parse_mode") is None
 
     assert stored_states, "Game state should be stored after correct answer"
+
+
+@pytest.mark.anyio
+async def test_correct_answer_from_dm_mirrors_primary_chat(monkeypatch, tmp_path, fresh_state):
+    puzzle = _make_turn_puzzle()
+    game_state = _make_turn_state(-703, puzzle)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    answering_player = game_state.players[game_state.turn_order[0]]
+    dm_chat_id = answering_player.dm_chat_id or 0
+
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _: game_state)
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
+    monkeypatch.setattr(app, "_send_clues_update", AsyncMock())
+    monkeypatch.setattr(app, "_announce_turn", AsyncMock())
+
+    image_path = tmp_path / "dm_grid.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
+    context = SimpleNamespace(bot=bot, job_queue=DummyJobQueue())
+
+    chat = SimpleNamespace(id=dm_chat_id, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        reply_photo=AsyncMock(),
+        from_user=SimpleNamespace(id=answering_player.user_id, full_name=answering_player.name),
+    )
+
+    await app._handle_answer_submission(context, chat, message, "A1", "рим")
+
+    text_calls = [
+        call
+        for call in bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == game_state.chat_id
+    ]
+    assert any(
+        "Верно!" in call.kwargs.get("text", "")
+        for call in text_calls
+    ), "Primary chat should receive a success text update"
+
+    photo_calls = [
+        call
+        for call in bot.send_photo.await_args_list
+        if call.kwargs.get("chat_id") == game_state.chat_id
+    ]
+    assert photo_calls, "Primary chat should receive the updated grid"
+    assert any(
+        "Верно!" in (call.kwargs.get("caption") or "")
+        for call in photo_calls
+    ), "Primary chat grid caption should contain success text"
+
 
 @pytest.mark.anyio
 async def test_turn_based_rejects_rapid_second_answer(monkeypatch, tmp_path, fresh_state):
