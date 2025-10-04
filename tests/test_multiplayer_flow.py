@@ -1729,7 +1729,7 @@ def test_format_leaderboard_orders_players(fresh_state):
 
     text = app._format_leaderboard(game_state)
 
-    lines = text.split("<br/>")
+    lines = text.splitlines()
     assert lines[0].startswith("1. <b>Игрок 3")
     assert lines[1].startswith("2. <b>Игрок 2")
     assert "💡 2" in lines[0]
