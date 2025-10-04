@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from collections.abc import MutableMapping, Mapping
 from types import SimpleNamespace
@@ -60,6 +61,7 @@ def fresh_state():
     state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
     state.chat_threads.clear()
+    state.pending_join_replies.clear()
     yield
     state.active_games.clear()
     state.chat_to_game.clear()
@@ -72,6 +74,7 @@ def fresh_state():
     state.lobby_generation_tasks.clear()
     state.scheduled_jobs.clear()
     state.chat_threads.clear()
+    state.pending_join_replies.clear()
     state.settings = original_settings
 
 
@@ -414,6 +417,12 @@ async def test_join_name_after_button_flow_keeps_wrapper(monkeypatch, fresh_stat
     user_store = MappingWrapper()
     pending_game_id = "game-4242"
     user_store["pending_join"] = {"game_id": pending_game_id, "code": "ABCD"}
+    state.pending_join_replies[user_id] = {
+        "game_id": pending_game_id,
+        "chat_id": chat.id,
+        "code": "ABCD",
+        "prompt_message_id": 555,
+    }
     context = SimpleNamespace(
         chat_data={},
         user_data=user_store,
@@ -452,7 +461,10 @@ async def test_join_name_after_button_flow_keeps_wrapper(monkeypatch, fresh_stat
         message_thread_id=None,
         text="Игрок",
         reply_text=AsyncMock(),
-        reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=context.bot.id)),
+        reply_to_message=SimpleNamespace(
+            from_user=SimpleNamespace(id=context.bot.id),
+            message_id=555,
+        ),
     )
     name_update = SimpleNamespace(
         effective_chat=chat,
@@ -460,16 +472,79 @@ async def test_join_name_after_button_flow_keeps_wrapper(monkeypatch, fresh_stat
         effective_user=SimpleNamespace(id=user_id, full_name="Игрок"),
     )
 
+    await inline_answer_handler(name_update, context)
     await app.join_name_response_handler(name_update, context)
 
     assert user_id in game_state.players
     assert game_state.players[user_id].name == "Игрок"
     assert "pending_join" not in user_store
     assert user_store.get("player_name") == "Игрок"
+    assert user_id not in state.pending_join_replies
     name_message.reply_text.assert_awaited()
     broadcast_mock.assert_awaited()
     update_mock.assert_awaited()
     assert stored_states and stored_states[-1] is game_state
+
+
+@pytest.mark.anyio
+async def test_process_join_code_tracks_pending_reply(monkeypatch, fresh_state, caplog):
+    chat = SimpleNamespace(id=777, type=ChatType.PRIVATE)
+    reply_result = SimpleNamespace(message_id=1001)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        text=None,
+        reply_text=AsyncMock(return_value=reply_result),
+    )
+    user = SimpleNamespace(id=3030)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(
+        chat_data={},
+        user_data={},
+        bot=SimpleNamespace(id=9000),
+        application=SimpleNamespace(user_data={}),
+    )
+    game_state = GameState(
+        chat_id=-555,
+        puzzle_id="demo",
+        mode="turn_based",
+        status="lobby",
+        players={},
+        host_id=None,
+        game_id="game-track",
+    )
+    state.active_games[game_state.game_id] = game_state
+    state.join_codes["ABCD"] = game_state.game_id
+
+    monkeypatch.setattr(
+        app,
+        "_load_state_by_game_id",
+        lambda game_id: game_state if game_id == game_state.game_id else None,
+    )
+
+    caplog.set_level(logging.INFO, logger=app.logger.name)
+
+    await app._process_join_code(update, context, "abcd")
+
+    stored = context.application.user_data[user.id]
+    pending = stored.get("pending_join")
+    assert pending["game_id"] == game_state.game_id
+    assert pending["code"] == "ABCD"
+    assert pending["prompt_message_id"] == reply_result.message_id
+    assert state.pending_join_replies[user.id]["chat_id"] == chat.id
+    assert (
+        state.pending_join_replies[user.id]["prompt_message_id"]
+        == reply_result.message_id
+    )
+    message.reply_text.assert_awaited_once()
+    assert any(
+        "Prompting user" in record.message or "Waiting for join name" in record.message
+        for record in caplog.records
+        if record.levelno >= logging.INFO
+    )
 
 
 @pytest.mark.anyio
@@ -959,6 +1034,7 @@ async def test_admin_proxy_restarts_after_finished_game(monkeypatch, fresh_state
     update = SimpleNamespace(
         effective_chat=chat,
         effective_message=message,
+        effective_user=SimpleNamespace(id=1111),
         callback_query=query,
     )
     context = SimpleNamespace(chat_data={}, user_data={}, bot=SimpleNamespace())
@@ -1127,6 +1203,12 @@ async def test_join_name_accepts_plain_text_with_pending(monkeypatch, fresh_stat
         chat_data={},
         user_data={"pending_join": {"game_id": pending_game_id, "code": "ROOM01"}},
     )
+    state.pending_join_replies[user.id] = {
+        "game_id": pending_game_id,
+        "chat_id": chat.id,
+        "code": "ROOM01",
+        "prompt_message_id": None,
+    }
 
     await app.join_name_response_handler(update, context)
 
@@ -1140,6 +1222,7 @@ async def test_join_name_accepts_plain_text_with_pending(monkeypatch, fresh_stat
     assert lobby_updates == [(context, game_state)]
     message.reply_text.assert_awaited_once()
     assert game_state.players[user.id].dm_chat_id == chat.id
+    assert user.id not in state.pending_join_replies
 
 
 @pytest.mark.anyio
