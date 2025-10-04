@@ -1412,8 +1412,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     game_state.dummy_total_delay += actual_delay
     game_state.dummy_turn_started_at = None
     game_state.dummy_planned_delay = 0.0
-    message_text = f"{info_prefix}: /answer {slot_ref.public_id} {attempt_answer}"
-    await _broadcast_with_primary(message_text)
+    attempt_display = _canonical_answer(attempt_answer, puzzle.language or "")
     log_result = "success" if attempt_success else "fail"
     points = SCORE_PER_WORD if attempt_success else 0
     with logging_context(chat_id=game_state.chat_id, puzzle_id=game_state.puzzle_id):
@@ -1436,9 +1435,8 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         _apply_answer_to_state(game_state, slot_ref, attempt_answer)
         game_state.active_slot_id = None
         _store_state(game_state)
-        display_answer = _canonical_answer(attempt_answer, puzzle.language)
         success_caption = (
-            f"Верно! {info_prefix} - {slot_ref.public_id}: {display_answer}"
+            f"Верно! {info_prefix} - {slot_ref.public_id}: {attempt_display}"
         )
         if SCORE_PER_WORD:
             success_caption += f" (+{SCORE_PER_WORD} очков)"
@@ -1488,7 +1486,9 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     if dummy_player:
         dummy_player.answers_fail += 1
     _cancel_turn_timers(game_state)
-    failure_text = f"{info_prefix} ошибся на {slot_ref.public_id}."
+    failure_text = (
+        f"{info_prefix} ошибся на {slot_ref.public_id}: {attempt_display}"
+    )
     await _broadcast_with_primary(failure_text)
     _advance_turn(game_state)
     _store_state(game_state)
