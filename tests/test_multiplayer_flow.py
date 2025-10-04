@@ -2039,6 +2039,11 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     assert broadcast_photo_mock.await_args.kwargs.get("caption") == expected_caption
     context.bot.send_photo.assert_awaited()
     assert context.bot.send_photo.await_args.kwargs.get("caption") == expected_caption
+    sent_texts = [
+        call.kwargs.get("text")
+        for call in context.bot.send_message.await_args_list
+    ]
+    assert all("/answer" not in text for text in sent_texts if isinstance(text, str))
 
 
 @pytest.mark.anyio
@@ -2163,9 +2168,14 @@ async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
     monkeypatch.setattr(app, "_finish_game", AsyncMock())
     monkeypatch.setattr(app, "_announce_turn", AsyncMock())
     monkeypatch.setattr(app.random, "random", lambda: 1.0)
+    monkeypatch.setattr(
+        app, "_generate_dummy_incorrect_answer", lambda *_, **__: "ошибка"
+    )
 
     attempted: list[int] = []
     delivered: list[int] = []
+
+    messages_by_chat: dict[int, list[str]] = {}
 
     async def fake_send_message(*args, **kwargs):
         chat_id = kwargs.get("chat_id")
@@ -2175,6 +2185,9 @@ async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
         if chat_id == dummy_player.dm_chat_id:
             raise RuntimeError("dm failure")
         delivered.append(chat_id)
+        text = kwargs.get("text")
+        if isinstance(text, str):
+            messages_by_chat.setdefault(chat_id, []).append(text)
         return SimpleNamespace(message_id=700 + len(delivered))
 
     bot = SimpleNamespace(
@@ -2190,9 +2203,14 @@ async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
 
     await app._dummy_turn_job(context)
 
-    assert attempted.count(dummy_player.dm_chat_id) == 3
-    assert delivered.count(game_state.chat_id) == 3
-    assert delivered.count(human_player.dm_chat_id) == 3
+    assert attempted.count(dummy_player.dm_chat_id) == 2
+    assert delivered.count(game_state.chat_id) == 2
+    assert delivered.count(human_player.dm_chat_id) == 2
+    for texts in messages_by_chat.values():
+        for text in texts:
+            assert "/answer" not in text
+    failure_messages = messages_by_chat.get(game_state.chat_id, [])
+    assert any("ошибся" in text and "ОШИБКА" in text for text in failure_messages)
 
 
 @pytest.mark.anyio
