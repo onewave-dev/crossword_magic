@@ -3120,20 +3120,24 @@ def _reveal_letter(
     hint_set = _ensure_hint_set(game_state)
     slot = slot_ref.slot
     component = slot_ref.component_index
+    candidates: list[tuple[int, str]] = []
     for index, (row, col) in enumerate(slot.coordinates()):
+        if index >= len(answer):
+            break
         key = _coord_key(row, col, component)
         if key in game_state.filled_cells:
             continue
-        if index >= len(answer):
-            break
-        letter = answer[index]
-        game_state.filled_cells[key] = letter
-        hint_set.add(key)
-        _record_hint_usage(game_state, slot_ref.public_id, user_id=user_id)
-        game_state.last_update = time.time()
-        _store_state(game_state)
-        return index, letter
-    return None
+        candidates.append((index, key))
+    if not candidates:
+        return None
+    index, key = random.choice(candidates)
+    letter = answer[index]
+    game_state.filled_cells[key] = letter
+    hint_set.add(key)
+    _record_hint_usage(game_state, slot_ref.public_id, user_id=user_id)
+    game_state.last_update = time.time()
+    _store_state(game_state)
+    return index, letter
 
 
 def _all_slots_solved(puzzle: Puzzle | CompositePuzzle, game_state: GameState) -> bool:
@@ -6213,6 +6217,13 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     trimmed_text = raw_text.strip()
+    if trimmed_text.startswith("?"):
+        remainder = trimmed_text[1:].strip()
+        slot_token = remainder.split(maxsplit=1)[0] if remainder else None
+        await _handle_hint_request(
+            update, context, slot_query=slot_token if slot_token else None
+        )
+        return
     if trimmed_text in LOBBY_CONTROL_CAPTIONS:
         logger.debug(
             "Inline answer handler ignored lobby control caption",
@@ -6254,26 +6265,36 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await _handle_answer_submission(context, chat, message, slot_id, answer_text)
 
 
-@command_entrypoint()
-async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_hint_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    slot_query: str | None = None,
+) -> None:
     _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
     if chat is None or message is None:
         return
+
+    slot_identifier = slot_query.strip() if slot_query else None
+
+    game_state: GameState | None = None
     if chat.type in GROUP_CHAT_TYPES:
         game_state = _load_state_for_chat(chat.id)
         if not game_state or game_state.mode != "turn_based":
-            if not await _reject_group_chat(update):
-                return
+            await _reject_group_chat(update)
+            return
     else:
         if not await _reject_group_chat(update):
             return
         game_state = _load_state_for_chat(chat.id)
+
     if not game_state:
         await message.reply_text("Нет активной игры. Используйте /new.")
         return
-    logger.debug("Chat %s requested /hint", chat.id)
+
+    logger.debug("Chat %s requested hint", chat.id)
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
         await message.reply_text("Нет активной игры. Используйте /new.")
         return
@@ -6309,16 +6330,21 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if player_id != current_player_id:
                 await message.reply_text(f"Сейчас ход {current_player.name}.")
                 return
+
         slot_ref: Optional[SlotRef] = None
-        if context.args:
-            slot_ref, ambiguity = _resolve_slot(puzzle, context.args[0])
+        ambiguity: Optional[str] = None
+        if slot_identifier:
+            slot_ref, ambiguity = _resolve_slot(puzzle, slot_identifier)
             if ambiguity:
                 await message.reply_text(ambiguity)
                 return
             if slot_ref is None:
-                await message.reply_text(f"Слот {context.args[0]} не найден.")
+                await message.reply_text(f"Слот {slot_identifier} не найден.")
                 return
         else:
+            solved_ids = {
+                _normalise_slot_id(entry) for entry in game_state.solved_slots
+            }
             for candidate in sorted(
                 iter_slot_refs(puzzle),
                 key=lambda ref: (
@@ -6328,7 +6354,7 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ),
             ):
                 public_id = _normalise_slot_id(candidate.public_id)
-                if public_id in {_normalise_slot_id(entry) for entry in game_state.solved_slots}:
+                if public_id in solved_ids:
                     continue
                 if not candidate.slot.answer:
                     continue
@@ -6385,10 +6411,18 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             with open(image_path, "rb") as photo:
                 await message.reply_photo(photo=photo, caption=reply_text)
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to render grid after hint for slot %s", slot.slot_id)
+            logger.exception(
+                "Failed to render grid after hint for slot %s", slot_ref.slot.slot_id
+            )
             await message.reply_text(
                 "Подсказка сохранена, но не удалось обновить изображение. Попробуйте /state позже."
             )
+
+
+@command_entrypoint()
+async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    slot_arg = context.args[0] if getattr(context, "args", None) else None
+    await _handle_hint_request(update, context, slot_query=slot_arg)
 
 
 def _find_turn_game_for_private_chat(
@@ -6794,7 +6828,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(CommandHandler("clues", send_clues))
     telegram_application.add_handler(CommandHandler("state", send_state_image))
-    telegram_application.add_handler(CommandHandler(["hint", "open"], hint_command))
     telegram_application.add_handler(CommandHandler("solve", solve_command))
     telegram_application.add_handler(CommandHandler("finish", finish_command))
     telegram_application.add_handler(CommandHandler("quit", quit_command))
