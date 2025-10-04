@@ -625,7 +625,9 @@ NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
 MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
 ANSWER_INSTRUCTIONS_TEXT = (
-    'Отвечайте в формате:  "А1 - париж",   "А1 париж", или просто "1 париж".'
+    'Отвечайте в формате: "А1 - париж", "А1 париж" или просто "1 париж". '
+    'Подсказку можно запросить сообщением "?A1" (или с другим слотом). '
+    'Имейте в виду: подсказки уменьшают итоговый счёт.'
 )
 
 NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
@@ -1542,11 +1544,7 @@ async def _announce_turn(
     if prefix:
         parts.append(prefix)
     player_name = html.escape(player.name if player.name else "игрок")
-    parts.append(
-        "Ход игрока "
-        f"{player_name}. Отправьте ответ прямо в чат — например: «A1 париж», "
-        "«A1 - париж» или «1 париж». Для подсказки используйте /hint <слот>."
-    )
+    parts.append(f"Ход игрока {player_name}.")
     text = "\n".join(parts)
     try:
         broadcast = await _broadcast_to_players(
@@ -3196,7 +3194,7 @@ async def _reminder_job(context: CallbackContext) -> None:
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Не забывайте про /hint, если нужна подсказка!",
+                text="Нужна помощь? Отправьте «?A1» (или другой слот) — но учтите, что подсказки снижают очки!",
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to deliver reminder message to chat %s", chat_id)
