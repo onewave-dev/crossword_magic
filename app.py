@@ -494,18 +494,25 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{remaining_seconds:02d}"
 
 
-def _get_new_game_storage(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> dict:
+def _get_new_game_storage(
+    context: ContextTypes.DEFAULT_TYPE, chat: Chat | None
+) -> MutableMapping[str, Any]:
     if chat and chat.type in GROUP_CHAT_TYPES:
         data = getattr(context, "chat_data", None)
-        if not isinstance(data, dict):
-            data = {}
-            setattr(context, "chat_data", data)
-        return data
+        if isinstance(data, MutableMapping):
+            return data
+        fresh: MutableMapping[str, Any] = {}
+        setattr(context, "chat_data", fresh)
+        return fresh
+    if chat and chat.type == ChatType.PRIVATE and isinstance(chat.id, int):
+        return _ensure_user_store_for(context, int(chat.id))
     data = getattr(context, "user_data", None)
-    if not isinstance(data, dict):
-        data = {}
-        setattr(context, "user_data", data)
-    return data
+    if isinstance(data, MutableMapping):
+        return data
+    fresh: MutableMapping[str, Any] = {}
+    if hasattr(context, "user_data"):
+        setattr(context, "user_data", fresh)
+    return fresh
 
 
 def _get_button_flow_state(
@@ -1953,19 +1960,20 @@ def _find_existing_join_code(game_state: GameState) -> str | None:
 
 def _ensure_user_store_for(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> dict:
+) -> MutableMapping[str, Any]:
     application = getattr(context, "application", None)
     container = getattr(application, "user_data", None)
     if isinstance(container, MutableMapping):
         store = container.get(user_id)
-        if not isinstance(store, dict):
-            store = {}
-            container[user_id] = store
-        return store
+        if isinstance(store, MutableMapping):
+            return store
+        fresh_store: MutableMapping[str, Any] = {}
+        container[user_id] = fresh_store
+        return fresh_store
     user_data = getattr(context, "user_data", None)
-    if isinstance(user_data, dict):
+    if isinstance(user_data, MutableMapping):
         return user_data
-    fresh: dict = {}
+    fresh: MutableMapping[str, Any] = {}
     if hasattr(context, "user_data"):
         setattr(context, "user_data", fresh)
     return fresh
@@ -4164,9 +4172,8 @@ async def _process_join_code(
         )
         return
 
-    stored_name = context.user_data.get("player_name") if isinstance(
-        context.user_data, dict
-    ) else None
+    user_store = _ensure_user_store_for(context, user.id)
+    stored_name = user_store.get("player_name")
     if stored_name:
         player = _ensure_player_entry(game_state, user, str(stored_name), chat.id)
         _store_state(game_state)
@@ -4181,7 +4188,10 @@ async def _process_join_code(
         await _update_lobby_message(context, game_state)
         return
 
-    context.user_data["pending_join"] = {"game_id": game_state.game_id, "code": code_upper}
+    user_store["pending_join"] = {
+        "game_id": game_state.game_id,
+        "code": code_upper,
+    }
     await message.reply_text(
         "Как вас представить другим игрокам?", reply_markup=ForceReply(selective=True)
     )
@@ -4892,7 +4902,8 @@ async def join_name_response_handler(
         return
     if chat.type != ChatType.PRIVATE:
         return
-    pending = context.user_data.get("pending_join")
+    user_store = _ensure_user_store_for(context, user.id)
+    pending = user_store.get("pending_join")
     reply = message.reply_to_message
     bot_id = getattr(getattr(context, "bot", None), "id", None)
     if not isinstance(pending, dict):
@@ -4905,7 +4916,7 @@ async def join_name_response_handler(
         return
     game_id = pending.get("game_id")
     if not game_id:
-        context.user_data.pop("pending_join", None)
+        user_store.pop("pending_join", None)
         return
     name = message.text.strip() if message.text else ""
     if not name:
@@ -4914,8 +4925,8 @@ async def join_name_response_handler(
             reply_markup=ForceReply(selective=True),
         )
         return
-    context.user_data["player_name"] = name
-    context.user_data.pop("pending_join", None)
+    user_store["player_name"] = name
+    user_store.pop("pending_join", None)
     game_state = _load_state_by_game_id(game_id)
     if not game_state or game_state.status != "lobby":
         await message.reply_text("Игра уже недоступна для присоединения.")
