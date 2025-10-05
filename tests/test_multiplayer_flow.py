@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from telegram import InlineKeyboardMarkup, constants
+from telegram import InlineKeyboardMarkup, ReplyKeyboardRemove, constants
 from telegram.constants import ChatType
 from telegram.error import BadRequest
 from telegram.ext import ConversationHandler
@@ -1371,6 +1371,62 @@ async def test_lobby_start_button_triggers_start_without_inline_error(monkeypatc
     args, kwargs = process_mock.await_args
     assert args == (context, game_state, user)
     assert kwargs == {"trigger_message": message}
+
+
+@pytest.mark.anyio
+async def test_private_lobby_start_hides_host_keyboard(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    host_id = 1
+    host_chat_id = 101
+    guest_id = 2
+    guest_chat_id = 202
+    now = time.time()
+    game_state = GameState(
+        chat_id=host_chat_id,
+        puzzle_id=puzzle.id,
+        host_id=host_id,
+        game_id="private101",
+        mode="turn_based",
+        status="lobby",
+        players={
+            host_id: Player(user_id=host_id, name="Хост", dm_chat_id=host_chat_id, joined_at=now),
+            guest_id: Player(
+                user_id=guest_id,
+                name="Гость",
+                dm_chat_id=guest_chat_id,
+                joined_at=now + 1,
+            ),
+        },
+        language="ru",
+        theme="Тема",
+    )
+    state.active_games[game_state.game_id] = game_state
+    state.lobby_host_invites[game_state.game_id] = (host_chat_id, 555)
+
+    send_message_mock = AsyncMock()
+    context = SimpleNamespace(
+        bot=SimpleNamespace(send_message=send_message_mock),
+        job_queue=None,
+    )
+
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda gs: puzzle)
+    monkeypatch.setattr(app, "_send_game_message", AsyncMock())
+    monkeypatch.setattr(app, "_announce_turn", AsyncMock())
+    monkeypatch.setattr(app, "_schedule_game_timers", lambda ctx, gs: None)
+    monkeypatch.setattr(app, "_store_state", lambda gs: None)
+
+    await app._process_lobby_start(
+        context,
+        game_state,
+        SimpleNamespace(id=host_id),
+    )
+
+    assert any(
+        call.kwargs.get("chat_id") == host_chat_id
+        and isinstance(call.kwargs.get("reply_markup"), ReplyKeyboardRemove)
+        for call in send_message_mock.await_args_list
+    )
+    assert game_state.game_id not in state.lobby_host_invites
 
 
 @pytest.mark.anyio
