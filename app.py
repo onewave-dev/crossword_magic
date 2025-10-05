@@ -2129,6 +2129,54 @@ async def _send_lobby_invite_controls(
     return sent_message_id
 
 
+async def _dismiss_lobby_invite_keyboard(
+    context: ContextTypes.DEFAULT_TYPE, game_state: GameState
+) -> None:
+    """Hide the lobby invite reply keyboard for the host if applicable."""
+
+    stored_invite = state.lobby_host_invites.pop(game_state.game_id, None)
+    if not _is_private_multiplayer(game_state):
+        return
+    host_id = getattr(game_state, "host_id", None)
+    host_chat_id: int | None = None
+    if host_id is not None:
+        host_player = game_state.players.get(host_id)
+        if host_player and host_player.dm_chat_id is not None:
+            host_chat_id = host_player.dm_chat_id
+        elif isinstance(stored_invite, tuple) and len(stored_invite) == 2:
+            host_chat_id = stored_invite[0]
+        else:
+            host_chat_id = _lookup_player_chat(host_id) or host_id
+    elif isinstance(stored_invite, tuple) and len(stored_invite) == 2:
+        host_chat_id = stored_invite[0]
+    if host_chat_id is None:
+        return
+    bot = getattr(context, "bot", None)
+    if bot is None:
+        return
+    try:
+        await bot.send_message(
+            chat_id=host_chat_id,
+            text="Игра началась — клавиатура приглашений скрыта.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Forbidden:
+        logger.debug(
+            "Unable to hide invite keyboard for host %s in chat %s", host_id, host_chat_id
+        )
+    except TelegramError:
+        logger.exception(
+            "Failed to hide invite keyboard for host %s in game %s",
+            host_id,
+            game_state.game_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Unexpected error while hiding invite keyboard for game %s",
+            game_state.game_id,
+        )
+
+
 def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
     has_min_players = len(game_state.players) >= 2
     if has_min_players:
@@ -7445,6 +7493,7 @@ async def _process_lobby_start(
     game_state.turn_order = [player.user_id for player in players_sorted]
     game_state.turn_index = 0
     game_state.status = "running"
+    await _dismiss_lobby_invite_keyboard(context, game_state)
     game_state.active_slot_id = None
     game_state.started_at = time.time()
     game_state.last_update = time.time()
@@ -7455,7 +7504,6 @@ async def _process_lobby_start(
     _schedule_game_timers(context, game_state)
     _store_state(game_state)
     state.lobby_messages.pop(game_state.game_id, None)
-    state.lobby_host_invites.pop(game_state.game_id, None)
     if trigger_query is not None and not query_answered:
         await trigger_query.answer("Игра начинается!")
     elif trigger_query is None:
