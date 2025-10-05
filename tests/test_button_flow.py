@@ -16,6 +16,7 @@ from app import (
     BUTTON_STEP_LANGUAGE,
     BUTTON_STEP_KEY,
     BUTTON_STEP_THEME,
+    LOBBY_START_BUTTON_TEXT,
     MODE_AWAIT_LANGUAGE,
     GENERATION_NOTICE_KEY,
     MODE_AWAIT_THEME,
@@ -181,3 +182,73 @@ async def test_button_theme_handler_generates_puzzle_via_completion_menu(monkeyp
     assert len(job_queue.submitted) == 1
     assert context.chat_data["reminder_job"].name.startswith("hint-reminder-")
     message.reply_text.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_button_language_handler_ignores_lobby_caption():
+    chat = SimpleNamespace(id=999, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text=f"  {LOBBY_START_BUTTON_TEXT}  ",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        chat_data={},
+        user_data={
+            BUTTON_NEW_GAME_KEY: {
+                BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE,
+                BUTTON_LANGUAGE_KEY: "existing",
+            }
+        },
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+
+    app.set_chat_mode(context, app.MODE_AWAIT_LANGUAGE)
+
+    await button_language_handler(update, context)
+
+    flow_state = context.user_data[BUTTON_NEW_GAME_KEY]
+    assert flow_state[BUTTON_LANGUAGE_KEY] == "existing"
+    assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_LANGUAGE
+    assert app.get_chat_mode(context) == MODE_AWAIT_LANGUAGE
+    message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_button_theme_handler_ignores_lobby_caption(monkeypatch):
+    chat_id = 1001
+    chat = SimpleNamespace(id=chat_id, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        text=f" {LOBBY_START_BUTTON_TEXT} ",
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        bot=SimpleNamespace(),
+        chat_data={},
+        user_data={
+            BUTTON_NEW_GAME_KEY: {
+                BUTTON_STEP_KEY: BUTTON_STEP_THEME,
+                BUTTON_LANGUAGE_KEY: "ru",
+            }
+        },
+        job_queue=None,
+    )
+    update = SimpleNamespace(effective_chat=chat, effective_message=message)
+
+    app.set_chat_mode(context, app.MODE_AWAIT_THEME)
+
+    run_generate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_run_generate_puzzle", run_generate_mock)
+
+    state.generating_chats.clear()
+
+    await button_theme_handler(update, context)
+
+    flow_state = context.user_data[BUTTON_NEW_GAME_KEY]
+    assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_THEME
+    assert flow_state[BUTTON_LANGUAGE_KEY] == "ru"
+    assert app.get_chat_mode(context) == MODE_AWAIT_THEME
+    run_generate_mock.assert_not_awaited()
+    assert chat_id not in state.generating_chats
+    message.reply_text.assert_not_awaited()
