@@ -4593,7 +4593,14 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
                 user.id,
             )
             return
-    language = message.text.strip().lower()
+    trimmed_text = message.text.strip()
+    if trimmed_text in LOBBY_CONTROL_CAPTIONS:
+        logger.debug(
+            "Ignoring button language input matching lobby control caption: %s",
+            trimmed_text,
+        )
+        return
+    language = trimmed_text.lower()
     if not language or not language.isalpha():
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
         return
@@ -4897,6 +4904,13 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.effective_message
     if chat is None or message is None or not message.text:
         return
+    trimmed_text = message.text.strip()
+    if trimmed_text in LOBBY_CONTROL_CAPTIONS:
+        logger.debug(
+            "Ignoring button theme input matching lobby control caption: %s",
+            trimmed_text,
+        )
+        return
     user = getattr(update, "effective_user", None)
     if user is not None:
         user_store = _ensure_user_store_for(context, user.id)
@@ -4935,7 +4949,7 @@ async def button_theme_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("Сначала выберите язык через команду /new.")
         flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_LANGUAGE
         return
-    theme = message.text.strip()
+    theme = trimmed_text
     if not theme:
         await message.reply_text("Введите тему, например: Древний Рим.")
         return
