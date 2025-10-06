@@ -709,6 +709,7 @@ LOBBY_INVITE_INSTRUCTION = (
     "Пригласите друзей в игру: используйте кнопки ниже, чтобы выбрать контакт "
     "или создать ссылку."
 )
+LOBBY_WAIT_FOR_HOST_NOTE = "Дождитесь пока инициатор запустит игру... ☕️"
 
 LOBBY_CONTROL_CAPTIONS = {
     LOBBY_INVITE_BUTTON_TEXT,
@@ -1042,6 +1043,7 @@ async def _broadcast_to_players(
     exclude_chat_ids: Iterable[int] | None = None,
     disable_notification: bool | None = None,
     collect_message_ids: bool = False,
+    text_for: Mapping[int, str] | None = None,
 ) -> BroadcastResult:
     """Send a text message to every player participating in the game."""
 
@@ -1050,6 +1052,7 @@ async def _broadcast_to_players(
         if reply_markup_for is not None
         else None
     )
+    text_overrides = dict(text_for) if text_for is not None else {}
     excluded = set(exclude_chat_ids or [])
     collected: dict[int, int] | None = {} if collect_message_ids else None
     successful: set[int] = set()
@@ -1059,13 +1062,14 @@ async def _broadcast_to_players(
         markup = reply_markup
         if allowed_markup_users is not None and user_id not in allowed_markup_users:
             markup = None
+        payload_text = text_overrides.get(user_id, text)
         kwargs = {}
         if chat_id == game_state.chat_id:
             kwargs.update(_thread_kwargs(game_state))
         try:
             sent = await context.bot.send_message(
                 chat_id=chat_id,
-                text=text,
+                text=payload_text,
                 parse_mode=parse_mode,
                 reply_markup=markup,
                 disable_notification=disable_notification,
@@ -2137,6 +2141,8 @@ async def _dismiss_lobby_invite_keyboard(
     stored_invite = state.lobby_host_invites.pop(game_state.game_id, None)
     if not _is_private_multiplayer(game_state):
         return
+    if stored_invite is None:
+        return
     host_id = getattr(game_state, "host_id", None)
     host_chat_id: int | None = None
     if host_id is not None:
@@ -2233,20 +2239,19 @@ async def _publish_lobby_message(
             game_state,
             text=f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}",
         )
-        mapping: dict[int, int] = {}
-        exclude = {host_chat_id} if host_chat_id is not None else set()
+        wait_text = f"{text}\n\n{LOBBY_WAIT_FOR_HOST_NOTE}"
         broadcast = await _broadcast_to_players(
             context,
             game_state,
-            text,
-            reply_markup=keyboard,
+            wait_text,
+            reply_markup=None,
             collect_message_ids=True,
-            exclude_chat_ids=exclude,
+            exclude_chat_ids=(
+                {host_chat_id} if host_chat_id is not None else set()
+            ),
         )
         if broadcast and broadcast.message_ids:
-            mapping.update(broadcast.message_ids)
-        if mapping:
-            state.lobby_messages[game_state.game_id] = mapping
+            state.lobby_messages[game_state.game_id] = broadcast.message_ids
         else:
             state.lobby_messages.pop(game_state.game_id, None)
         return
@@ -2292,6 +2297,7 @@ async def _update_lobby_message(
     elif previous_host_chat_id is not None:
         host_chat_id = previous_host_chat_id
     if _is_private_multiplayer(game_state):
+        wait_text = f"{text}\n\n{LOBBY_WAIT_FOR_HOST_NOTE}"
         expected_chats = {
             chat_id
             for user_id, chat_id in _iter_player_dm_chats(game_state)
@@ -2309,12 +2315,18 @@ async def _update_lobby_message(
         if chat_id not in expected_chats:
             entry.pop(chat_id, None)
             continue
+        if _is_private_multiplayer(game_state):
+            payload_text = wait_text
+            markup = None
+        else:
+            payload_text = text
+            markup = keyboard
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
+                text=payload_text,
+                reply_markup=markup,
             )
         except TelegramError:
             logger.exception(
@@ -2356,8 +2368,8 @@ async def _update_lobby_message(
             broadcast = await _broadcast_to_players(
                 context,
                 game_state,
-                text,
-                reply_markup=keyboard,
+                wait_text,
+                reply_markup=None,
                 exclude_chat_ids=(
                     set(entry)
                     | ({host_chat_id} if host_chat_id is not None else set())
