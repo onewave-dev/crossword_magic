@@ -819,6 +819,19 @@ def _register_player_chat(user_id: int, chat_id: int | None) -> None:
     if chat_id is None:
         return
     state.player_chats[user_id] = chat_id
+    updated_games: list[GameState] = []
+    for game_state in list(state.active_games.values()):
+        if game_state.mode != "turn_based":
+            continue
+        player = game_state.players.get(user_id)
+        if player is None:
+            continue
+        if player.dm_chat_id == chat_id:
+            continue
+        player.dm_chat_id = chat_id
+        updated_games.append(game_state)
+    for game_state in updated_games:
+        _store_state(game_state)
 
 
 def _clear_pending_join_for(user_id: int) -> None:
@@ -7515,6 +7528,13 @@ async def _process_lobby_start(
         await respond("Игра уже запущена или недоступна.", alert=True)
         return
     if len(game_state.players) < 2:
+        logger.info(
+            "Lobby start rejected: not enough players",
+            extra={
+                "game_id": game_state.game_id,
+                "players": sorted(game_state.players),
+            },
+        )
         await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
         await _update_lobby_message(context, game_state)
         return
