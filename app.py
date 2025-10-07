@@ -5695,18 +5695,34 @@ async def lobby_start_button_handler(
     user = update.effective_user
     if chat is None or message is None or user is None:
         return
-    if (message.text or "").strip() != LOBBY_START_BUTTON_TEXT:
+    button_text = (message.text or "").strip()
+    matched = button_text == LOBBY_START_BUTTON_TEXT
+    logger.info(
+        "Lobby start reply button pressed",
+        extra={
+            "where": getattr(chat, "type", None),
+            "chat_id": getattr(chat, "id", None),
+            "user_id": getattr(user, "id", None),
+            "matched": matched,
+        },
+    )
+    if not matched:
         return
     game_state = _load_state_for_chat(chat.id)
     if game_state is None and chat.type == ChatType.PRIVATE:
         game_state = _find_turn_game_for_private_chat(chat.id, user.id)
     if not game_state:
-        if chat.type in GROUP_CHAT_TYPES:
-            await message.reply_text(
-                "В этом чате нет активной игры (лобби). Создайте новую игру или нажмите «Старт» в чате лобби."
-            )
-        else:
-            await message.reply_text("Лобби не найдено. Создайте новую игру.")
+        logger.info(
+            "Lobby start reply button: game not found",
+            extra={
+                "where": getattr(chat, "type", None),
+                "chat_id": getattr(chat, "id", None),
+                "user_id": getattr(user, "id", None),
+            },
+        )
+        await message.reply_text(
+            "Лобби не найдено в этом чате. Создайте новую игру или нажмите «Старт» там, где было создано лобби."
+        )
         return
     await _process_lobby_start(
         context,
