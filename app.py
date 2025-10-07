@@ -2862,6 +2862,61 @@ async def _broadcast_clues_message(
             )
 
 
+async def _share_puzzle_start_assets(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    puzzle: Puzzle | CompositePuzzle,
+) -> None:
+    """Send the freshly prepared puzzle image to players before the first turn."""
+
+    language_display = (puzzle.language or "?").upper()
+    theme_display = puzzle.theme or "(тема не выбрана)"
+    caption = (
+        "Кроссворд готов!\n"
+        f"Язык: {language_display}\n"
+        f"Тема: {theme_display}"
+    )
+    image_bytes: bytes | None = None
+    try:
+        image_path = render_puzzle(puzzle, game_state)
+        with open(image_path, "rb") as photo:
+            image_bytes = photo.read()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to render puzzle image before starting game %s",
+            game_state.game_id,
+        )
+
+    if image_bytes is None:
+        return
+
+    try:
+        await context.bot.send_photo(
+            chat_id=game_state.chat_id,
+            photo=image_bytes,
+            caption=caption,
+            **_thread_kwargs(game_state),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to deliver puzzle image to primary chat for game %s",
+            game_state.game_id,
+        )
+    try:
+        await _broadcast_photo_to_players(
+            context,
+            game_state,
+            image_bytes,
+            caption=caption,
+            exclude_chat_ids={game_state.chat_id},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to broadcast puzzle image to players for game %s",
+            game_state.game_id,
+        )
+
+
 def _sorted_slot_refs(puzzle: Puzzle | CompositePuzzle) -> list[SlotRef]:
     return sorted(
         iter_slot_refs(puzzle),
@@ -7530,6 +7585,7 @@ async def _process_lobby_start(
     _schedule_game_timers(context, game_state)
     _store_state(game_state)
     state.lobby_messages.pop(game_state.game_id, None)
+    await _share_puzzle_start_assets(context, game_state, puzzle)
     if trigger_query is not None and not query_answered:
         await trigger_query.answer("Игра начинается!")
     elif trigger_query is None:
