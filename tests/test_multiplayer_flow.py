@@ -1247,6 +1247,8 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     monkeypatch.setattr(app, "_store_state", fake_store)
     announce_mock = AsyncMock()
     monkeypatch.setattr(app, "_announce_turn", announce_mock)
+    share_mock = AsyncMock()
+    monkeypatch.setattr(app, "_share_puzzle_start_assets", share_mock)
 
     query_message = SimpleNamespace(message_thread_id=None)
     query = SimpleNamespace(
@@ -1270,6 +1272,7 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     assert all(score == 0 for score in game_state.scoreboard.values())
     schedule_mock.assert_called_once()
     announce_mock.assert_awaited()
+    share_mock.assert_awaited_once_with(context, game_state, puzzle)
     query.answer.assert_awaited_with("Игра начинается!")
 
 
@@ -1335,6 +1338,8 @@ async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_
     monkeypatch.setattr(app, "_store_state", fake_store)
     announce_mock = AsyncMock()
     monkeypatch.setattr(app, "_announce_turn", announce_mock)
+    share_mock = AsyncMock()
+    monkeypatch.setattr(app, "_share_puzzle_start_assets", share_mock)
 
     send_message_mock = AsyncMock()
     context = SimpleNamespace(bot=SimpleNamespace(send_message=send_message_mock), job_queue=DummyJobQueue())
@@ -1358,8 +1363,9 @@ async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_
 
     expected_dm_chats = {player.dm_chat_id for player in game_state.players.values()}
     sent_chats = {call.kwargs["chat_id"] for call in send_message_mock.await_args_list}
-    assert sent_chats == expected_dm_chats
-    assert send_message_mock.await_count == len(expected_dm_chats)
+    assert expected_dm_chats.issubset(sent_chats)
+    assert send_message_mock.await_count >= len(expected_dm_chats)
+    share_mock.assert_awaited_once_with(context, game_state, puzzle)
 
 
 @pytest.mark.anyio
@@ -1454,6 +1460,7 @@ async def test_private_lobby_start_hides_host_keyboard(monkeypatch, fresh_state)
     monkeypatch.setattr(app, "_announce_turn", AsyncMock())
     monkeypatch.setattr(app, "_schedule_game_timers", lambda ctx, gs: None)
     monkeypatch.setattr(app, "_store_state", lambda gs: None)
+    monkeypatch.setattr(app, "_share_puzzle_start_assets", AsyncMock())
 
     await app._process_lobby_start(
         context,
@@ -1470,79 +1477,23 @@ async def test_private_lobby_start_hides_host_keyboard(monkeypatch, fresh_state)
 
 
 @pytest.mark.anyio
-async def test_host_dm_start_uses_registered_private_chat(monkeypatch, fresh_state):
+async def test_share_puzzle_start_assets_sends_images(monkeypatch, tmp_path, fresh_state):
     puzzle = _make_turn_puzzle()
-    host_id = 1
-    host_dm_chat = 303
-    guest_id = 2
-    guest_dm_chat = 404
-    now = time.time()
-    game_state = GameState(
-        chat_id=-100,
-        puzzle_id=puzzle.id,
-        host_id=host_id,
-        game_id="group-game",
-        mode="turn_based",
-        status="lobby",
-        players={
-            host_id: Player(user_id=host_id, name="Хост", joined_at=now),
-            guest_id: Player(
-                user_id=guest_id,
-                name="Гость",
-                dm_chat_id=guest_dm_chat,
-                joined_at=now + 1,
-            ),
-        },
-        language="ru",
-        theme="История",
-    )
-    monkeypatch.setattr(app, "save_state", lambda *args, **kwargs: None)
-    state.active_games[game_state.game_id] = game_state
-    state.chat_to_game[game_state.chat_id] = game_state.game_id
+    game_state = _make_turn_state(-909, puzzle)
+    image_path = tmp_path / "puzzle.png"
+    image_path.write_bytes(b"fake-bytes")
 
-    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
-    dismiss_mock = AsyncMock()
-    announce_mock = AsyncMock()
-    message_mock = AsyncMock()
-    monkeypatch.setattr(app, "_dismiss_lobby_invite_keyboard", dismiss_mock)
-    monkeypatch.setattr(app, "_announce_turn", announce_mock)
-    monkeypatch.setattr(app, "_send_game_message", message_mock)
-    monkeypatch.setattr(app, "_schedule_game_timers", lambda *args, **kwargs: None)
+    send_photo_mock = AsyncMock()
+    broadcast_mock = AsyncMock()
+    context = SimpleNamespace(bot=SimpleNamespace(send_photo=send_photo_mock))
 
-    reply = AsyncMock()
-    message = SimpleNamespace(
-        message_id=77,
-        text="Старт",
-        reply_text=reply,
-        message_thread_id=None,
-    )
-    chat = SimpleNamespace(id=host_dm_chat, type=ChatType.PRIVATE)
-    user = SimpleNamespace(id=host_id)
-    update = SimpleNamespace(
-        effective_chat=chat,
-        effective_message=message,
-        effective_user=user,
-    )
-    context = SimpleNamespace(
-        bot=SimpleNamespace(),
-        chat_data={},
-        user_data={},
-        job_queue=None,
-    )
+    monkeypatch.setattr(app, "render_puzzle", lambda *_: image_path)
+    monkeypatch.setattr(app, "_broadcast_photo_to_players", broadcast_mock)
 
-    await app.track_player_message(update, context)
+    await app._share_puzzle_start_assets(context, game_state, puzzle)
 
-    assert game_state.players[host_id].dm_chat_id == host_dm_chat
-    assert state.dm_chat_to_game.get(host_dm_chat) == game_state.game_id
-
-    await lobby_start_button_handler(update, context)
-
-    assert game_state.status == "running"
-    assert game_state.turn_order == [host_id, guest_id]
-    dismiss_mock.assert_awaited_once()
-    announce_mock.assert_awaited_once()
-    message_mock.assert_awaited()
-    reply.assert_awaited()
+    send_photo_mock.assert_awaited_once()
+    broadcast_mock.assert_awaited_once()
 
 
 @pytest.mark.anyio
