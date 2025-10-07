@@ -1274,6 +1274,46 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_lobby_wait_callback_routes_to_start_logic(monkeypatch, fresh_state):
+    game_state = GameState(
+        chat_id=-4242,
+        puzzle_id="demo",
+        host_id=1,
+        status="lobby",
+        mode="turn_based",
+        players={1: Player(user_id=1, name="Хост", dm_chat_id=101)},
+    )
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: game_state)
+    process_mock = AsyncMock()
+    monkeypatch.setattr(app, "_process_lobby_start", process_mock)
+
+    message = SimpleNamespace(message_thread_id=None)
+    query = SimpleNamespace(
+        data=f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}",
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=SimpleNamespace(id=game_state.chat_id, type=ChatType.GROUP),
+        effective_message=message,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(), job_queue=None)
+
+    await lobby_start_callback_handler(update, context)
+
+    process_mock.assert_awaited_once()
+    args, kwargs = process_mock.await_args
+    assert args == (context, game_state, update.effective_user)
+    assert kwargs == {"trigger_query": query, "trigger_message": message}
+    query.answer.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(888, puzzle)
@@ -1427,6 +1467,82 @@ async def test_private_lobby_start_hides_host_keyboard(monkeypatch, fresh_state)
         for call in send_message_mock.await_args_list
     )
     assert game_state.game_id not in state.lobby_host_invites
+
+
+@pytest.mark.anyio
+async def test_host_dm_start_uses_registered_private_chat(monkeypatch, fresh_state):
+    puzzle = _make_turn_puzzle()
+    host_id = 1
+    host_dm_chat = 303
+    guest_id = 2
+    guest_dm_chat = 404
+    now = time.time()
+    game_state = GameState(
+        chat_id=-100,
+        puzzle_id=puzzle.id,
+        host_id=host_id,
+        game_id="group-game",
+        mode="turn_based",
+        status="lobby",
+        players={
+            host_id: Player(user_id=host_id, name="Хост", joined_at=now),
+            guest_id: Player(
+                user_id=guest_id,
+                name="Гость",
+                dm_chat_id=guest_dm_chat,
+                joined_at=now + 1,
+            ),
+        },
+        language="ru",
+        theme="История",
+    )
+    monkeypatch.setattr(app, "save_state", lambda *args, **kwargs: None)
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
+    dismiss_mock = AsyncMock()
+    announce_mock = AsyncMock()
+    message_mock = AsyncMock()
+    monkeypatch.setattr(app, "_dismiss_lobby_invite_keyboard", dismiss_mock)
+    monkeypatch.setattr(app, "_announce_turn", announce_mock)
+    monkeypatch.setattr(app, "_send_game_message", message_mock)
+    monkeypatch.setattr(app, "_schedule_game_timers", lambda *args, **kwargs: None)
+
+    reply = AsyncMock()
+    message = SimpleNamespace(
+        message_id=77,
+        text="Старт",
+        reply_text=reply,
+        message_thread_id=None,
+    )
+    chat = SimpleNamespace(id=host_dm_chat, type=ChatType.PRIVATE)
+    user = SimpleNamespace(id=host_id)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(
+        bot=SimpleNamespace(),
+        chat_data={},
+        user_data={},
+        job_queue=None,
+    )
+
+    await app.track_player_message(update, context)
+
+    assert game_state.players[host_id].dm_chat_id == host_dm_chat
+    assert state.dm_chat_to_game.get(host_dm_chat) == game_state.game_id
+
+    await lobby_start_button_handler(update, context)
+
+    assert game_state.status == "running"
+    assert game_state.turn_order == [host_id, guest_id]
+    dismiss_mock.assert_awaited_once()
+    announce_mock.assert_awaited_once()
+    message_mock.assert_awaited()
+    reply.assert_awaited()
 
 
 @pytest.mark.anyio

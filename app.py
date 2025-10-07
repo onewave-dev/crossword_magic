@@ -819,6 +819,19 @@ def _register_player_chat(user_id: int, chat_id: int | None) -> None:
     if chat_id is None:
         return
     state.player_chats[user_id] = chat_id
+    updated_games: list[GameState] = []
+    for game_state in list(state.active_games.values()):
+        if game_state.mode != "turn_based":
+            continue
+        player = game_state.players.get(user_id)
+        if player is None:
+            continue
+        if player.dm_chat_id == chat_id:
+            continue
+        player.dm_chat_id = chat_id
+        updated_games.append(game_state)
+    for game_state in updated_games:
+        _store_state(game_state)
 
 
 def _clear_pending_join_for(user_id: int) -> None:
@@ -5586,11 +5599,25 @@ async def lobby_start_callback_handler(
     if query is None or not query.data:
         return
     data = query.data
+    user = update.effective_user
+    if data.startswith(LOBBY_WAIT_CALLBACK_PREFIX):
+        game_id = data[len(LOBBY_WAIT_CALLBACK_PREFIX) :]
+        game_state = _load_state_by_game_id(game_id)
+        if not game_state or user is None:
+            await query.answer("Лобби недоступно.", show_alert=True)
+            return
+        await _process_lobby_start(
+            context,
+            game_state,
+            user,
+            trigger_query=query,
+            trigger_message=query.message,
+        )
+        return
     if not data.startswith(LOBBY_START_CALLBACK_PREFIX):
         return
     game_id = data[len(LOBBY_START_CALLBACK_PREFIX) :]
     game_state = _load_state_by_game_id(game_id)
-    user = update.effective_user
     if not game_state or user is None:
         await query.answer("Лобби недоступно.", show_alert=True)
         return
@@ -7446,6 +7473,13 @@ async def _process_lobby_start(
         await respond("Игра уже запущена или недоступна.", alert=True)
         return
     if len(game_state.players) < 2:
+        logger.info(
+            "Lobby start rejected: not enough players",
+            extra={
+                "game_id": game_state.game_id,
+                "players": sorted(game_state.players),
+            },
+        )
         await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
         await _update_lobby_message(context, game_state)
         return
