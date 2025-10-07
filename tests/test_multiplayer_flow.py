@@ -1277,6 +1277,46 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_lobby_wait_callback_routes_to_start_logic(monkeypatch, fresh_state):
+    game_state = GameState(
+        chat_id=-4242,
+        puzzle_id="demo",
+        host_id=1,
+        status="lobby",
+        mode="turn_based",
+        players={1: Player(user_id=1, name="Хост", dm_chat_id=101)},
+    )
+    state.active_games[game_state.game_id] = game_state
+    state.chat_to_game[game_state.chat_id] = game_state.game_id
+
+    monkeypatch.setattr(app, "_load_state_by_game_id", lambda _: game_state)
+    process_mock = AsyncMock()
+    monkeypatch.setattr(app, "_process_lobby_start", process_mock)
+
+    message = SimpleNamespace(message_thread_id=None)
+    query = SimpleNamespace(
+        data=f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}",
+        answer=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=SimpleNamespace(id=game_state.chat_id, type=ChatType.GROUP),
+        effective_message=message,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(), job_queue=None)
+
+    await lobby_start_callback_handler(update, context)
+
+    process_mock.assert_awaited_once()
+    args, kwargs = process_mock.await_args
+    assert args == (context, game_state, update.effective_user)
+    assert kwargs == {"trigger_query": query, "trigger_message": message}
+    query.answer.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_lobby_start_callback_private_broadcasts_start(monkeypatch, fresh_state):
     puzzle = _make_turn_puzzle()
     game_state = _make_turn_state(888, puzzle)

@@ -5641,11 +5641,25 @@ async def lobby_start_callback_handler(
     if query is None or not query.data:
         return
     data = query.data
+    user = update.effective_user
+    if data.startswith(LOBBY_WAIT_CALLBACK_PREFIX):
+        game_id = data[len(LOBBY_WAIT_CALLBACK_PREFIX) :]
+        game_state = _load_state_by_game_id(game_id)
+        if not game_state or user is None:
+            await query.answer("Лобби недоступно.", show_alert=True)
+            return
+        await _process_lobby_start(
+            context,
+            game_state,
+            user,
+            trigger_query=query,
+            trigger_message=query.message,
+        )
+        return
     if not data.startswith(LOBBY_START_CALLBACK_PREFIX):
         return
     game_id = data[len(LOBBY_START_CALLBACK_PREFIX) :]
     game_state = _load_state_by_game_id(game_id)
-    user = update.effective_user
     if not game_state or user is None:
         await query.answer("Лобби недоступно.", show_alert=True)
         return
