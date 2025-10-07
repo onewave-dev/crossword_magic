@@ -5695,15 +5695,18 @@ async def lobby_start_button_handler(
     user = update.effective_user
     if chat is None or message is None or user is None:
         return
-    if chat.type != ChatType.PRIVATE:
-        return
     if (message.text or "").strip() != LOBBY_START_BUTTON_TEXT:
         return
     game_state = _load_state_for_chat(chat.id)
-    if game_state is None or game_state.mode == "single":
+    if game_state is None and chat.type == ChatType.PRIVATE:
         game_state = _find_turn_game_for_private_chat(chat.id, user.id)
     if not game_state:
-        await message.reply_text("Лобби не найдено. Создайте новую игру.")
+        if chat.type in GROUP_CHAT_TYPES:
+            await message.reply_text(
+                "В этом чате нет активной игры (лобби). Создайте новую игру или нажмите «Старт» в чате лобби."
+            )
+        else:
+            await message.reply_text("Лобби не найдено. Создайте новую игру.")
         return
     await _process_lobby_start(
         context,
