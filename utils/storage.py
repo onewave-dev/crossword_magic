@@ -123,6 +123,8 @@ class GameState:
     dummy_successes: int = 0
     dummy_failures: int = 0
     dummy_total_delay: float = 0.0
+    auto_start_on_ready: bool = False
+    generation_in_progress: bool = False
 
     def __post_init__(self) -> None:
         self.game_id = str(self.game_id or self.chat_id)
@@ -243,6 +245,8 @@ class GameState:
             self.language = str(self.language)
         if self.theme:
             self.theme = str(self.theme)
+        self.auto_start_on_ready = bool(self.auto_start_on_ready)
+        self.generation_in_progress = bool(self.generation_in_progress)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the state into a JSON-compatible dictionary."""
@@ -287,6 +291,8 @@ class GameState:
             "dummy_successes": self.dummy_successes,
             "dummy_failures": self.dummy_failures,
             "dummy_total_delay": self.dummy_total_delay,
+            "auto_start_on_ready": self.auto_start_on_ready,
+            "generation_in_progress": self.generation_in_progress,
         }
 
     @classmethod
@@ -473,6 +479,10 @@ class GameState:
             dummy_successes=dummy_successes,
             dummy_failures=dummy_failures,
             dummy_total_delay=dummy_total_delay,
+            auto_start_on_ready=bool(payload.get("auto_start_on_ready", False)),
+            generation_in_progress=bool(
+                payload.get("generation_in_progress", False)
+            ),
         )
 
 

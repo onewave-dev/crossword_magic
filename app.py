@@ -698,7 +698,7 @@ GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
 LOBBY_INVITE_CALLBACK_PREFIX = "lobby_invite:"
 LOBBY_LINK_CALLBACK_PREFIX = "lobby_link:"
-LOBBY_START_CALLBACK_PREFIX = "lobby_start:"
+LOBBY_START_CALLBACK_PREFIX = "lobby:start:"
 LOBBY_WAIT_CALLBACK_PREFIX = "lobby_wait:"
 
 LOBBY_INVITE_BUTTON_TEXT = "Пригласить из контактов"
@@ -2070,7 +2070,6 @@ def _build_lobby_invite_keyboard(request_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(**request_button_kwargs)],
         [KeyboardButton(text=LOBBY_LINK_BUTTON_TEXT)],
-        [KeyboardButton(text=LOBBY_START_BUTTON_TEXT)],
         [
             KeyboardButton(
                 text=LOBBY_SHARE_CONTACT_BUTTON_TEXT,
@@ -2106,7 +2105,20 @@ async def _send_lobby_invite_controls(
     if request_id is None or force:
         request_id = secrets.randbelow(2**31 - 1) + 1
     keyboard = _build_lobby_invite_keyboard(request_id)
-    message_text = text or LOBBY_INVITE_INSTRUCTION
+    inline_keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    text=LOBBY_START_BUTTON_TEXT,
+                    callback_data=f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}",
+                )
+            ]
+        ]
+    )
+    if text:
+        message_text = f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}"
+    else:
+        message_text = LOBBY_INVITE_INSTRUCTION
     sent_message_id: int | None = None
     if should_send:
         try:
@@ -2141,6 +2153,16 @@ async def _send_lobby_invite_controls(
                 dm_chat_id,
                 sent_message_id,
             )
+            edit_reply_markup = getattr(
+                context.bot, "edit_message_reply_markup", None
+            )
+            if callable(edit_reply_markup):
+                with suppress(BadRequest, TelegramError):
+                    await edit_reply_markup(
+                        chat_id=dm_chat_id,
+                        message_id=sent_message_id,
+                        reply_markup=inline_keyboard,
+                    )
     join_code = _find_existing_join_code(game_state)
     _update_host_pending_invite(context, host_id, game_state.game_id, request_id, join_code)
     return sent_message_id
@@ -2207,6 +2229,10 @@ def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _is_puzzle_ready(game_state: GameState) -> bool:
+    return bool(game_state.puzzle_id)
+
+
 def _format_lobby_text(game_state: GameState) -> str:
     language = (game_state.language or "?").upper()
     theme = game_state.theme or "(тема не выбрана)"
@@ -2214,10 +2240,13 @@ def _format_lobby_text(game_state: GameState) -> str:
         _player_display_name(player) for player in game_state.players.values()
     )
     generation_task = state.lobby_generation_tasks.get(game_state.game_id or "")
-    generating = bool(generation_task and not generation_task.done())
-    if generating:
+    generating = bool(generation_task and not generation_task.done()) or bool(
+        getattr(game_state, "generation_in_progress", False)
+    )
+    puzzle_ready = bool(game_state.puzzle_id)
+    if generating and not puzzle_ready:
         puzzle_status = "Статус пазла: генерируется…"
-    elif game_state.puzzle_id:
+    elif puzzle_ready:
         puzzle_status = "Статус пазла: готов к старту ✅"
     else:
         puzzle_status = "Статус пазла: ожидает подготовки"
@@ -2534,11 +2563,16 @@ async def _run_lobby_puzzle_generation(
         logger.exception("Failed to publish lobby update for game %s", game_id)
     _clear_generation_notice_for_game(context, refreshed)
     if update_succeeded:
+        notify_text = (
+            "Кроссворд готов! Нажмите «Старт», чтобы начать игру."
+            if not getattr(refreshed, "auto_start_on_ready", False)
+            else "Кроссворд готов! Игра начнётся автоматически."
+        )
         try:
             await _send_game_message(
                 context,
                 refreshed,
-                "Кроссворд готов! Нажмите «Старт», чтобы начать игру.",
+                notify_text,
             )
         except TelegramError:
             logger.exception(
@@ -2546,6 +2580,96 @@ async def _run_lobby_puzzle_generation(
                 refreshed.game_id,
             )
     state.lobby_generation_tasks.pop(game_id, None)
+
+
+async def _ensure_puzzle_generated_and_autostart(
+    context: ContextTypes.DEFAULT_TYPE, game_id: str
+) -> None:
+    generation_succeeded = False
+    try:
+        while True:
+            game_state = _load_state_by_game_id(game_id)
+            if game_state is None:
+                return
+            if game_state.status != "lobby":
+                generation_succeeded = True
+                return
+            if _is_puzzle_ready(game_state):
+                generation_succeeded = True
+                break
+            existing_task = state.lobby_generation_tasks.get(game_id)
+            if existing_task is None or existing_task.done():
+                language = game_state.language
+                theme = game_state.theme
+                if not language or not theme:
+                    logger.info(
+                        "Cannot auto-generate puzzle for game %s: language or theme missing",
+                        game_id,
+                    )
+                    return
+                existing_task = asyncio.create_task(
+                    _run_lobby_puzzle_generation(
+                        context, game_id, language, theme
+                    )
+                )
+                state.lobby_generation_tasks[game_id] = existing_task
+            try:
+                await existing_task
+            except asyncio.CancelledError:
+                logger.info(
+                    "Lobby generation cancelled while waiting to autostart game %s",
+                    game_id,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "Generation task failed while waiting to autostart game %s",
+                    game_id,
+                )
+                return
+            refreshed_after_task = _load_state_by_game_id(game_id)
+            if refreshed_after_task is None:
+                return
+            if refreshed_after_task.status != "lobby":
+                generation_succeeded = True
+                break
+            if _is_puzzle_ready(refreshed_after_task):
+                generation_succeeded = True
+                break
+            break
+    finally:
+        refreshed = _load_state_by_game_id(game_id)
+        if refreshed is None:
+            return
+        try:
+            if (
+                refreshed.status == "lobby"
+                and getattr(refreshed, "auto_start_on_ready", False)
+                and _is_puzzle_ready(refreshed)
+            ):
+                started = await _start_game(context, refreshed)
+                if not started:
+                    try:
+                        await _send_game_message(
+                            context,
+                            refreshed,
+                            "Не удалось автоматически запустить игру. "
+                            "Убедитесь, что в лобби минимум два игрока и попробуйте снова.",
+                        )
+                    except TelegramError:
+                        logger.exception(
+                            "Failed to notify game %s about auto-start failure",
+                            refreshed.game_id,
+                        )
+                generation_succeeded = generation_succeeded or started
+        finally:
+            refreshed_state = _load_state_by_game_id(game_id)
+            if refreshed_state is None:
+                return
+            refreshed_state.generation_in_progress = False
+            if not generation_succeeded and refreshed_state.status == "lobby":
+                refreshed_state.auto_start_on_ready = False
+            _store_state(refreshed_state)
 
 
 def _load_state_by_game_id(game_id: str) -> GameState | None:
@@ -5656,9 +5780,12 @@ async def lobby_start_callback_handler(
     data = query.data
     user = update.effective_user
     if data.startswith(LOBBY_WAIT_CALLBACK_PREFIX):
-        game_id = data[len(LOBBY_WAIT_CALLBACK_PREFIX) :]
+        game_id = data.split(":", 1)[-1]
+        if user is None:
+            await query.answer("Лобби недоступно.", show_alert=True)
+            return
         game_state = _load_state_by_game_id(game_id)
-        if not game_state or user is None:
+        if not game_state:
             await query.answer("Лобби недоступно.", show_alert=True)
             return
         await _process_lobby_start(
@@ -5671,18 +5798,69 @@ async def lobby_start_callback_handler(
         return
     if not data.startswith(LOBBY_START_CALLBACK_PREFIX):
         return
-    game_id = data[len(LOBBY_START_CALLBACK_PREFIX) :]
-    game_state = _load_state_by_game_id(game_id)
-    if not game_state or user is None:
+    if user is None:
         await query.answer("Лобби недоступно.", show_alert=True)
         return
-    await _process_lobby_start(
-        context,
-        game_state,
-        user,
-        trigger_query=query,
-        trigger_message=query.message,
+    game_id = data.split(":", 2)[-1]
+    game_state = _load_state_by_game_id(game_id)
+    if not game_state:
+        await query.answer("Лобби недоступно.", show_alert=True)
+        return
+    if game_state.status != "lobby":
+        await query.answer("Игра уже запущена или недоступна.", show_alert=True)
+        return
+    if user.id != game_state.host_id:
+        await query.answer("Только создатель комнаты может запустить игру.", show_alert=True)
+        return
+    if len(game_state.players) < 2:
+        await query.answer("Нужно минимум два игрока, чтобы начать игру.", show_alert=True)
+        return
+    if _is_puzzle_ready(game_state):
+        started = await _start_game(context, game_state)
+        if started:
+            if query.message is not None:
+                edit_markup = getattr(query, "edit_message_reply_markup", None)
+                if callable(edit_markup):
+                    with suppress(BadRequest, TelegramError):
+                        await edit_markup(reply_markup=None)
+            await query.answer("Игра начинается!")
+        else:
+            await query.answer("Не удалось запустить игру. Попробуйте позже.", show_alert=True)
+        return
+    if not game_state.language or not game_state.theme:
+        await query.answer("Сначала выберите язык и тему.", show_alert=True)
+        return
+
+    wait_text = (
+        "Подождите, кроссворд готовится, игра начнётся как только он будет готов…"
     )
+    if query.message is not None:
+        with suppress(BadRequest, TelegramError):
+            await query.edit_message_text(wait_text)
+    await query.answer("Готовим кроссворд...")
+
+    existing_task = state.lobby_generation_tasks.get(game_state.game_id)
+    task_active = existing_task is not None and not existing_task.done()
+    should_send_notice = not task_active
+
+    game_state.auto_start_on_ready = True
+    game_state.generation_in_progress = True
+    _store_state(game_state)
+
+    if should_send_notice:
+        await _send_generation_notice_to_game(
+            context,
+            game_state,
+            "Готовим кроссворд, это может занять немного времени...",
+            message=query.message,
+        )
+
+    helper_task = _ensure_puzzle_generated_and_autostart(context, game_state.game_id)
+    application = getattr(context, "application", None)
+    if application is not None:
+        application.create_task(helper_task)
+    else:
+        asyncio.create_task(helper_task)
 
 
 @command_entrypoint()
@@ -7181,6 +7359,14 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         group=-1,
     )
     telegram_application.add_handler(
+        CallbackQueryHandler(
+            lobby_start_callback_handler,
+            pattern = rf"^(?:{re.escape(LOBBY_START_CALLBACK_PREFIX)}|{re.escape(LOBBY_WAIT_CALLBACK_PREFIX)})"
+            block=False,
+        ),
+        group=-2,
+    )
+    telegram_application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & PENDING_JOIN_FILTER,
             join_name_response_handler,
@@ -7221,14 +7407,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     )
     telegram_application.add_handler(
         MessageHandler(
-            filters.TEXT
-            & filters.Regex(fr"^{re.escape(LOBBY_START_BUTTON_TEXT)}$"),
-            lobby_start_button_handler,
-            block=False,
-        )
-    )
-    telegram_application.add_handler(
-        MessageHandler(
             filters.CONTACT | USER_SHARED_FILTER,
             lobby_contact_handler,
             block=False,
@@ -7246,13 +7424,6 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         CallbackQueryHandler(
             completion_callback_handler,
             pattern=fr"^{COMPLETION_CALLBACK_PREFIX}",
-        )
-    )
-    telegram_application.add_handler(
-        CallbackQueryHandler(
-            lobby_start_callback_handler,
-            pattern=fr"^{LOBBY_START_CALLBACK_PREFIX}.*|^{LOBBY_WAIT_CALLBACK_PREFIX}.*",
-            block=False,
         )
     )
     telegram_application.add_handler(
@@ -7529,12 +7700,83 @@ async def reset_webhook(
 
 __all__ = ["app"]
 
+async def _start_game(
+    context: ContextTypes.DEFAULT_TYPE, game_state: GameState
+) -> bool:
+    if game_state.status != "lobby":
+        logger.info(
+            "Start request ignored because game %s is in status %s",
+            game_state.game_id,
+            game_state.status,
+        )
+        return False
+
+    puzzle = _load_puzzle_for_state(game_state)
+    if puzzle is None:
+        logger.error(
+            "Cannot start game %s: puzzle is not available",
+            game_state.game_id,
+        )
+        return False
+
+    players_sorted = sorted(
+        game_state.players.values(), key=lambda player: player.joined_at
+    )
+    if len(players_sorted) < 2:
+        logger.info(
+            "Start request rejected for game %s: not enough players",
+            game_state.game_id,
+        )
+        return False
+
+    await _dismiss_lobby_invite_keyboard(context, game_state)
+
+    now = time.time()
+    game_state.turn_order = [player.user_id for player in players_sorted]
+    game_state.turn_index = 0
+    game_state.status = "running"
+    game_state.active_slot_id = None
+    game_state.started_at = now
+    game_state.last_update = now
+    game_state.auto_start_on_ready = False
+    game_state.generation_in_progress = False
+    for player in players_sorted:
+        game_state.scoreboard[player.user_id] = 0
+        player.answers_ok = 0
+        player.answers_fail = 0
+
+    _schedule_game_timers(context, game_state)
+    _store_state(game_state)
+    state.lobby_messages.pop(game_state.game_id, None)
+
+    await _share_puzzle_start_assets(context, game_state, puzzle)
+    await _send_game_message(
+        context,
+        game_state,
+        "Игра началась! Ходы идут по очереди.",
+    )
+
+    first_player = players_sorted[0] if players_sorted else None
+    prefix = (
+        f"Первым ходит {first_player.name}!"
+        if first_player is not None
+        else "Игра начинается!"
+    )
+    await _announce_turn(
+        context,
+        game_state,
+        puzzle,
+        prefix=prefix,
+    )
+    return True
+
+
 async def _process_lobby_start(
     context: ContextTypes.DEFAULT_TYPE,
     game_state: GameState,
     user: User,
     *,
-    trigger_query=None,
+    trigger_query: Any | None = None,
     trigger_message: Message | None = None,
 ) -> None:
     async def respond(text: str, *, alert: bool = False) -> None:
@@ -7547,112 +7789,48 @@ async def _process_lobby_start(
         await respond("Игра уже запущена или недоступна.", alert=True)
         return
     if len(game_state.players) < 2:
-        logger.info(
-            "Lobby start rejected: not enough players",
-            extra={
-                "game_id": game_state.game_id,
-                "players": sorted(game_state.players),
-            },
-        )
         await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
         await _update_lobby_message(context, game_state)
         return
-    if not user or user.id != game_state.host_id:
+    if user is None or user.id != game_state.host_id:
         await respond("Только создатель комнаты может начинать игру.", alert=True)
         return
 
-    puzzle = _load_puzzle_for_state(game_state)
-    query_answered = False
-    if puzzle is None:
-        language = game_state.language
-        theme = game_state.theme
-        if not language or not theme:
-            await respond("Сначала выберите язык и тему.", alert=True)
-            return
-        generation_task = state.lobby_generation_tasks.get(game_state.game_id)
-        if generation_task and generation_task.done():
-            state.lobby_generation_tasks.pop(game_state.game_id, None)
-            generation_task = None
-        if generation_task is None:
-            await _send_generation_notice_to_game(
-                context,
-                game_state,
-                "Готовим кроссворд, это может занять немного времени...",
-                message=trigger_message,
+    if _is_puzzle_ready(game_state):
+        started = await _start_game(context, game_state)
+        if started:
+            await respond("Игра начинается!")
+        else:
+            await respond(
+                "Не удалось запустить игру. Попробуйте позже.",
+                alert=True,
             )
-            generation_task = asyncio.create_task(
-                _run_lobby_puzzle_generation(context, game_state.game_id, language, theme)
-            )
-            state.lobby_generation_tasks[game_state.game_id] = generation_task
-        await respond("Кроссворд готовится, это может занять немного времени.")
-        query_answered = True
-        try:
-            await generation_task
-        except asyncio.CancelledError:
-            logger.info("Lobby puzzle generation cancelled while starting game %s", game_state.game_id)
-            return
-        except Exception:
-            logger.exception("Unexpected error while awaiting lobby generation for %s", game_state.game_id)
-            await _send_game_message(
-                context,
-                game_state,
-                "Не удалось подготовить кроссворд. Попробуйте начать позже.",
-            )
-            return
-        refreshed_state = _load_state_by_game_id(game_state.game_id)
-        if refreshed_state is None or refreshed_state.puzzle_id == "":
-            await _send_game_message(
-                context,
-                game_state,
-                "Кроссворд так и не был подготовлен. Попробуйте ещё раз позже.",
-            )
-            return
-        game_state = refreshed_state
-        puzzle = _load_puzzle_for_state(game_state)
-        if puzzle is None:
-            await _send_game_message(
-                context,
-                game_state,
-                "Не удалось загрузить кроссворд. Попробуйте позже.",
-            )
-            return
-
-    players_sorted = sorted(
-        game_state.players.values(), key=lambda player: player.joined_at
-    )
-    if len(players_sorted) < 2:
-        await respond("Нужно минимум два игрока, чтобы начать игру.", alert=True)
-        await _update_lobby_message(context, game_state)
         return
-    game_state.turn_order = [player.user_id for player in players_sorted]
-    game_state.turn_index = 0
-    game_state.status = "running"
-    await _dismiss_lobby_invite_keyboard(context, game_state)
-    game_state.active_slot_id = None
-    game_state.started_at = time.time()
-    game_state.last_update = time.time()
-    for player in players_sorted:
-        game_state.scoreboard[player.user_id] = 0
-        player.answers_ok = 0
-        player.answers_fail = 0
-    _schedule_game_timers(context, game_state)
+
+    if not game_state.language or not game_state.theme:
+        await respond("Сначала выберите язык и тему.", alert=True)
+        return
+
+    existing_task = state.lobby_generation_tasks.get(game_state.game_id)
+    task_active = existing_task is not None and not existing_task.done()
+    if not task_active:
+        await _send_generation_notice_to_game(
+            context,
+            game_state,
+            "Готовим кроссворд, это может занять немного времени...",
+            message=trigger_message,
+        )
+    await respond("Кроссворд готовится, это может занять немного времени.")
+
+    game_state.auto_start_on_ready = True
+    game_state.generation_in_progress = True
     _store_state(game_state)
-    state.lobby_messages.pop(game_state.game_id, None)
-    await _share_puzzle_start_assets(context, game_state, puzzle)
-    if trigger_query is not None and not query_answered:
-        await trigger_query.answer("Игра начинается!")
-    elif trigger_query is None:
-        await respond("Игра начинается!")
-    await _send_game_message(
-        context,
-        game_state,
-        "Игра началась! Ходы идут по очереди.",
-    )
-    await _announce_turn(
-        context,
-        game_state,
-        puzzle,
-        prefix=f"Первым ходит {players_sorted[0].name}!",
-    )
+
+    helper_task = _ensure_puzzle_generated_and_autostart(context, game_state.game_id)
+    application = getattr(context, "application", None)
+    if application is not None:
+        application.create_task(helper_task)
+    else:
+        asyncio.create_task(helper_task)
 
 
