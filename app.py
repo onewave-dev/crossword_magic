@@ -2059,7 +2059,15 @@ def _update_host_pending_invite(
     store["pending_invite"] = pending
 
 
-def _build_lobby_invite_keyboard(request_id: int) -> ReplyKeyboardMarkup:
+def _should_show_lobby_start_button(game_state: GameState) -> bool:
+    """Return True if the host can launch the lobby via the start button."""
+
+    return len(game_state.players) >= 2
+
+
+def _build_lobby_invite_keyboard(
+    request_id: int, *, show_start: bool = False
+) -> ReplyKeyboardMarkup:
     request_button_kwargs = {
         "text": LOBBY_INVITE_BUTTON_TEXT,
         _KEYBOARD_REQUEST_USER_KWARG: KeyboardButtonRequestUser(
@@ -2067,16 +2075,21 @@ def _build_lobby_invite_keyboard(request_id: int) -> ReplyKeyboardMarkup:
             user_is_bot=False,
         ),
     }
-    rows = [
-        [KeyboardButton(**request_button_kwargs)],
-        [KeyboardButton(text=LOBBY_LINK_BUTTON_TEXT)],
+    rows: list[list[KeyboardButton]] = []
+    if show_start:
+        rows.append([KeyboardButton(text=LOBBY_START_BUTTON_TEXT)])
+    rows.extend(
         [
-            KeyboardButton(
-                text=LOBBY_SHARE_CONTACT_BUTTON_TEXT,
-                request_contact=True,
-            )
-        ],
-    ]
+            [KeyboardButton(**request_button_kwargs)],
+            [KeyboardButton(text=LOBBY_LINK_BUTTON_TEXT)],
+            [
+                KeyboardButton(
+                    text=LOBBY_SHARE_CONTACT_BUTTON_TEXT,
+                    request_contact=True,
+                )
+            ],
+        ]
+    )
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
 
 
@@ -2104,17 +2117,20 @@ async def _send_lobby_invite_controls(
     should_send = force or request_id is None
     if request_id is None or force:
         request_id = secrets.randbelow(2**31 - 1) + 1
-    keyboard = _build_lobby_invite_keyboard(request_id)
-    inline_keyboard = InlineKeyboardMarkup(
-        [
+    show_start = _should_show_lobby_start_button(game_state)
+    keyboard = _build_lobby_invite_keyboard(request_id, show_start=show_start)
+    inline_keyboard: InlineKeyboardMarkup | None = None
+    if show_start:
+        inline_keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    text=LOBBY_START_BUTTON_TEXT,
-                    callback_data=f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}",
-                )
+                [
+                    InlineKeyboardButton(
+                        text=LOBBY_START_BUTTON_TEXT,
+                        callback_data=f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}",
+                    )
+                ]
             ]
-        ]
-    )
+        )
     if text:
         message_text = f"{text}\n\n{LOBBY_INVITE_INSTRUCTION}"
     else:
@@ -2161,6 +2177,18 @@ async def _send_lobby_invite_controls(
                     await edit_reply_markup(
                         chat_id=dm_chat_id,
                         message_id=sent_message_id,
+                        reply_markup=inline_keyboard,
+                    )
+    else:
+        stored_invite = state.lobby_host_invites.get(game_state.game_id)
+        if isinstance(stored_invite, tuple) and len(stored_invite) == 2:
+            target_chat_id, target_message_id = stored_invite
+            edit_reply_markup = getattr(context.bot, "edit_message_reply_markup", None)
+            if callable(edit_reply_markup):
+                with suppress(BadRequest, TelegramError):
+                    await edit_reply_markup(
+                        chat_id=target_chat_id,
+                        message_id=target_message_id,
                         reply_markup=inline_keyboard,
                     )
     join_code = _find_existing_join_code(game_state)
@@ -5383,11 +5411,9 @@ async def lobby_contact_handler(
         code_hint = pending.get("code")
     else:
         pending = None
-    reply_keyboard = (
-        _build_lobby_invite_keyboard(expected_request_id)
-        if expected_request_id is not None
-        else None
-    )
+    reply_keyboard: ReplyKeyboardMarkup | None = None
+    if expected_request_id is not None:
+        reply_keyboard = _build_lobby_invite_keyboard(expected_request_id)
     if not game_id or expected_request_id is None:
         fallback_state = _find_turn_game_for_private_chat(chat.id, user.id)
         invite_id: int | None = None
@@ -5397,11 +5423,13 @@ async def lobby_contact_handler(
             )
         if invite_id is not None:
             refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
-            reply_markup = (
-                _build_lobby_invite_keyboard(refreshed_request)
-                if refreshed_request is not None
-                else None
-            )
+            if refreshed_request is not None:
+                show_start = _should_show_lobby_start_button(fallback_state)
+                reply_markup = _build_lobby_invite_keyboard(
+                    refreshed_request, show_start=show_start
+                )
+            else:
+                reply_markup = None
             await message.reply_text(
                 "Обновил клавиатуру приглашений. Попробуйте снова.",
                 reply_markup=reply_markup,
@@ -5418,6 +5446,10 @@ async def lobby_contact_handler(
             reply_markup=reply_keyboard,
         )
         return
+    show_start = _should_show_lobby_start_button(game_state)
+    reply_keyboard = _build_lobby_invite_keyboard(
+        expected_request_id, show_start=show_start
+    )
     if user.id != game_state.host_id:
         await message.reply_text(
             "Только создатель комнаты может отправлять приглашения.",
@@ -5623,11 +5655,13 @@ async def lobby_link_message_handler(
             )
         if invite_id is not None:
             refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
-            reply_markup = (
-                _build_lobby_invite_keyboard(refreshed_request)
-                if refreshed_request is not None
-                else None
-            )
+            if refreshed_request is not None:
+                show_start = _should_show_lobby_start_button(fallback_state)
+                reply_markup = _build_lobby_invite_keyboard(
+                    refreshed_request, show_start=show_start
+                )
+            else:
+                reply_markup = None
             await message.reply_text(
                 "Обновил клавиатуру приглашений. Используйте кнопки ниже.",
                 reply_markup=reply_markup,
@@ -5651,11 +5685,13 @@ async def lobby_link_message_handler(
             )
         if invite_id is not None:
             refreshed_request = state.lobby_invite_requests.get(fallback_state.game_id)
-            reply_markup = (
-                _build_lobby_invite_keyboard(refreshed_request)
-                if refreshed_request is not None
-                else None
-            )
+            if refreshed_request is not None:
+                show_start = _should_show_lobby_start_button(fallback_state)
+                reply_markup = _build_lobby_invite_keyboard(
+                    refreshed_request, show_start=show_start
+                )
+            else:
+                reply_markup = None
             await message.reply_text(
                 "Обновил клавиатуру приглашений. Используйте кнопки ниже.",
                 reply_markup=reply_markup,
@@ -5665,7 +5701,10 @@ async def lobby_link_message_handler(
                 "Приглашение не найдено. Откройте меню лобби ещё раз.",
             )
         return
-    reply_keyboard = _build_lobby_invite_keyboard(request_id)
+    show_start = _should_show_lobby_start_button(game_state)
+    reply_keyboard = _build_lobby_invite_keyboard(
+        request_id, show_start=show_start
+    )
     join_code: str | None = None
     if (
         isinstance(code_hint, str)
@@ -5750,7 +5789,10 @@ async def lobby_link_callback_handler(
         request_id,
         code,
     )
-    reply_markup = _build_lobby_invite_keyboard(request_id)
+    show_start = _should_show_lobby_start_button(game_state)
+    reply_markup = _build_lobby_invite_keyboard(
+        request_id, show_start=show_start
+    )
     parts = [f"Код для присоединения: {code}"]
     if link:
         parts.append(f"Ссылка: {link}")
