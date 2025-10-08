@@ -1067,8 +1067,7 @@ def test_lobby_keyboard_start_activation(fresh_state):
     game_state.turn_order = []
 
     keyboard = app._build_lobby_keyboard(game_state)
-    start_data = keyboard.inline_keyboard[-1][0].callback_data
-    assert start_data.startswith(LOBBY_WAIT_CALLBACK_PREFIX)
+    assert keyboard is None
 
     # Add second player to enable start
     new_player = Player(user_id=3, name="Игрок 3")
@@ -1076,6 +1075,7 @@ def test_lobby_keyboard_start_activation(fresh_state):
     game_state.scoreboard[new_player.user_id] = 0
 
     keyboard = app._build_lobby_keyboard(game_state)
+    assert keyboard is not None
     start_data = keyboard.inline_keyboard[-1][0].callback_data
     assert start_data.startswith(LOBBY_START_CALLBACK_PREFIX)
 
@@ -1087,6 +1087,7 @@ def test_lobby_keyboard_excludes_admin_button_after_entry(fresh_state):
     state.settings = SimpleNamespace(admin_id=game_state.host_id)
 
     keyboard = app._build_lobby_keyboard(game_state)
+    assert keyboard is not None
 
     admin_callbacks = [
         button.callback_data
