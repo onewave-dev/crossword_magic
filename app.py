@@ -7361,7 +7361,7 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(
         CallbackQueryHandler(
             lobby_start_callback_handler,
-            pattern = rf"^(?:{re.escape(LOBBY_START_CALLBACK_PREFIX)}|{re.escape(LOBBY_WAIT_CALLBACK_PREFIX)})"
+            pattern=rf"^(?:{re.escape(LOBBY_START_CALLBACK_PREFIX)}|{re.escape(LOBBY_WAIT_CALLBACK_PREFIX)})",
             block=False,
         ),
         group=-2,
