@@ -2246,12 +2246,13 @@ async def _dismiss_lobby_invite_keyboard(
         )
 
 
-def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup:
-    has_min_players = len(game_state.players) >= 2
-    if has_min_players:
-        start_callback = f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}"
-    else:
-        start_callback = f"{LOBBY_WAIT_CALLBACK_PREFIX}{game_state.game_id}"
+def _build_lobby_keyboard(game_state: GameState) -> InlineKeyboardMarkup | None:
+    """Return inline controls for the lobby message if the game can be started."""
+
+    if len(game_state.players) < 2:
+        return None
+
+    start_callback = f"{LOBBY_START_CALLBACK_PREFIX}{game_state.game_id}"
     start_button = InlineKeyboardButton(text="Старт", callback_data=start_callback)
     rows = [[start_button]]
     return InlineKeyboardMarkup(rows)
