@@ -173,11 +173,8 @@ def load_settings() -> Settings:
 
 
 def ensure_storage_directories() -> None:
-    """Ensure that persistent storage directories exist."""
+    logger.debug("Supabase mode: no local storage directories needed")
 
-    for path in ("/var/data/puzzles", "/var/data/states"):
-        os.makedirs(path, exist_ok=True)
-        logger.debug("Ensured storage directory exists: %s", path)
 
 
 # ---------------------------------------------------------------------------
