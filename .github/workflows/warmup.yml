@@ -1,0 +1,30 @@
+name: Keep Render Free Instance Warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  warmup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET /healthz (robust warmup)
+        env:
+          BASE_URL: "https://crossword-magic.onrender.com"
+        run: |
+          set -e
+          URL="${BASE_URL}/healthz"
+          echo "GET -> $URL"
+          # Случайный query, чтобы не попасть в прокси/edge-кэш
+          Q="r=$RANDOM$(date +%s)"
+          curl -sS -4 --fail \
+            --connect-timeout 10 \
+            --max-time 20 \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            "${URL}?${Q}"
+          echo "OK"

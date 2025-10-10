@@ -16,7 +16,7 @@ from functools import wraps
 from typing import Any, AsyncIterator, Iterable, Mapping, MutableMapping, Optional, Sequence
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from telegram import (
     Chat,
@@ -7658,6 +7658,11 @@ async def healthz() -> JSONResponse:
     logger.debug("Health check requested")
     return JSONResponse({"status": "ok"})
 
+@app.head("/healthz")
+async def healthz_head() -> Response:
+    # Пустой 200 OK без тела, с запретом кэша
+    headers = {"Cache-Control": "no-store"}
+    return Response(status_code=200, headers=headers)
 
 async def telegram_webhook(
     request: Request,
