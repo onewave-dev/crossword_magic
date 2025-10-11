@@ -7,7 +7,12 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from telegram import InlineKeyboardMarkup, ReplyKeyboardRemove, constants
+from telegram import (
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    constants,
+)
 from telegram.constants import ChatType
 from telegram.error import BadRequest
 from telegram.ext import ConversationHandler
@@ -301,24 +306,41 @@ async def test_publish_lobby_message_private_records_dm_messages(fresh_state):
 
     first_response = SimpleNamespace(message_id=401)
     second_response = SimpleNamespace(message_id=402)
+    third_response = SimpleNamespace(message_id=403)
     bot = SimpleNamespace(
-        send_message=AsyncMock(side_effect=[first_response, second_response])
+        send_message=AsyncMock(
+            side_effect=[first_response, second_response, third_response]
+        )
     )
     context = SimpleNamespace(bot=bot)
 
     await app._publish_lobby_message(context, game_state)
 
     host_chat_id = game_state.players[game_state.host_id].dm_chat_id
-    assert bot.send_message.await_count == len(game_state.players)
-    first_call, second_call = bot.send_message.await_args_list
+    assert bot.send_message.await_count == len(game_state.players) + 1
+    first_call, second_call, third_call = bot.send_message.await_args_list
     assert first_call.kwargs["chat_id"] == host_chat_id
-    assert second_call.kwargs["chat_id"] != host_chat_id
+    assert isinstance(first_call.kwargs["reply_markup"], ReplyKeyboardMarkup)
+    broadcast_chats = {
+        second_call.kwargs["chat_id"],
+        third_call.kwargs["chat_id"],
+    }
+    assert host_chat_id in broadcast_chats
+    assert broadcast_chats == {
+        player.dm_chat_id for player in game_state.players.values()
+    }
+    for call in (second_call, third_call):
+        markup = call.kwargs.get("reply_markup")
+        assert isinstance(markup, InlineKeyboardMarkup)
+        buttons = markup.inline_keyboard[0]
+        assert buttons[0].text == app.LOBBY_START_BUTTON_TEXT
     assert state.lobby_host_invites[game_state.game_id] == (
         host_chat_id,
         first_response.message_id,
     )
     assert state.lobby_messages[game_state.game_id] == {
-        second_call.kwargs["chat_id"]: second_response.message_id
+        second_call.kwargs["chat_id"]: second_response.message_id,
+        third_call.kwargs["chat_id"]: third_response.message_id,
     }
 
 
