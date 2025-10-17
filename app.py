@@ -7406,6 +7406,14 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
         )
     )
     telegram_application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND
+            & filters.Regex(fr"^{re.escape(LOBBY_START_BUTTON_TEXT)}$"),
+            lobby_start_button_handler,
+        )
+    )
+    telegram_application.add_handler(
         MessageHandler(filters.Regex(ADMIN_COMMAND_PATTERN), admin_answer_request_handler)
     )
     telegram_application.add_handler(
