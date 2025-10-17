@@ -5859,7 +5859,7 @@ async def lobby_start_callback_handler(
                 if callable(edit_markup):
                     with suppress(BadRequest, TelegramError):
                         await edit_markup(reply_markup=None)
-            await query.answer("Игра начинается!")
+            await query.answer()
         else:
             await query.answer("Не удалось запустить игру. Попробуйте позже.", show_alert=True)
         return
@@ -6091,7 +6091,7 @@ async def _launch_admin_test_game(
         prefix=(
             f"Первым ходит {first_player.name}!"
             if first_player
-            else "Игра начинается!"
+            else None
         ),
         send_clues=False,
     )
@@ -7809,7 +7809,7 @@ async def _start_game(
     prefix = (
         f"Первым ходит {first_player.name}!"
         if first_player is not None
-        else "Игра начинается!"
+        else None
     )
     await _announce_turn(
         context,
@@ -7828,10 +7828,13 @@ async def _process_lobby_start(
     trigger_query: Any | None = None,
     trigger_message: Message | None = None,
 ) -> None:
-    async def respond(text: str, *, alert: bool = False) -> None:
+    async def respond(text: str | None = None, *, alert: bool = False) -> None:
         if trigger_query is not None:
-            await trigger_query.answer(text, show_alert=alert)
-        elif trigger_message is not None:
+            if text:
+                await trigger_query.answer(text, show_alert=alert)
+            else:
+                await trigger_query.answer(show_alert=alert)
+        elif trigger_message is not None and text:
             await trigger_message.reply_text(text)
 
     if game_state.status != "lobby":
@@ -7848,7 +7851,7 @@ async def _process_lobby_start(
     if _is_puzzle_ready(game_state):
         started = await _start_game(context, game_state)
         if started:
-            await respond("Игра начинается!")
+            await respond()
         else:
             await respond(
                 "Не удалось запустить игру. Попробуйте позже.",
