@@ -1296,7 +1296,7 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     schedule_mock.assert_called_once()
     announce_mock.assert_awaited()
     share_mock.assert_awaited_once_with(context, game_state, puzzle)
-    query.answer.assert_awaited_with("Игра начинается!")
+    query.answer.assert_awaited_with()
 
 
 @pytest.mark.anyio
