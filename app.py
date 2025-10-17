@@ -2217,28 +2217,32 @@ async def _dismiss_lobby_invite_keyboard(
         host_chat_id = stored_invite[0]
     if host_chat_id is None:
         return
+    invite_message_id: int | None = None
+    if isinstance(stored_invite, tuple) and len(stored_invite) == 2:
+        invite_message_id = stored_invite[1]
     bot = getattr(context, "bot", None)
-    if bot is None:
+    if bot is None or invite_message_id is None:
+        return
+    delete_message = getattr(bot, "delete_message", None)
+    if not callable(delete_message):
         return
     try:
-        await bot.send_message(
-            chat_id=host_chat_id,
-            text="Игра началась — клавиатура приглашений скрыта.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        await delete_message(chat_id=host_chat_id, message_id=invite_message_id)
     except Forbidden:
         logger.debug(
-            "Unable to hide invite keyboard for host %s in chat %s", host_id, host_chat_id
+            "Unable to delete invite keyboard message for host %s in chat %s",
+            host_id,
+            host_chat_id,
         )
     except TelegramError:
         logger.exception(
-            "Failed to hide invite keyboard for host %s in game %s",
+            "Failed to delete invite keyboard message for host %s in game %s",
             host_id,
             game_state.game_id,
         )
     except Exception:  # noqa: BLE001
         logger.exception(
-            "Unexpected error while hiding invite keyboard for game %s",
+            "Unexpected error while deleting invite keyboard message for game %s",
             game_state.game_id,
         )
 
