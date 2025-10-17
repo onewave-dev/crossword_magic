@@ -1033,6 +1033,9 @@ async def test_new_game_menu_admin_proxy_clears_state(monkeypatch, fresh_state):
         callback_query=query,
     )
 
+    monkeypatch.setattr(app, "_load_state_for_chat", lambda _chat_id: None)
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
+
     result = await new_game_menu_admin_proxy_handler(update, context)
 
     assert result == ConversationHandler.END
@@ -1066,6 +1069,10 @@ async def test_admin_proxy_restarts_after_finished_game(monkeypatch, fresh_state
     base_state.status = "finished"
     state.active_games[base_state.game_id] = base_state
     state.chat_to_game[chat.id] = base_state.game_id
+
+    monkeypatch.setattr(app, "load_puzzle", lambda _pid: puzzle)
+    monkeypatch.setattr(app, "delete_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, "delete_puzzle", lambda *_args, **_kwargs: None)
 
     start_group_mock = AsyncMock(return_value=LANGUAGE_STATE)
     monkeypatch.setattr(app, "_start_new_group_game", start_group_mock)
@@ -1744,17 +1751,24 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
     monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
 
     job_queue = DummyJobQueue()
-    bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
     context = SimpleNamespace(bot=bot, job_queue=job_queue)
 
     game_state.thread_id = 321
     await app._announce_turn(context, game_state, puzzle)
-    group_call = next(
+    photo_call = next(
         call
-        for call in bot.send_message.await_args_list
+        for call in bot.send_photo.await_args_list
         if call.kwargs.get("chat_id") == game_state.chat_id
     )
-    assert group_call.kwargs.get("message_thread_id") == 321
+    assert photo_call.kwargs.get("message_thread_id") == 321
+    caption = photo_call.kwargs.get("caption", "")
+    assert "Ход игрока Игрок 1." in caption
+    bot.send_photo.reset_mock()
     bot.send_message.reset_mock()
     assert len(job_queue.submitted) >= 1
     initial_warn_name = game_state.turn_warn_job_id
@@ -1824,7 +1838,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert broadcast_mock.await_count == 4
+    assert broadcast_mock.await_count == 3
     broadcast_texts = [call.args[2] for call in broadcast_mock.await_args_list]
 
     updated_clues = app._format_clues_message(puzzle, game_state)
@@ -1836,11 +1850,16 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     assert ANSWER_INSTRUCTIONS_TEXT in broadcast_texts
     expected_turn_text = "Ход игрока Игрок 2."
-    assert expected_turn_text in broadcast_texts
     assert any(text.startswith("Верно!") for text in broadcast_texts)
 
+    photo_calls = bot.send_photo.await_args_list
+    assert photo_calls, "Board image should be sent to the primary chat"
+    board_kwargs = photo_calls[0].kwargs
+    assert board_kwargs.get("caption") is not None
+    assert expected_turn_text in board_kwargs.get("caption")
+
     send_calls = bot.send_message.await_args_list
-    assert len(send_calls) >= 3
+    assert len(send_calls) >= 2
     send_kwargs_list = [call.kwargs for call in send_calls]
     clues_kwargs = next(kwargs for kwargs in send_kwargs_list if kwargs.get("text") == updated_clues)
     assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
@@ -1850,11 +1869,6 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
         kwargs for kwargs in send_kwargs_list if kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
     )
     assert instructions_kwargs.get("parse_mode") is None
-
-    turn_kwargs = next(
-        kwargs for kwargs in send_kwargs_list if kwargs.get("text", "") == expected_turn_text
-    )
-    assert turn_kwargs.get("parse_mode") is None
 
     assert stored_states, "Game state should be stored after correct answer"
 
@@ -1943,7 +1957,11 @@ async def test_turn_based_rejects_rapid_second_answer(monkeypatch, tmp_path, fre
     monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
 
     job_queue = DummyJobQueue()
-    bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
     context = SimpleNamespace(bot=bot, job_queue=job_queue)
 
     _update1, chat, message1 = _make_group_update(game_state.chat_id, user_id=1)
@@ -2001,29 +2019,29 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     )
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _gs: puzzle)
 
-    announce_mock = AsyncMock()
-    context = SimpleNamespace(
-        bot=SimpleNamespace(send_message=announce_mock), job_queue=DummyJobQueue()
+    bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+        send_chat_action=AsyncMock(),
     )
+    context = SimpleNamespace(bot=bot, job_queue=DummyJobQueue())
 
     await app._announce_turn(context, game_state, puzzle)
 
-    assert announce_mock.await_count == 3
-    first_call = announce_mock.await_args_list[0]
-    second_call = announce_mock.await_args_list[1]
-    third_call = announce_mock.await_args_list[2]
+    assert bot.send_photo.await_count == 1
+    photo_kwargs = bot.send_photo.await_args.kwargs
+    assert photo_kwargs.get("chat_id") == chat_id
+    expected_turn_text = "Ход игрока Игрок 1."
+    assert expected_turn_text in photo_kwargs.get("caption", "")
+    assert photo_kwargs.get("parse_mode") == constants.ParseMode.HTML
+
+    assert bot.send_message.await_count == 2
+    first_call = bot.send_message.await_args_list[0]
+    second_call = bot.send_message.await_args_list[1]
     assert first_call.kwargs.get("text") == app._format_clues_message(puzzle, game_state)
     assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
     assert second_call.kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
     assert second_call.kwargs.get("parse_mode") is None
-    announce_kwargs = third_call.kwargs
-    assert announce_kwargs["chat_id"] == chat_id
-    assert "message_thread_id" not in announce_kwargs
-    text = announce_kwargs.get("text", "")
-    expected_turn_text = "Ход игрока Игрок 1."
-    assert text == expected_turn_text
-    assert "/answer" not in text
-    assert announce_kwargs.get("reply_markup") is None
 
     warning_mock = AsyncMock()
     job_name = "turn-warn-test"
@@ -2210,13 +2228,18 @@ async def test_auto_finish_after_last_slot(monkeypatch, tmp_path, fresh_state):
     finish_mock = AsyncMock()
     monkeypatch.setattr(app, "_finish_game", finish_mock)
     monkeypatch.setattr(app, "_send_clues_update", AsyncMock())
+    monkeypatch.setattr(app, "_store_state", lambda _gs: None)
 
     image_path = tmp_path / "last.png"
     image_path.write_bytes(b"png")
     monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
 
     job_queue = DummyJobQueue()
-    bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message=AsyncMock())
+    bot = SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+    )
     context = SimpleNamespace(bot=bot, job_queue=job_queue)
 
     update, chat, message = _make_group_update(game_state.chat_id, user_id=1)
@@ -2272,7 +2295,7 @@ async def test_admin_menu_requires_admin(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
-async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
+async def test_admin_test_game_creates_room(monkeypatch, tmp_path, fresh_state):
     state.settings = SimpleNamespace(admin_id=700)
     puzzle = _make_turn_puzzle()
     base_state = _make_turn_state(-940, puzzle)
@@ -2284,6 +2307,10 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
     monkeypatch.setattr(app, "_load_state_for_chat", lambda _: base_state)
     monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _: puzzle)
     monkeypatch.setattr(app, "_clone_puzzle_for_test", lambda _p: (puzzle, "clone", None))
+
+    image_path = tmp_path / "admin_board.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
 
     existing_admin_state = GameState(
         chat_id=base_state.chat_id,
@@ -2315,7 +2342,11 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
     monkeypatch.setattr(app, "_store_state", fake_store)
 
     job_queue = DummyJobQueue()
-    bot = SimpleNamespace(send_message=AsyncMock())
+    bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(),
+        send_chat_action=AsyncMock(),
+    )
     context = SimpleNamespace(bot=bot, job_queue=job_queue)
     query_message = SimpleNamespace(
         chat=SimpleNamespace(id=base_state.chat_id, type=ChatType.GROUP),
@@ -2348,7 +2379,12 @@ async def test_admin_test_game_creates_room(monkeypatch, fresh_state):
         for call in bot.send_message.await_args_list
         if call.kwargs.get("chat_id") == base_state.chat_id
     ]
-    assert sum(text.count("Первым ходит") for text in main_chat_texts) == 1
+    board_captions = [
+        call.kwargs.get("caption", "")
+        for call in bot.send_photo.await_args_list
+        if call.kwargs.get("chat_id") == base_state.chat_id
+    ]
+    assert any("Первым ходит" in caption for caption in board_captions)
     query.answer.assert_awaited()
 
 
@@ -2728,7 +2764,7 @@ async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
 
 
 @pytest.mark.anyio
-async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, fresh_state):
+async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, tmp_path, fresh_state):
     puzzle = _make_turn_puzzle()
     player = Player(user_id=1, name="Игрок", dm_chat_id=404)
     game_state = GameState(
@@ -2763,21 +2799,29 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, fresh_sta
         delivered.append(chat_id)
         return SimpleNamespace(message_id=900 + len(delivered))
 
-    bot = SimpleNamespace(send_message=AsyncMock(side_effect=fake_send_message))
+    image_path = tmp_path / "board.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr(app, "render_puzzle", lambda _p, _s: str(image_path))
+
+    bot = SimpleNamespace(
+        send_message=AsyncMock(side_effect=fake_send_message),
+        send_photo=AsyncMock(),
+        send_chat_action=AsyncMock(),
+    )
     context = SimpleNamespace(bot=bot, job_queue=None)
 
     await app._announce_turn(context, game_state, puzzle)
+
+    photo_chats = [call.kwargs.get("chat_id") for call in bot.send_photo.await_args_list]
+    assert game_state.chat_id in photo_chats
 
     assert attempted == [
         player.dm_chat_id,
         player.dm_chat_id,
         game_state.chat_id,
         game_state.chat_id,
-        player.dm_chat_id,
-        game_state.chat_id,
     ]
     assert delivered == [
-        game_state.chat_id,
         game_state.chat_id,
         game_state.chat_id,
     ]

@@ -1663,41 +1663,47 @@ async def _announce_turn(
     player = _current_player(game_state)
     if player is None:
         return
-    if send_clues:
-        await _broadcast_clues_message(context, game_state, puzzle)
-    parts = []
-    if prefix:
-        parts.append(prefix)
-    player_name = html.escape(player.name if player.name else "игрок")
-    parts.append(f"Ход игрока {player_name}.")
-    text = "\n".join(parts)
-    try:
-        broadcast = await _broadcast_to_players(
-            context,
-            game_state,
-            text,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to announce turn via direct chats for game %s",
-            game_state.game_id,
-        )
-        broadcast = BroadcastResult(successful_chats=set())
-    if (
-        not broadcast.successful_chats
-        or game_state.chat_id not in broadcast.successful_chats
-    ):
+    caption, fallback_text = _compose_turn_announcements(
+        game_state,
+        player,
+        prefix=prefix,
+    )
+    board_sent = await _broadcast_board_state(
+        context,
+        game_state,
+        puzzle,
+        caption=caption,
+    )
+    if not board_sent and fallback_text:
         try:
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text=text,
-                **_thread_kwargs(game_state),
+            broadcast = await _broadcast_to_players(
+                context,
+                game_state,
+                fallback_text,
             )
         except Exception:  # noqa: BLE001
             logger.exception(
-                "Failed to announce turn in primary chat for game %s",
+                "Failed to announce turn via direct chats for game %s",
                 game_state.game_id,
             )
+            broadcast = BroadcastResult(successful_chats=set())
+        if (
+            not broadcast.successful_chats
+            or game_state.chat_id not in broadcast.successful_chats
+        ):
+            try:
+                await context.bot.send_message(
+                    chat_id=game_state.chat_id,
+                    text=fallback_text,
+                    **_thread_kwargs(game_state),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to announce turn in primary chat for game %s",
+                    game_state.game_id,
+                )
+    if send_clues:
+        await _broadcast_clues_message(context, game_state, puzzle)
     _schedule_turn_timers(context, game_state)
     if game_state.test_mode:
         _schedule_dummy_turn(context, game_state, puzzle)
@@ -3017,6 +3023,120 @@ async def _broadcast_clues_message(
             )
 
 
+def _compose_turn_announcements(
+    game_state: GameState,
+    player: Player,
+    *,
+    prefix: str | None = None,
+) -> tuple[str, str]:
+    """Return HTML caption and plain text lines describing the current turn."""
+
+    caption_lines = ["📋 Текущая доска"]
+    text_lines: list[str] = []
+
+    if prefix:
+        caption_lines.append(html.escape(prefix))
+        text_lines.append(prefix)
+
+    player_name = player.name or "игрок"
+    caption_lines.append(f"Ход игрока {html.escape(player_name)}.")
+    text_lines.append(f"Ход игрока {player_name}.")
+
+    if game_state.scoreboard:
+        html_parts: list[str] = []
+        text_parts: list[str] = []
+        for player_id, score in sorted(
+            game_state.scoreboard.items(), key=lambda item: (-item[1], item[0])
+        ):
+            scoreboard_player = game_state.players.get(player_id)
+            display_name = (
+                scoreboard_player.name
+                if scoreboard_player and scoreboard_player.name
+                else str(player_id)
+            )
+            html_parts.append(f"{html.escape(display_name)}: {score}")
+            text_parts.append(f"{display_name}: {score}")
+        if html_parts:
+            caption_lines.append("Очки: " + ", ".join(html_parts))
+            text_lines.append("Очки: " + ", ".join(text_parts))
+
+    caption = "\n".join(caption_lines)
+    text = "\n".join(text_lines)
+    return caption, text
+
+
+async def _broadcast_board_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    puzzle: Puzzle | CompositePuzzle,
+    *,
+    caption: str,
+) -> bool:
+    """Render and broadcast the current board image for the active game."""
+
+    image_bytes: bytes | None = None
+    try:
+        image_path = render_puzzle(puzzle, game_state)
+        with open(image_path, "rb") as photo:
+            image_bytes = photo.read()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to render board image before broadcasting turn for game %s",
+            game_state.game_id,
+        )
+        image_bytes = None
+
+    if image_bytes is None:
+        return False
+
+    delivered = False
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=game_state.chat_id,
+            action=constants.ChatAction.UPLOAD_PHOTO,
+            **_thread_kwargs(game_state),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to send board upload action to primary chat for game %s",
+            game_state.game_id,
+        )
+
+    try:
+        await context.bot.send_photo(
+            chat_id=game_state.chat_id,
+            photo=image_bytes,
+            caption=caption,
+            parse_mode=constants.ParseMode.HTML,
+            **_thread_kwargs(game_state),
+        )
+        delivered = True
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to deliver board image to primary chat for game %s",
+            game_state.game_id,
+        )
+
+    try:
+        await _broadcast_photo_to_players(
+            context,
+            game_state,
+            image_bytes,
+            caption=caption,
+            parse_mode=constants.ParseMode.HTML,
+            exclude_chat_ids={game_state.chat_id},
+        )
+        delivered = True
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to broadcast board image to players for game %s",
+            game_state.game_id,
+        )
+
+    return delivered
+
+
 async def _share_puzzle_start_assets(
     context: ContextTypes.DEFAULT_TYPE,
     game_state: GameState,
@@ -3118,9 +3238,6 @@ async def _send_clues_update(
     text = _format_clues_message(puzzle, game_state)
     if game_state.mode == "turn_based":
         extras: list[str] = []
-        current_player = _current_player(game_state)
-        if current_player:
-            extras.append(f"Сейчас ход {html.escape(current_player.name)}.")
         if game_state.scoreboard:
             board_parts: list[str] = []
             for player_id, score in sorted(
