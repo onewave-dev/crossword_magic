@@ -1,1 +1,34 @@
 fix.patch
+admin/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.build/
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+.env.*
+*.local
+
+# Logs & cache
+*.log
+logs/
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
