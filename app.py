@@ -102,7 +102,7 @@ from utils.logging_config import configure_logging, get_logger, logging_context
 # Logging configuration
 # ---------------------------------------------------------------------------
 
-configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+configure_logging(os.getenv("LOG_LEVEL", "WARNING"))
 logger = get_logger("app")
 
 
