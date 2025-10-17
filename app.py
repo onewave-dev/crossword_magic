@@ -7799,11 +7799,6 @@ async def _start_game(
     state.lobby_messages.pop(game_state.game_id, None)
 
     await _share_puzzle_start_assets(context, game_state, puzzle)
-    await _send_game_message(
-        context,
-        game_state,
-        "Игра началась! Ходы идут по очереди.",
-    )
 
     first_player = players_sorted[0] if players_sorted else None
     prefix = (
