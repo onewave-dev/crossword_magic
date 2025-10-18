@@ -1742,6 +1742,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         game_state,
         puzzle,
         send_clues=False,
+        broadcast_board=False,
     )
 def _advance_turn(game_state: GameState) -> int | None:
     if not game_state.turn_order:
@@ -6812,7 +6813,13 @@ async def _handle_answer_submission(
                     _cancel_turn_timers(game_state)
                     _advance_turn(game_state)
                     _store_state(game_state)
-                    await _announce_turn(context, game_state, puzzle)
+                    await _announce_turn(
+                        context,
+                        game_state,
+                        puzzle,
+                        send_clues=False,
+                        broadcast_board=False,
+                    )
                 log_abort(
                     "answer_incorrect",
                     slot_identifier=normalised_slot_id,
@@ -6864,7 +6871,13 @@ async def _handle_answer_submission(
                 _cancel_turn_timers(game_state)
                 _advance_turn(game_state)
                 _store_state(game_state)
-                await _announce_turn(context, game_state, puzzle)
+                await _announce_turn(
+                    context,
+                    game_state,
+                    puzzle,
+                    send_clues=False,
+                    broadcast_board=False,
+                )
             else:
                 await send_failure_feedback(public_id, candidate)
             log_abort("answer_incorrect", slot_identifier=public_id)
