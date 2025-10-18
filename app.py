@@ -812,7 +812,11 @@ def _record_hint_usage(
     usage[player_id] = usage.get(player_id, 0) + 1
 
 
-def _register_player_chat(user_id: int, chat_id: int | None) -> None:
+def _register_player_chat(
+    user_id: int,
+    chat_id: int | None,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
     if chat_id is None:
         return
     state.player_chats[user_id] = chat_id
@@ -829,6 +833,17 @@ def _register_player_chat(user_id: int, chat_id: int | None) -> None:
         updated_games.append(game_state)
     for game_state in updated_games:
         _store_state(game_state)
+        if context is not None and game_state.generation_in_progress:
+            coroutine = _ensure_generation_notice_for_chat(
+                context,
+                game_state,
+                chat_id,
+            )
+            application = getattr(context, "application", None)
+            if application is not None:
+                application.create_task(coroutine)
+            else:
+                asyncio.create_task(coroutine)
 
 
 def _clear_pending_join_for(user_id: int) -> None:
@@ -963,6 +978,54 @@ async def _send_generation_notice_to_game(
         text,
         message=message,
         chat_data=chat_data,
+    )
+
+
+def _resolve_generation_notice_reason(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    *,
+    exclude_chat_id: int | None = None,
+) -> str | None:
+    """Return the base text of an active generation notice for the game."""
+
+    for _, chat_id in _iter_player_dm_chats(game_state):
+        if chat_id == exclude_chat_id:
+            continue
+        chat_data = _get_chat_data_for_chat(context, chat_id)
+        notice = chat_data.get(GENERATION_NOTICE_KEY)
+        if isinstance(notice, dict) and notice.get("active"):
+            reason = notice.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason
+            text = notice.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
+
+
+async def _ensure_generation_notice_for_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    chat_id: int | None,
+) -> None:
+    """Ensure a player chat receives generation progress notifications."""
+
+    if chat_id is None or not game_state.generation_in_progress:
+        return
+    chat_data = _get_chat_data_for_chat(context, chat_id)
+    existing_notice = chat_data.get(GENERATION_NOTICE_KEY)
+    if isinstance(existing_notice, dict) and existing_notice.get("active"):
+        return
+    base_text = _resolve_generation_notice_reason(
+        context, game_state, exclude_chat_id=chat_id
+    )
+    if not base_text:
+        base_text = "Готовим кроссворд, это может занять немного времени..."
+    await _send_generation_notice(
+        context,
+        chat_id,
+        base_text,
     )
 
 
@@ -2768,14 +2831,14 @@ async def track_player_message(update: Update, context: ContextTypes.DEFAULT_TYP
     chat = update.effective_chat
     user = getattr(update, "effective_user", None)
     if chat and user and chat.type == ChatType.PRIVATE:
-        _register_player_chat(user.id, chat.id)
+        _register_player_chat(user.id, chat.id, context)
 
 
 async def track_player_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     user = getattr(update, "effective_user", None)
     if chat and user and chat.type == ChatType.PRIVATE:
-        _register_player_chat(user.id, chat.id)
+        _register_player_chat(user.id, chat.id, context)
 
 
 def _maybe_update_thread_binding(
@@ -4528,7 +4591,7 @@ async def _start_new_group_game(
     host_id = user.id if user else None
     host_name = _user_display_name(user)
     if host_id and is_private_lobby:
-        _register_player_chat(host_id, chat.id)
+        _register_player_chat(host_id, chat.id, context)
     dm_chat_id = (
         chat.id if is_private_lobby else _lookup_player_chat(host_id)
     ) if host_id else None
@@ -4591,7 +4654,7 @@ async def _process_join_code(
     if len(game_state.players) >= MAX_LOBBY_PLAYERS and user.id not in game_state.players:
         await message.reply_text("Достигнут лимит игроков в этой комнате (6).")
         return
-    _register_player_chat(user.id, chat.id)
+    _register_player_chat(user.id, chat.id, context)
     existing = game_state.players.get(user.id)
     if existing:
         existing.dm_chat_id = chat.id
@@ -4604,6 +4667,7 @@ async def _process_join_code(
             game_state,
             f"{existing.name} снова с нами!",
         )
+        await _ensure_generation_notice_for_chat(context, game_state, chat.id)
         _clear_pending_join_for(user.id)
         return
 
@@ -4621,6 +4685,7 @@ async def _process_join_code(
             f"{player.name} подключился к игре!",
         )
         await _update_lobby_message(context, game_state)
+        await _ensure_generation_notice_for_chat(context, game_state, chat.id)
         _clear_pending_join_for(user.id)
         return
 
@@ -5462,7 +5527,7 @@ async def join_name_response_handler(
         )
         await message.reply_text("К сожалению, комната уже заполнена.")
         return
-    _register_player_chat(user.id, chat.id)
+    _register_player_chat(user.id, chat.id, context)
     player = _ensure_player_entry(game_state, user, name, chat.id)
     _store_state(game_state)
     with logging_context(chat_id=chat.id, puzzle_id=game_state.puzzle_id):
@@ -5481,6 +5546,7 @@ async def join_name_response_handler(
         game_state,
         f"{player.name} присоединился к игре!",
     )
+    await _ensure_generation_notice_for_chat(context, game_state, chat.id)
     await _update_lobby_message(context, game_state)
 
 
@@ -6129,7 +6195,7 @@ async def _launch_admin_test_game(
     admin_state.theme = cloned_puzzle.theme
     admin_state.active_slot_id = None
 
-    _register_player_chat(admin_id, dm_chat_id)
+    _register_player_chat(admin_id, dm_chat_id, context)
     set_chat_mode(context, MODE_IN_GAME)
     state.lobby_messages.pop(base_state.game_id, None)
     state.lobby_host_invites.pop(base_state.game_id, None)
