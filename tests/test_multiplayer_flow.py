@@ -1767,7 +1767,13 @@ async def test_turn_based_answer_advances_turn(monkeypatch, tmp_path, fresh_stat
     )
     assert photo_call.kwargs.get("message_thread_id") == 321
     caption = photo_call.kwargs.get("caption", "")
-    assert "Ход игрока Игрок 1." in caption
+    assert "Сейчас ход" not in caption
+    turn_texts = [
+        call.kwargs.get("text", "")
+        for call in bot.send_message.await_args_list
+        if call.kwargs.get("chat_id") == game_state.chat_id
+    ]
+    assert any(text.startswith("Сейчас ход Игрок 1.") for text in turn_texts)
     bot.send_photo.reset_mock()
     bot.send_message.reset_mock()
     assert len(job_queue.submitted) >= 1
@@ -1838,7 +1844,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert broadcast_mock.await_count == 3
+    assert broadcast_mock.await_count == 4
     broadcast_texts = [call.args[2] for call in broadcast_mock.await_args_list]
 
     updated_clues = app._format_clues_message(puzzle, game_state)
@@ -1849,17 +1855,20 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert clues_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
 
     assert ANSWER_INSTRUCTIONS_TEXT in broadcast_texts
-    expected_turn_text = "Ход игрока Игрок 2."
+    expected_turn_text = "Сейчас ход Игрок 2."
+    assert any(text.startswith(expected_turn_text) for text in broadcast_texts)
     assert any(text.startswith("Верно!") for text in broadcast_texts)
 
     photo_calls = bot.send_photo.await_args_list
     assert photo_calls, "Board image should be sent to the primary chat"
     board_kwargs = photo_calls[0].kwargs
-    assert board_kwargs.get("caption") is not None
-    assert expected_turn_text in board_kwargs.get("caption")
+    caption_text = board_kwargs.get("caption") or ""
+    assert caption_text
+    assert "Сейчас ход" not in caption_text
+    assert "Очки:" in caption_text
 
     send_calls = bot.send_message.await_args_list
-    assert len(send_calls) >= 2
+    assert len(send_calls) >= 3
     send_kwargs_list = [call.kwargs for call in send_calls]
     clues_kwargs = next(kwargs for kwargs in send_kwargs_list if kwargs.get("text") == updated_clues)
     assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
@@ -1869,6 +1878,9 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
         kwargs for kwargs in send_kwargs_list if kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
     )
     assert instructions_kwargs.get("parse_mode") is None
+
+    turn_kwargs = send_kwargs_list[-1]
+    assert turn_kwargs.get("text", "").startswith(expected_turn_text)
 
     assert stored_states, "Game state should be stored after correct answer"
 
@@ -2031,17 +2043,24 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     assert bot.send_photo.await_count == 1
     photo_kwargs = bot.send_photo.await_args.kwargs
     assert photo_kwargs.get("chat_id") == chat_id
-    expected_turn_text = "Ход игрока Игрок 1."
-    assert expected_turn_text in photo_kwargs.get("caption", "")
+    caption_text = photo_kwargs.get("caption", "")
+    assert caption_text
+    assert "Сейчас ход" not in caption_text
+    assert "Очки:" in caption_text
     assert photo_kwargs.get("parse_mode") == constants.ParseMode.HTML
 
-    assert bot.send_message.await_count == 2
-    first_call = bot.send_message.await_args_list[0]
-    second_call = bot.send_message.await_args_list[1]
-    assert first_call.kwargs.get("text") == app._format_clues_message(puzzle, game_state)
-    assert first_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
-    assert second_call.kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
-    assert second_call.kwargs.get("parse_mode") is None
+    assert bot.send_message.await_count == 3
+    send_kwargs_list = [call.kwargs for call in bot.send_message.await_args_list]
+    clues_kwargs = send_kwargs_list[0]
+    instructions_kwargs = send_kwargs_list[1]
+    turn_kwargs = send_kwargs_list[2]
+    assert clues_kwargs.get("text") == app._format_clues_message(puzzle, game_state)
+    assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
+    assert instructions_kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
+    assert instructions_kwargs.get("parse_mode") is None
+    turn_text = turn_kwargs.get("text", "")
+    assert turn_text.startswith("Сейчас ход Игрок 1.")
+    assert "Очки:" in turn_text
 
     warning_mock = AsyncMock()
     job_name = "turn-warn-test"
@@ -2384,7 +2403,9 @@ async def test_admin_test_game_creates_room(monkeypatch, tmp_path, fresh_state):
         for call in bot.send_photo.await_args_list
         if call.kwargs.get("chat_id") == base_state.chat_id
     ]
-    assert any("Первым ходит" in caption for caption in board_captions)
+    assert all("Первым ходит" not in caption for caption in board_captions)
+    assert any("Первым ходит" in text for text in main_chat_texts)
+    assert any("Сейчас ход" in text for text in main_chat_texts)
     query.answer.assert_awaited()
 
 
@@ -2820,8 +2841,11 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, tmp_path,
         player.dm_chat_id,
         game_state.chat_id,
         game_state.chat_id,
+        player.dm_chat_id,
+        game_state.chat_id,
     ]
     assert delivered == [
+        game_state.chat_id,
         game_state.chat_id,
         game_state.chat_id,
     ]
