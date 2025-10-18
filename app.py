@@ -6836,7 +6836,9 @@ async def _handle_answer_submission(
             needs_clue_update = (
                 not in_turn_mode and not _all_slots_solved(puzzle, game_state)
             )
-            if needs_clue_update:
+            if in_turn_mode:
+                await _broadcast_clues_message(context, game_state, puzzle)
+            elif needs_clue_update:
                 await refresh_clues_if_needed()
             await message.reply_photo(
                 photo=photo_bytes, caption=success_caption
@@ -6892,6 +6894,7 @@ async def _handle_answer_submission(
                 game_state,
                 puzzle,
                 broadcast_board=False,
+                send_clues=False,
             )
         else:
             if _all_slots_solved(puzzle, game_state):
