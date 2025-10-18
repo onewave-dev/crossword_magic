@@ -1636,6 +1636,13 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         if scoreboard_text:
             success_caption = f"{success_caption}\n{scoreboard_text}"
         try:
+            await _broadcast_clues_message(context, game_state, puzzle)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to broadcast clues before dummy correct board for game %s",
+                game_state.game_id,
+            )
+        try:
             image_path = render_puzzle(puzzle, game_state)
             with open(image_path, "rb") as photo:
                 photo_bytes = photo.read()
@@ -1678,6 +1685,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
             game_state,
             puzzle,
             broadcast_board=False,
+            send_clues=False,
         )
         return
 
@@ -1729,7 +1737,12 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
 
     _advance_turn(game_state)
     _store_state(game_state)
-    await _announce_turn(context, game_state, puzzle)
+    await _announce_turn(
+        context,
+        game_state,
+        puzzle,
+        send_clues=False,
+    )
 def _advance_turn(game_state: GameState) -> int | None:
     if not game_state.turn_order:
         return None
