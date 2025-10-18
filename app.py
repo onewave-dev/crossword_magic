@@ -1686,10 +1686,47 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
     if dummy_player:
         dummy_player.answers_fail += 1
     _cancel_turn_timers(game_state)
-    failure_text = (
-        f"{info_prefix} ошибся на {slot_ref.public_id}: {attempt_display}"
+    failure_caption = (
+        f"Неверно! {info_prefix} - {slot_ref.public_id} - {attempt_display}"
     )
-    await _broadcast_with_primary(failure_text)
+    _, scoreboard_text = _format_scoreboard_summary(game_state)
+    if scoreboard_text:
+        failure_caption = f"{failure_caption}\n{scoreboard_text}"
+
+    await _broadcast_clues_message(context, game_state, puzzle)
+
+    photo_bytes: bytes | None = None
+    try:
+        image_path = render_puzzle(puzzle, game_state)
+        with open(image_path, "rb") as photo:
+            photo_bytes = photo.read()
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to render updated grid after dummy incorrect answer")
+        await _broadcast_with_primary(failure_caption)
+        photo_bytes = None
+
+    if photo_bytes is not None:
+        await _broadcast_photo_to_players(
+            context,
+            game_state,
+            photo_bytes,
+            caption=failure_caption,
+            exclude_chat_ids={game_state.chat_id},
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=game_state.chat_id,
+                photo=photo_bytes,
+                caption=failure_caption,
+                **_thread_kwargs(game_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to send dummy incorrect board to primary chat for game %s",
+                game_state.game_id,
+            )
+            await _broadcast_with_primary(failure_caption)
+
     _advance_turn(game_state)
     _store_state(game_state)
     await _announce_turn(context, game_state, puzzle)
@@ -6580,6 +6617,67 @@ async def _handle_answer_submission(
         async def refresh_clues_if_needed() -> None:
             await _send_clues_update(message, puzzle, game_state)
 
+        def resolve_player_display_name() -> str:
+            if current_player and current_player.name:
+                return current_player.name
+            from_user = message.from_user
+            if from_user is not None:
+                fallback_name = (
+                    getattr(from_user, "full_name", None)
+                    or getattr(from_user, "username", None)
+                    or getattr(from_user, "first_name", None)
+                    or getattr(from_user, "last_name", None)
+                )
+                if fallback_name:
+                    return fallback_name
+            return "Игрок"
+
+        async def send_failure_feedback(slot_label: str, candidate_display: str) -> None:
+            player_name = resolve_player_display_name()
+            caption = f"Неверно! {player_name} - {slot_label} - {candidate_display}"
+            _, scoreboard_text = _format_scoreboard_summary(game_state)
+            if scoreboard_text:
+                caption = f"{caption}\n{scoreboard_text}"
+
+            if in_turn_mode:
+                await _broadcast_clues_message(context, game_state, puzzle)
+            else:
+                await refresh_clues_if_needed()
+
+            photo_bytes: bytes | None = None
+            try:
+                image_path = render_puzzle(puzzle, game_state)
+                await context.bot.send_chat_action(
+                    chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+                )
+                with open(image_path, "rb") as photo:
+                    photo_bytes = photo.read()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to render updated grid after incorrect answer")
+                await message.reply_text(
+                    "Ответ неверный, но не удалось обновить изображение. Попробуйте команду /state позже."
+                )
+                return
+
+            await message.reply_photo(photo=photo_bytes, caption=caption)
+
+            if in_turn_mode and photo_bytes is not None:
+                await _broadcast_photo_to_players(
+                    context,
+                    game_state,
+                    photo_bytes,
+                    caption=caption,
+                    exclude_chat_ids={chat.id},
+                )
+                await _mirror_primary_chat_if_needed(
+                    context,
+                    game_state,
+                    source_chat_id=chat.id,
+                    broadcast_result=None,
+                    photo_bytes=photo_bytes,
+                    caption=caption,
+                )
+
         solved_ids = {_normalise_slot_id(entry) for entry in game_state.solved_slots}
         is_numeric_slot = normalised_slot_id.isdigit()
         candidate_refs: list[SlotRef] = []
@@ -6694,8 +6792,14 @@ async def _handle_answer_submission(
                     "Incorrect answer for slot number %s",
                     normalised_slot_id,
                 )
-                await message.reply_text("Ответ неверный, попробуйте ещё раз.")
-                await refresh_clues_if_needed()
+                if in_turn_mode and current_player:
+                    current_player.answers_fail += 1
+                await send_failure_feedback(normalised_slot_id, candidate)
+                if in_turn_mode:
+                    _cancel_turn_timers(game_state)
+                    _advance_turn(game_state)
+                    _store_state(game_state)
+                    await _announce_turn(context, game_state, puzzle)
                 log_abort(
                     "answer_incorrect",
                     slot_identifier=normalised_slot_id,
@@ -6733,20 +6837,7 @@ async def _handle_answer_submission(
             game_state.active_slot_id = public_id
             game_state.last_update = time.time()
 
-        player_display_name: str
-        if current_player and current_player.name:
-            player_display_name = current_player.name
-        else:
-            from_user = message.from_user
-            fallback_name = None
-            if from_user is not None:
-                fallback_name = (
-                    getattr(from_user, "full_name", None)
-                    or getattr(from_user, "username", None)
-                    or getattr(from_user, "first_name", None)
-                    or getattr(from_user, "last_name", None)
-                )
-            player_display_name = fallback_name or "Игрок"
+        player_display_name = resolve_player_display_name()
 
         if _canonical_answer(candidate, puzzle.language) != _canonical_answer(
             slot.answer,
@@ -6756,39 +6847,13 @@ async def _handle_answer_submission(
             if in_turn_mode:
                 if current_player:
                     current_player.answers_fail += 1
-                failure_announcement = (
-                    f"Неверно! {player_display_name} - {public_id} - {candidate}"
-                )
-                await message.reply_text(failure_announcement)
-                await refresh_clues_if_needed()
-                broadcast_result: BroadcastResult | None = None
-                try:
-                    broadcast_result = await _broadcast_to_players(
-                        context,
-                        game_state,
-                        failure_announcement,
-                        exclude_chat_ids={chat.id},
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Failed to broadcast incorrect answer announcement for game %s",
-                        game_state.game_id,
-                    )
-                    broadcast_result = None
-                await _mirror_primary_chat_if_needed(
-                    context,
-                    game_state,
-                    source_chat_id=chat.id,
-                    broadcast_result=broadcast_result,
-                    text=failure_announcement,
-                )
+                await send_failure_feedback(public_id, candidate)
                 _cancel_turn_timers(game_state)
                 _advance_turn(game_state)
                 _store_state(game_state)
                 await _announce_turn(context, game_state, puzzle)
             else:
-                await message.reply_text("Ответ неверный, попробуйте ещё раз.")
-                await refresh_clues_if_needed()
+                await send_failure_feedback(public_id, candidate)
             log_abort("answer_incorrect", slot_identifier=public_id)
             return
 

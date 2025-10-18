@@ -2797,14 +2797,19 @@ async def test_dummy_turn_job_falls_back_to_primary_on_dm_failure(
 
     await app._dummy_turn_job(context)
 
-    assert attempted.count(dummy_player.dm_chat_id) == 2
-    assert delivered.count(game_state.chat_id) == 2
-    assert delivered.count(human_player.dm_chat_id) == 2
+    assert attempted.count(dummy_player.dm_chat_id) == 1
+    assert delivered.count(game_state.chat_id) == 1
+    assert delivered.count(human_player.dm_chat_id) == 1
     for texts in messages_by_chat.values():
         for text in texts:
             assert "/answer" not in text
-    failure_messages = messages_by_chat.get(game_state.chat_id, [])
-    assert any("ошибся" in text and "ОШИБКА" in text for text in failure_messages)
+
+    photo_calls = bot.send_photo.await_args_list
+    assert photo_calls, "Dummy failure should broadcast board image"
+    failure_caption = photo_calls[0].kwargs.get("caption") or ""
+    assert "Неверно!" in failure_caption
+    assert "A1" in failure_caption
+    assert "ОШИБКА" in failure_caption
 
 
 @pytest.mark.anyio
