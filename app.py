@@ -1562,7 +1562,6 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         if dummy_player is None or not dummy_player.name
         else f"🤖 {dummy_player.name}"
     )
-    clue = slot_ref.slot.clue or "(без подсказки)"
     game_state.active_slot_id = normalised_slot
     game_state.last_update = time.time()
     _store_state(game_state)
@@ -1596,10 +1595,6 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
                 game_state.game_id,
             )
 
-    selection_text = (
-        f"{info_prefix} отвечает на {slot_ref.public_id}: {clue}"
-    )
-    await _broadcast_with_primary(selection_text)
     actual_delay = 0.0
     if game_state.dummy_turn_started_at is not None:
         actual_delay = max(0.0, time.time() - game_state.dummy_turn_started_at)

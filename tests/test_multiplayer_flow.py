@@ -2708,7 +2708,7 @@ async def test_dummy_turn_job_admin_test_mirrors_primary_chat(
         for call in context.bot.send_message.await_args_list
         if call.kwargs.get("chat_id") == game_state.chat_id
     ]
-    assert any("отвечает на" in text for text in main_chat_messages)
+    assert all("отвечает на" not in text for text in main_chat_messages)
     assert all("разгадал" not in text for text in main_chat_messages)
 
 
