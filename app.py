@@ -3149,11 +3149,9 @@ def _compose_turn_announcements(
     player_name = player.name or "игрок"
     text_lines.append(f"Сейчас ход {player_name}.")
 
-    scoreboard_caption, scoreboard_text = _format_scoreboard_summary(game_state)
+    scoreboard_caption, _ = _format_scoreboard_summary(game_state)
     if scoreboard_caption:
         caption_lines.append(scoreboard_caption)
-    if scoreboard_text:
-        text_lines.append(scoreboard_text)
 
     caption = "\n".join(caption_lines)
     text = "\n".join(text_lines)

@@ -1858,6 +1858,9 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     assert ANSWER_INSTRUCTIONS_TEXT in broadcast_texts
     expected_turn_text = "Сейчас ход Игрок 2."
+    turn_messages = [text for text in broadcast_texts if text.startswith(expected_turn_text)]
+    assert turn_messages
+    assert all("Очки:" not in message for message in turn_messages)
     assert any(text.startswith(expected_turn_text) for text in broadcast_texts)
     assert any(text.startswith("Верно!") for text in broadcast_texts)
 
@@ -1890,7 +1893,9 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert instructions_kwargs.get("parse_mode") is None
 
     turn_kwargs = send_kwargs_list[-1]
-    assert turn_kwargs.get("text", "").startswith(expected_turn_text)
+    turn_text = turn_kwargs.get("text", "")
+    assert turn_text.startswith(expected_turn_text)
+    assert "Очки:" not in turn_text
 
     assert stored_states, "Game state should be stored after correct answer"
 
@@ -2070,7 +2075,7 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     assert instructions_kwargs.get("parse_mode") is None
     turn_text = turn_kwargs.get("text", "")
     assert turn_text.startswith("Сейчас ход Игрок 1.")
-    assert "Очки:" in turn_text
+    assert "Очки:" not in turn_text
 
     warning_mock = AsyncMock()
     job_name = "turn-warn-test"
