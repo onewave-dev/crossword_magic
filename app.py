@@ -1746,6 +1746,10 @@ async def _announce_turn(
         player,
         prefix=prefix,
     )
+    fallback_text = caption
+    if send_clues:
+        await _broadcast_clues_message(context, game_state, puzzle)
+
     board_sent = False
     if broadcast_board:
         board_sent = await _broadcast_board_state(
@@ -1754,42 +1758,34 @@ async def _announce_turn(
             puzzle,
             caption=caption,
         )
-    if not board_sent and fallback_text:
-        try:
-            broadcast = await _broadcast_to_players(
-                context,
-                game_state,
-                fallback_text,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to announce turn via direct chats for game %s",
-                game_state.game_id,
-            )
-            broadcast = BroadcastResult(successful_chats=set())
-        if (
-            not broadcast.successful_chats
-            or game_state.chat_id not in broadcast.successful_chats
-        ):
+        if not board_sent and fallback_text:
             try:
-                await context.bot.send_message(
-                    chat_id=game_state.chat_id,
-                    text=fallback_text,
-                    **_thread_kwargs(game_state),
+                broadcast = await _broadcast_to_players(
+                    context,
+                    game_state,
+                    fallback_text,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "Failed to announce turn in primary chat for game %s",
+                    "Failed to announce turn via direct chats for game %s",
                     game_state.game_id,
                 )
-    await _broadcast_board_state(
-        context,
-        game_state,
-        puzzle,
-        caption=caption,
-    )
-    if send_clues:
-        await _broadcast_clues_message(context, game_state, puzzle)
+                broadcast = BroadcastResult(successful_chats=set())
+            if (
+                not broadcast.successful_chats
+                or game_state.chat_id not in broadcast.successful_chats
+            ):
+                try:
+                    await context.bot.send_message(
+                        chat_id=game_state.chat_id,
+                        text=fallback_text,
+                        **_thread_kwargs(game_state),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to announce turn in primary chat for game %s",
+                        game_state.game_id,
+                    )
     await _broadcast_turn_message(context, game_state, turn_text)
     _schedule_turn_timers(context, game_state)
     if game_state.test_mode:
@@ -3711,17 +3707,8 @@ async def _deliver_puzzle_via_bot(
     try:
         with logging_context(puzzle_id=puzzle.id):
             image_path = render_puzzle(puzzle, game_state)
-            await context.bot.send_chat_action(
-                chat_id=chat_id, action=constants.ChatAction.UPLOAD_PHOTO
-            )
             with open(image_path, "rb") as photo:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=(
-                        f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
-                    ),
-                )
+                photo_bytes = photo.read()
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=_format_clues_message(puzzle, game_state),
@@ -3730,6 +3717,16 @@ async def _deliver_puzzle_via_bot(
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=ANSWER_INSTRUCTIONS_TEXT,
+            )
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=constants.ChatAction.UPLOAD_PHOTO
+            )
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_bytes,
+                caption=(
+                    f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
+                ),
             )
             logger.info("Delivered freshly generated puzzle to chat %s", chat_id)
             return True
@@ -4623,18 +4620,19 @@ async def _start_new_private_game(
         try:
             with logging_context(puzzle_id=puzzle.id):
                 image_path = render_puzzle(puzzle, game_state)
-                await context.bot.send_chat_action(
-                    chat_id=chat_id,
-                    action=constants.ChatAction.UPLOAD_PHOTO,
-                )
                 if message:
                     with open(image_path, "rb") as photo:
-                        await message.reply_photo(photo=photo)
+                        photo_bytes = photo.read()
                     await message.reply_text(
                         _format_clues_message(puzzle, game_state),
                         parse_mode=constants.ParseMode.HTML,
                     )
                     await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
+                    await context.bot.send_chat_action(
+                        chat_id=chat_id,
+                        action=constants.ChatAction.UPLOAD_PHOTO,
+                    )
+                    await message.reply_photo(photo=photo_bytes)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to resend active puzzle to chat %s", chat_id)
             if message:
@@ -6341,14 +6339,6 @@ async def _launch_admin_test_game(
                 "Failed to render puzzle image for admin test game %s",
                 admin_state.game_id,
             )
-        if puzzle_image_bytes is not None:
-            await _broadcast_photo_to_players(
-                context,
-                admin_state,
-                puzzle_image_bytes,
-                caption=caption,
-                exclude_chat_ids={admin_state.chat_id},
-            )
         clues_message = _format_clues_message(cloned_puzzle, admin_state)
         await _broadcast_to_players(
             context,
@@ -6363,6 +6353,14 @@ async def _launch_admin_test_game(
             ANSWER_INSTRUCTIONS_TEXT,
             exclude_chat_ids={admin_state.chat_id},
         )
+        if puzzle_image_bytes is not None:
+            await _broadcast_photo_to_players(
+                context,
+                admin_state,
+                puzzle_image_bytes,
+                caption=caption,
+                exclude_chat_ids={admin_state.chat_id},
+            )
 
     first_player = admin_state.players.get(admin_state.turn_order[0])
     if announce_start:
@@ -6877,6 +6875,11 @@ async def _handle_answer_submission(
             _, scoreboard_text = _format_scoreboard_summary(game_state)
             if scoreboard_text:
                 success_caption = f"{success_caption}\n{scoreboard_text}"
+            needs_clue_update = (
+                not in_turn_mode and not _all_slots_solved(puzzle, game_state)
+            )
+            if needs_clue_update:
+                await refresh_clues_if_needed()
             await message.reply_photo(
                 photo=photo_bytes, caption=success_caption
             )
@@ -6941,8 +6944,6 @@ async def _handle_answer_submission(
                     parse_mode=constants.ParseMode.HTML,
                 )
                 await _send_completion_options(context, chat.id, message, puzzle)
-            else:
-                await refresh_clues_if_needed()
 
 
 @command_entrypoint()
