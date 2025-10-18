@@ -3309,11 +3309,13 @@ async def _share_puzzle_start_assets(
 
     language_display = (puzzle.language or "?").upper()
     theme_display = puzzle.theme or "(тема не выбрана)"
-    caption = (
-        "Кроссворд готов!\n"
-        f"Язык: {language_display}\n"
-        f"Тема: {theme_display}"
-    )
+    caption_lines = [
+        "Кроссворд готов!",
+        f"Язык: {language_display}",
+        f"Тема: {theme_display}",
+        "Начинайте отгадывать!",
+    ]
+    caption = "\n".join(caption_lines)
     image_bytes: bytes | None = None
     try:
         image_path = render_puzzle(puzzle, game_state)
@@ -8180,6 +8182,7 @@ async def _start_game(
         game_state,
         puzzle,
         prefix=prefix,
+        broadcast_board=False,
     )
     return True
 
