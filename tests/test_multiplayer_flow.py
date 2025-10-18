@@ -1302,6 +1302,7 @@ async def test_lobby_start_callback_starts_game(monkeypatch, fresh_state):
     assert all(score == 0 for score in game_state.scoreboard.values())
     schedule_mock.assert_called_once()
     announce_mock.assert_awaited()
+    assert announce_mock.await_args.kwargs.get("show_board") is False
     share_mock.assert_awaited_once_with(context, game_state, puzzle)
     query.answer.assert_awaited_with()
 
@@ -1523,7 +1524,16 @@ async def test_share_puzzle_start_assets_sends_images(monkeypatch, tmp_path, fre
     await app._share_puzzle_start_assets(context, game_state, puzzle)
 
     send_photo_mock.assert_awaited_once()
+    caption = send_photo_mock.await_args.kwargs.get("caption")
+    assert caption == (
+        "Кроссворд готов!\n"
+        f"Язык: {puzzle.language.upper()}\n"
+        f"Тема: {puzzle.theme}\n"
+        "Начинайте отгадывать!"
+    )
     broadcast_mock.assert_awaited_once()
+    broadcast_caption = broadcast_mock.await_args.kwargs.get("caption")
+    assert broadcast_caption == caption
 
 
 @pytest.mark.anyio
@@ -2403,6 +2413,13 @@ async def test_admin_test_game_creates_room(monkeypatch, tmp_path, fresh_state):
         for call in bot.send_photo.await_args_list
         if call.kwargs.get("chat_id") == base_state.chat_id
     ]
+    expected_caption = (
+        "Кроссворд готов!\n"
+        f"Язык: {puzzle.language.upper()}\n"
+        f"Тема: {puzzle.theme}\n"
+        "Начинайте отгадывать!"
+    )
+    assert expected_caption in board_captions
     assert all("Первым ходит" not in caption for caption in board_captions)
     assert any("Первым ходит" in text for text in main_chat_texts)
     assert any("Сейчас ход" in text for text in main_chat_texts)

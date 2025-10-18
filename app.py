@@ -1728,6 +1728,7 @@ async def _announce_turn(
     *,
     prefix: str | None = None,
     send_clues: bool = True,
+    show_board: bool = True,
 ) -> None:
     player = _current_player(game_state)
     if player is None:
@@ -1737,12 +1738,13 @@ async def _announce_turn(
         player,
         prefix=prefix,
     )
-    await _broadcast_board_state(
-        context,
-        game_state,
-        puzzle,
-        caption=caption,
-    )
+    if show_board:
+        await _broadcast_board_state(
+            context,
+            game_state,
+            puzzle,
+            caption=caption,
+        )
     if send_clues:
         await _broadcast_clues_message(context, game_state, puzzle)
     await _broadcast_turn_message(context, game_state, turn_text)
@@ -3255,7 +3257,8 @@ async def _share_puzzle_start_assets(
     caption = (
         "Кроссворд готов!\n"
         f"Язык: {language_display}\n"
-        f"Тема: {theme_display}"
+        f"Тема: {theme_display}\n"
+        "Начинайте отгадывать!"
     )
     image_bytes: bytes | None = None
     try:
@@ -3658,7 +3661,10 @@ async def _deliver_puzzle_via_bot(
                     chat_id=chat_id,
                     photo=photo,
                     caption=(
-                        f"Кроссворд готов!\nЯзык: {puzzle.language.upper()}\nТема: {puzzle.theme}"
+                        "Кроссворд готов!\n"
+                        f"Язык: {puzzle.language.upper()}\n"
+                        f"Тема: {puzzle.theme}\n"
+                        "Начинайте отгадывать!"
                     ),
                 )
             await context.bot.send_message(
@@ -6331,6 +6337,7 @@ async def _launch_admin_test_game(
             else None
         ),
         send_clues=False,
+        show_board=False,
     )
 
     return admin_state, cloned_puzzle
@@ -8114,6 +8121,7 @@ async def _start_game(
         game_state,
         puzzle,
         prefix=prefix,
+        show_board=False,
     )
     return True
 
