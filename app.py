@@ -4710,7 +4710,8 @@ async def _process_join_code(
         await _broadcast_to_players(
             context,
             game_state,
-            f"{player.name} подключился к игре!",
+            f"Игрок <b>{html.escape(player.name)}</b> подключился к игре!",
+            parse_mode=constants.ParseMode.HTML,
         )
         await _update_lobby_message(context, game_state)
         await _ensure_generation_notice_for_chat(context, game_state, chat.id)
