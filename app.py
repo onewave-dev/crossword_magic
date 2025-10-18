@@ -7075,6 +7075,7 @@ async def _handle_hint_request(
         in_turn_mode = game_state.mode == "turn_based"
         player_id: int | None = None
         current_player: Player | None = None
+        player_display_name: str | None = None
         if in_turn_mode:
             if game_state.status != "running":
                 await message.reply_text("Игра ещё не запущена или завершена.")
@@ -7097,6 +7098,26 @@ async def _handle_hint_request(
             if player_id != current_player_id:
                 await message.reply_text(f"Сейчас ход {current_player.name}.")
                 return
+            if current_player.name:
+                player_display_name = current_player.name
+        else:
+            if message.from_user is not None:
+                player_id = getattr(message.from_user, "id", None)
+        if player_display_name is None and player_id is not None:
+            player_entry = game_state.players.get(player_id)
+            if player_entry and player_entry.name:
+                player_display_name = player_entry.name
+        if player_display_name is None:
+            from_user = message.from_user
+            fallback_name = None
+            if from_user is not None:
+                fallback_name = (
+                    getattr(from_user, "full_name", None)
+                    or getattr(from_user, "username", None)
+                    or getattr(from_user, "first_name", None)
+                    or getattr(from_user, "last_name", None)
+                )
+            player_display_name = fallback_name or "Игрок"
 
         slot_ref: Optional[SlotRef] = None
         ambiguity: Optional[str] = None
@@ -7143,6 +7164,7 @@ async def _handle_hint_request(
         result = _reveal_letter(
             game_state, slot_ref, slot_ref.slot.answer, user_id=player_id
         )
+        broadcast_caption: str | None = None
         if result is None:
             _record_hint_usage(game_state, slot_ref.public_id, user_id=player_id)
             game_state.last_update = time.time()
@@ -7153,10 +7175,12 @@ async def _handle_hint_request(
             logger.info("Hint requested for already revealed slot %s", slot_ref.public_id)
         else:
             position, letter = result
+            clue_text = slot_ref.slot.clue or "нет"
             reply_text = (
-                f"Открыта буква №{position + 1} в {slot_ref.public_id}: {letter}\n"
-                f"Подсказка: {slot_ref.slot.clue or 'нет'}"
+                f"{player_display_name} открыл букву №{position + 1} в {normalised_public_id}. "
+                f"Подсказка: {clue_text}."
             )
+            broadcast_caption = reply_text
             logger.info(
                 "Revealed letter %s at position %s for slot %s",
                 letter,
@@ -7176,7 +7200,39 @@ async def _handle_hint_request(
                 chat_id=chat.id, action=constants.ChatAction.UPLOAD_PHOTO
             )
             with open(image_path, "rb") as photo:
-                await message.reply_photo(photo=photo, caption=reply_text)
+                photo_bytes = photo.read()
+            await message.reply_photo(photo=photo_bytes, caption=reply_text)
+            if broadcast_caption:
+                broadcast_result: BroadcastResult | None = None
+                try:
+                    broadcast_result = await _broadcast_to_players(
+                        context,
+                        game_state,
+                        broadcast_caption,
+                        exclude_chat_ids={chat.id},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to broadcast hint announcement for game %s",
+                        game_state.game_id,
+                    )
+                    broadcast_result = None
+                await _mirror_primary_chat_if_needed(
+                    context,
+                    game_state,
+                    source_chat_id=chat.id,
+                    broadcast_result=broadcast_result,
+                    text=broadcast_caption,
+                    photo_bytes=photo_bytes,
+                    caption=broadcast_caption,
+                )
+                await _broadcast_photo_to_players(
+                    context,
+                    game_state,
+                    photo_bytes,
+                    caption=broadcast_caption,
+                    exclude_chat_ids={chat.id},
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Failed to render grid after hint for slot %s", slot_ref.slot.slot_id
