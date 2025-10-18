@@ -1643,6 +1643,9 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         )
         if SCORE_PER_WORD:
             success_caption += f" (+{SCORE_PER_WORD} очков)"
+        _, scoreboard_text = _format_scoreboard_summary(game_state)
+        if scoreboard_text:
+            success_caption = f"{success_caption}\n{scoreboard_text}"
         try:
             image_path = render_puzzle(puzzle, game_state)
             with open(image_path, "rb") as photo:
@@ -1681,7 +1684,12 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
             return
         _advance_turn(game_state)
         _store_state(game_state)
-        await _announce_turn(context, game_state, puzzle)
+        await _announce_turn(
+            context,
+            game_state,
+            puzzle,
+            broadcast_board=False,
+        )
         return
 
     # Failure branch
@@ -1728,6 +1736,7 @@ async def _announce_turn(
     *,
     prefix: str | None = None,
     send_clues: bool = True,
+    broadcast_board: bool = True,
 ) -> None:
     player = _current_player(game_state)
     if player is None:
@@ -1737,12 +1746,14 @@ async def _announce_turn(
         player,
         prefix=prefix,
     )
-    board_sent = await _broadcast_board_state(
-        context,
-        game_state,
-        puzzle,
-        caption=caption,
-    )
+    board_sent = False
+    if broadcast_board:
+        board_sent = await _broadcast_board_state(
+            context,
+            game_state,
+            puzzle,
+            caption=caption,
+        )
     if not board_sent and fallback_text:
         try:
             broadcast = await _broadcast_to_players(
@@ -3137,27 +3148,43 @@ def _compose_turn_announcements(
     caption_lines.append(f"Ход игрока {html.escape(player_name)}.")
     text_lines.append(f"Ход игрока {player_name}.")
 
-    if game_state.scoreboard:
-        html_parts: list[str] = []
-        text_parts: list[str] = []
-        for player_id, score in sorted(
-            game_state.scoreboard.items(), key=lambda item: (-item[1], item[0])
-        ):
-            scoreboard_player = game_state.players.get(player_id)
-            display_name = (
-                scoreboard_player.name
-                if scoreboard_player and scoreboard_player.name
-                else str(player_id)
-            )
-            html_parts.append(f"{html.escape(display_name)}: {score}")
-            text_parts.append(f"{display_name}: {score}")
-        if html_parts:
-            caption_lines.append("Очки: " + ", ".join(html_parts))
-            text_lines.append("Очки: " + ", ".join(text_parts))
+    scoreboard_caption, scoreboard_text = _format_scoreboard_summary(game_state)
+    if scoreboard_caption:
+        caption_lines.append(scoreboard_caption)
+    if scoreboard_text:
+        text_lines.append(scoreboard_text)
 
     caption = "\n".join(caption_lines)
     text = "\n".join(text_lines)
     return caption, text
+
+
+def _format_scoreboard_summary(
+    game_state: GameState,
+) -> tuple[str | None, str | None]:
+    if not game_state.scoreboard:
+        return None, None
+
+    html_parts: list[str] = []
+    text_parts: list[str] = []
+    for player_id, score in sorted(
+        game_state.scoreboard.items(), key=lambda item: (-item[1], item[0])
+    ):
+        scoreboard_player = game_state.players.get(player_id)
+        display_name = (
+            scoreboard_player.name
+            if scoreboard_player and scoreboard_player.name
+            else str(player_id)
+        )
+        html_parts.append(f"{html.escape(display_name)}: {score}")
+        text_parts.append(f"{display_name}: {score}")
+
+    if not html_parts:
+        return None, None
+
+    summary = "Очки: " + ", ".join(html_parts)
+    summary_text = "Очки: " + ", ".join(text_parts)
+    return summary, summary_text
 
 
 async def _broadcast_board_state(
@@ -6787,6 +6814,9 @@ async def _handle_answer_submission(
             success_caption = (
                 f"Верно! {player_display_name} - {public_id} - {candidate}"
             )
+            _, scoreboard_text = _format_scoreboard_summary(game_state)
+            if scoreboard_text:
+                success_caption = f"{success_caption}\n{scoreboard_text}"
             await message.reply_photo(
                 photo=photo_bytes, caption=success_caption
             )
@@ -6840,6 +6870,7 @@ async def _handle_answer_submission(
                 context,
                 game_state,
                 puzzle,
+                broadcast_board=False,
             )
         else:
             if _all_slots_solved(puzzle, game_state):
