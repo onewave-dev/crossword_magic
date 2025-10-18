@@ -1639,7 +1639,7 @@ async def _dummy_turn_job(context: CallbackContext) -> None:
         game_state.active_slot_id = None
         _store_state(game_state)
         success_caption = (
-            f"Верно! {info_prefix} - {slot_ref.public_id}: {attempt_display}"
+            f"Верно! {info_prefix} - {slot_ref.public_id} - {attempt_display}"
         )
         if SCORE_PER_WORD:
             success_caption += f" (+{SCORE_PER_WORD} очков)"

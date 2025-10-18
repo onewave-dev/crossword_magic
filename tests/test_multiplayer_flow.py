@@ -2615,7 +2615,7 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     assert job_name not in state.scheduled_jobs
     broadcast_photo_mock.assert_awaited()
     expected_caption = (
-        f"Верно! 🤖 Dummy - A1: РИМ (+{app.SCORE_PER_WORD} очков)"
+        f"Верно! 🤖 Dummy - A1 - РИМ (+{app.SCORE_PER_WORD} очков)"
     )
     _, scoreboard_text = app._format_scoreboard_summary(game_state)
     assert scoreboard_text
