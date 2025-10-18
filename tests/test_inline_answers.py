@@ -119,7 +119,7 @@ async def test_inline_handler_replies_when_parse_fails_with_active_game():
     message.reply_text.assert_awaited_once()
     reply_call = message.reply_text.await_args
     assert reply_call.args
-    assert app.ANSWER_INSTRUCTIONS_TEXT in reply_call.args[0]
+    assert reply_call.args[0] == "Не удалось распознать ответ. Попробуйте ещё раз."
 
 
 @pytest.mark.anyio

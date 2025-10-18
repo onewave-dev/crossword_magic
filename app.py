@@ -673,12 +673,6 @@ SAME_TOPIC_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}repeat:"
 NEW_PUZZLE_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}new:"
 MENU_CALLBACK_PREFIX = f"{COMPLETION_CALLBACK_PREFIX}menu:"
 
-ANSWER_INSTRUCTIONS_TEXT = (
-    'Отвечайте в формате: "А1 - париж", "А1 париж" или просто "1 париж". '
-    'Подсказку можно запросить сообщением "?A1" (или с другим слотом). '
-    'Имейте в виду: подсказки уменьшают итоговый счёт.'
-)
-
 NEW_GAME_MENU_CALLBACK_PREFIX = "new_game_mode:"
 NEW_GAME_MODE_SOLO = f"{NEW_GAME_MENU_CALLBACK_PREFIX}solo"
 NEW_GAME_MODE_GROUP = f"{NEW_GAME_MENU_CALLBACK_PREFIX}group"
@@ -3082,7 +3076,6 @@ async def _broadcast_clues_message(
     """Broadcast formatted clues to players and the primary chat."""
 
     text = _format_clues_message(puzzle, game_state)
-    instructions = ANSWER_INSTRUCTIONS_TEXT
     try:
         broadcast = await _broadcast_to_players(
             context,
@@ -3097,18 +3090,6 @@ async def _broadcast_clues_message(
             game_state.game_id,
         )
         broadcast = BroadcastResult(successful_chats=set())
-    try:
-        await _broadcast_to_players(
-            context,
-            game_state,
-            instructions,
-            exclude_chat_ids=exclude_chat_ids,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to broadcast answer instructions for game %s",
-            game_state.game_id,
-        )
     if (
         not broadcast.successful_chats
         or game_state.chat_id not in broadcast.successful_chats
@@ -3118,11 +3099,6 @@ async def _broadcast_clues_message(
                 chat_id=game_state.chat_id,
                 text=text,
                 parse_mode=constants.ParseMode.HTML,
-                **_thread_kwargs(game_state),
-            )
-            await context.bot.send_message(
-                chat_id=game_state.chat_id,
-                text=instructions,
                 **_thread_kwargs(game_state),
             )
         except Exception:  # noqa: BLE001
@@ -3419,7 +3395,6 @@ async def _send_clues_update(
         text,
         parse_mode=constants.ParseMode.HTML,
     )
-    await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
 
 
 def _build_completion_keyboard(puzzle: Puzzle | CompositePuzzle) -> InlineKeyboardMarkup:
@@ -3715,10 +3690,6 @@ async def _deliver_puzzle_via_bot(
                 chat_id=chat_id,
                 text=_format_clues_message(puzzle, game_state),
                 parse_mode=constants.ParseMode.HTML,
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=ANSWER_INSTRUCTIONS_TEXT,
             )
             await context.bot.send_chat_action(
                 chat_id=chat_id, action=constants.ChatAction.UPLOAD_PHOTO
@@ -4629,7 +4600,6 @@ async def _start_new_private_game(
                         _format_clues_message(puzzle, game_state),
                         parse_mode=constants.ParseMode.HTML,
                     )
-                    await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
                     await context.bot.send_chat_action(
                         chat_id=chat_id,
                         action=constants.ChatAction.UPLOAD_PHOTO,
@@ -6349,12 +6319,6 @@ async def _launch_admin_test_game(
             parse_mode=constants.ParseMode.HTML,
             exclude_chat_ids={admin_state.chat_id},
         )
-        await _broadcast_to_players(
-            context,
-            admin_state,
-            ANSWER_INSTRUCTIONS_TEXT,
-            exclude_chat_ids={admin_state.chat_id},
-        )
         if puzzle_image_bytes is not None:
             await _broadcast_photo_to_players(
                 context,
@@ -6507,7 +6471,6 @@ async def send_clues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             _format_clues_message(puzzle, game_state),
             parse_mode=constants.ParseMode.HTML,
         )
-        await message.reply_text(ANSWER_INSTRUCTIONS_TEXT)
 
 
 @command_entrypoint()
@@ -7174,9 +7137,7 @@ async def inline_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     "text": raw_text,
                 },
             )
-            await message.reply_text(
-                f"Не удалось распознать ответ. {ANSWER_INSTRUCTIONS_TEXT}"
-            )
+            await message.reply_text("Не удалось распознать ответ. Попробуйте ещё раз.")
         else:
             logger.debug(
                 "Inline answer ignored: no active game and input not recognised",
