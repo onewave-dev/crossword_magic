@@ -1177,7 +1177,9 @@ async def test_join_name_accepts_plain_text_with_pending(monkeypatch, fresh_stat
 
     registrations: list[tuple[int, int]] = []
 
-    def fake_register_player_chat(user_id: int, dm_chat_id: int) -> None:
+    def fake_register_player_chat(
+        user_id: int, dm_chat_id: int, _context=None
+    ) -> None:
         registrations.append((user_id, dm_chat_id))
 
     monkeypatch.setattr(app, "_register_player_chat", fake_register_player_chat)
@@ -1859,9 +1861,13 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert any(text.startswith(expected_turn_text) for text in broadcast_texts)
     assert any(text.startswith("Верно!") for text in broadcast_texts)
 
-    photo_calls = bot.send_photo.await_args_list
+    photo_calls = message.reply_photo.await_args_list
     assert photo_calls, "Board image should be sent to the primary chat"
     board_kwargs = photo_calls[0].kwargs
+    assert board_kwargs.get("caption") is not None
+    _, scoreboard_text = app._format_scoreboard_summary(game_state)
+    assert scoreboard_text
+    assert scoreboard_text in board_kwargs.get("caption")
     caption_text = board_kwargs.get("caption") or ""
     assert caption_text
     assert "Сейчас ход" not in caption_text
@@ -1870,6 +1876,10 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     send_calls = bot.send_message.await_args_list
     assert len(send_calls) >= 3
     send_kwargs_list = [call.kwargs for call in send_calls]
+    assert any(
+        (kwargs.get("text") or "").startswith(expected_turn_text)
+        for kwargs in send_kwargs_list
+    )
     clues_kwargs = next(kwargs for kwargs in send_kwargs_list if kwargs.get("text") == updated_clues)
     assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
     assert clues_kwargs.get("reply_markup") is None
@@ -2607,6 +2617,9 @@ async def test_dummy_turn_job_success(monkeypatch, tmp_path, fresh_state, caplog
     expected_caption = (
         f"Верно! 🤖 Dummy - A1: РИМ (+{app.SCORE_PER_WORD} очков)"
     )
+    _, scoreboard_text = app._format_scoreboard_summary(game_state)
+    assert scoreboard_text
+    expected_caption = f"{expected_caption}\n{scoreboard_text}"
     assert broadcast_photo_mock.await_args.kwargs.get("caption") == expected_caption
     context.bot.send_photo.assert_awaited()
     assert context.bot.send_photo.await_args.kwargs.get("caption") == expected_caption
