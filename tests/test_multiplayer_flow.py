@@ -19,7 +19,6 @@ from telegram.ext import ConversationHandler
 
 import app
 from app import (
-    ANSWER_INSTRUCTIONS_TEXT,
     HINT_PENALTY,
     LANGUAGE_STATE,
     LOBBY_START_CALLBACK_PREFIX,
@@ -1846,7 +1845,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
 
     await app._handle_answer_submission(context, chat, message, "A1", "рим")
 
-    assert broadcast_mock.await_count == 4
+    assert broadcast_mock.await_count == 3
     broadcast_texts = [call.args[2] for call in broadcast_mock.await_args_list]
 
     updated_clues = app._format_clues_message(puzzle, game_state)
@@ -1856,7 +1855,9 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     )
     assert clues_call.kwargs.get("parse_mode") == constants.ParseMode.HTML
 
-    assert ANSWER_INSTRUCTIONS_TEXT in broadcast_texts
+    assert not [
+        text for text in broadcast_texts if "Отвечайте в формате" in (text or "")
+    ]
     expected_turn_text = "Сейчас ход Игрок 2."
     turn_messages = [text for text in broadcast_texts if text.startswith(expected_turn_text)]
     assert turn_messages
@@ -1877,7 +1878,7 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert "Очки:" in caption_text
 
     send_calls = bot.send_message.await_args_list
-    assert len(send_calls) >= 3
+    assert len(send_calls) == 2
     send_kwargs_list = [call.kwargs for call in send_calls]
     assert any(
         (kwargs.get("text") or "").startswith(expected_turn_text)
@@ -1887,10 +1888,10 @@ async def test_correct_answer_sends_clues_before_turn(monkeypatch, tmp_path, fre
     assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
     assert clues_kwargs.get("reply_markup") is None
 
-    instructions_kwargs = next(
-        kwargs for kwargs in send_kwargs_list if kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
+    assert all(
+        "Отвечайте в формате" not in (kwargs.get("text") or "")
+        for kwargs in send_kwargs_list
     )
-    assert instructions_kwargs.get("parse_mode") is None
 
     turn_kwargs = send_kwargs_list[-1]
     turn_text = turn_kwargs.get("text", "")
@@ -2064,15 +2065,19 @@ async def test_dm_only_game_notifications_send_once(monkeypatch, fresh_state):
     assert "Очки:" in caption_text
     assert photo_kwargs.get("parse_mode") == constants.ParseMode.HTML
 
-    assert bot.send_message.await_count == 3
+    assert bot.send_message.await_count == 2
     send_kwargs_list = [call.kwargs for call in bot.send_message.await_args_list]
-    clues_kwargs = send_kwargs_list[0]
-    instructions_kwargs = send_kwargs_list[1]
-    turn_kwargs = send_kwargs_list[2]
+    assert all(
+        "Отвечайте в формате" not in (kwargs.get("text") or "")
+        for kwargs in send_kwargs_list
+    )
+    clues_kwargs = next(
+        kwargs for kwargs in send_kwargs_list if kwargs.get("parse_mode") == constants.ParseMode.HTML
+    )
     assert clues_kwargs.get("text") == app._format_clues_message(puzzle, game_state)
-    assert clues_kwargs.get("parse_mode") == constants.ParseMode.HTML
-    assert instructions_kwargs.get("text") == ANSWER_INSTRUCTIONS_TEXT
-    assert instructions_kwargs.get("parse_mode") is None
+    turn_kwargs = next(
+        kwargs for kwargs in send_kwargs_list if (kwargs.get("text") or "").startswith("Сейчас ход")
+    )
     turn_text = turn_kwargs.get("text", "")
     assert turn_text.startswith("Сейчас ход Игрок 1.")
     assert "Очки:" not in turn_text
@@ -2856,14 +2861,11 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, tmp_path,
 
     assert attempted == [
         player.dm_chat_id,
-        player.dm_chat_id,
-        game_state.chat_id,
         game_state.chat_id,
         player.dm_chat_id,
         game_state.chat_id,
     ]
     assert delivered == [
-        game_state.chat_id,
         game_state.chat_id,
         game_state.chat_id,
     ]
