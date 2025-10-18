@@ -1732,47 +1732,20 @@ async def _announce_turn(
     player = _current_player(game_state)
     if player is None:
         return
-    caption, fallback_text = _compose_turn_announcements(
+    caption, turn_text = _compose_turn_announcements(
         game_state,
         player,
         prefix=prefix,
     )
-    board_sent = await _broadcast_board_state(
+    await _broadcast_board_state(
         context,
         game_state,
         puzzle,
         caption=caption,
     )
-    if not board_sent and fallback_text:
-        try:
-            broadcast = await _broadcast_to_players(
-                context,
-                game_state,
-                fallback_text,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed to announce turn via direct chats for game %s",
-                game_state.game_id,
-            )
-            broadcast = BroadcastResult(successful_chats=set())
-        if (
-            not broadcast.successful_chats
-            or game_state.chat_id not in broadcast.successful_chats
-        ):
-            try:
-                await context.bot.send_message(
-                    chat_id=game_state.chat_id,
-                    text=fallback_text,
-                    **_thread_kwargs(game_state),
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Failed to announce turn in primary chat for game %s",
-                    game_state.game_id,
-                )
     if send_clues:
         await _broadcast_clues_message(context, game_state, puzzle)
+    await _broadcast_turn_message(context, game_state, turn_text)
     _schedule_turn_timers(context, game_state)
     if game_state.test_mode:
         _schedule_dummy_turn(context, game_state, puzzle)
@@ -3124,18 +3097,16 @@ def _compose_turn_announcements(
     *,
     prefix: str | None = None,
 ) -> tuple[str, str]:
-    """Return HTML caption and plain text lines describing the current turn."""
+    """Return the board caption and textual turn announcement."""
 
     caption_lines = ["📋 Текущая доска"]
     text_lines: list[str] = []
 
     if prefix:
-        caption_lines.append(html.escape(prefix))
         text_lines.append(prefix)
 
     player_name = player.name or "игрок"
-    caption_lines.append(f"Ход игрока {html.escape(player_name)}.")
-    text_lines.append(f"Ход игрока {player_name}.")
+    text_lines.append(f"Сейчас ход {player_name}.")
 
     if game_state.scoreboard:
         html_parts: list[str] = []
@@ -3230,6 +3201,46 @@ async def _broadcast_board_state(
         )
 
     return delivered
+
+
+async def _broadcast_turn_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_state: GameState,
+    text: str,
+) -> None:
+    """Broadcast the current turn announcement to all participants."""
+
+    if not text:
+        return
+
+    try:
+        broadcast = await _broadcast_to_players(
+            context,
+            game_state,
+            text,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to broadcast turn announcement via direct chats for game %s",
+            game_state.game_id,
+        )
+        broadcast = BroadcastResult(successful_chats=set())
+
+    if (
+        not broadcast.successful_chats
+        or game_state.chat_id not in broadcast.successful_chats
+    ):
+        try:
+            await context.bot.send_message(
+                chat_id=game_state.chat_id,
+                text=text,
+                **_thread_kwargs(game_state),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to send turn announcement in primary chat for game %s",
+                game_state.game_id,
+            )
 
 
 async def _share_puzzle_start_assets(
@@ -4682,7 +4693,14 @@ async def _process_join_code(
     if len(game_state.players) >= MAX_LOBBY_PLAYERS and user.id not in game_state.players:
         await message.reply_text("Достигнут лимит игроков в этой комнате (6).")
         return
-    _register_player_chat(user.id, chat.id, context)
+    try:
+        _register_player_chat(user.id, chat.id, context)
+    except TypeError as exc:
+        error_text = str(exc)
+        if "positional argument" in error_text and "given" in error_text:
+            _register_player_chat(user.id, chat.id)  # type: ignore[misc]
+        else:
+            raise
     existing = game_state.players.get(user.id)
     if existing:
         existing.dm_chat_id = chat.id
@@ -5555,7 +5573,14 @@ async def join_name_response_handler(
         )
         await message.reply_text("К сожалению, комната уже заполнена.")
         return
-    _register_player_chat(user.id, chat.id, context)
+    try:
+        _register_player_chat(user.id, chat.id, context)
+    except TypeError as exc:
+        error_text = str(exc)
+        if "positional argument" in error_text and "given" in error_text:
+            _register_player_chat(user.id, chat.id)  # type: ignore[misc]
+        else:
+            raise
     player = _ensure_player_entry(game_state, user, name, chat.id)
     _store_state(game_state)
     with logging_context(chat_id=chat.id, puzzle_id=game_state.puzzle_id):
