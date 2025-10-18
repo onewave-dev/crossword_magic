@@ -64,6 +64,8 @@ from utils.storage import (
     STATE_CLEANUP_INTERVAL,
     GameState,
     Player,
+    SUPABASE_ENABLED,
+    ensure_local_directories,
     delete_puzzle,
     delete_state,
     load_puzzle,
@@ -173,7 +175,11 @@ def load_settings() -> Settings:
 
 
 def ensure_storage_directories() -> None:
-    logger.debug("Supabase mode: no local storage directories needed")
+    if SUPABASE_ENABLED:
+        logger.debug("Supabase mode: no local storage directories needed")
+        return
+    ensure_local_directories()
+    logger.debug("Ensured local storage directories on disk")
 
 
 
@@ -2231,9 +2237,10 @@ async def _dismiss_lobby_invite_keyboard(
         return
     delete_message = getattr(bot, "delete_message", None)
     if not callable(delete_message):
-        return
+        delete_message = None
     try:
-        await delete_message(chat_id=host_chat_id, message_id=invite_message_id)
+        if delete_message is not None:
+            await delete_message(chat_id=host_chat_id, message_id=invite_message_id)
     except Forbidden:
         logger.debug(
             "Unable to delete invite keyboard message for host %s in chat %s",
@@ -2249,6 +2256,27 @@ async def _dismiss_lobby_invite_keyboard(
     except Exception:  # noqa: BLE001
         logger.exception(
             "Unexpected error while deleting invite keyboard message for game %s",
+            game_state.game_id,
+        )
+
+    send_message = getattr(bot, "send_message", None)
+    if not callable(send_message):
+        return
+    try:
+        await send_message(
+            chat_id=host_chat_id,
+            text="Начинаем игру! Убираю клавиатуру приглашений.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except TelegramError:
+        logger.exception(
+            "Failed to send keyboard removal notice to host %s in game %s",
+            host_id,
+            game_state.game_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Unexpected error while sending keyboard removal notice for game %s",
             game_state.game_id,
         )
 
@@ -7918,6 +7946,16 @@ async def _start_game(
     await _share_puzzle_start_assets(context, game_state, puzzle)
 
     first_player = players_sorted[0] if players_sorted else None
+    start_lines = ["Игра начинается!"]
+    if first_player is not None:
+        start_lines.append(f"Первым ходит {first_player.name}.")
+    start_lines.append("Отвечайте в этом чате, когда придёт ваша очередь.")
+    await _send_game_message(
+        context,
+        game_state,
+        " ".join(start_lines),
+        reply_markup=ReplyKeyboardRemove(),
+    )
     prefix = (
         f"Первым ходит {first_player.name}!"
         if first_player is not None

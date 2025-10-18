@@ -28,10 +28,11 @@ STATE_CLEANUP_INTERVAL = 60 * 60  # hourly cleanup
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_KEY") or ""
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 _SB_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 def _sb() -> httpx.Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_ENABLED:
         raise RuntimeError("Supabase URL/KEY not configured")
     return httpx.Client(
         base_url=f"{SUPABASE_URL}/rest/v1",
@@ -542,28 +543,51 @@ def _dump_json(payload: Mapping[str, Any]) -> bytes:
 
 
 def load_puzzle(puzzle_id: str) -> Optional[Mapping[str, Any]]:
-    with _sb() as c:
-        r = c.get("/puzzles", params={"id": f"eq.{puzzle_id}", "select": "data"})
-        r.raise_for_status()
-        rows = r.json()
-        if not rows:
-            return None
-        payload = rows[0]["data"]
-        logger.debug("Loaded puzzle %s from Supabase", puzzle_id)
-        return payload
+    if SUPABASE_ENABLED:
+        with _sb() as c:
+            r = c.get("/puzzles", params={"id": f"eq.{puzzle_id}", "select": "data"})
+            r.raise_for_status()
+            rows = r.json()
+            if not rows:
+                return None
+            payload = rows[0]["data"]
+            logger.debug("Loaded puzzle %s from Supabase", puzzle_id)
+            return payload
+    path = PUZZLES_DIR / f"{puzzle_id}{STATE_FILE_SUFFIX}"
+    payload = _load_json(path)
+    if payload is not None:
+        logger.debug("Loaded puzzle %s from local storage", puzzle_id)
+    return payload
 
 def save_puzzle(puzzle_id: str, payload: Mapping[str, Any]) -> None:
-    body = {"id": puzzle_id, "data": payload}
-    with _sb() as c:
-        r = c.post("/puzzles", json=body)
-        r.raise_for_status()
-    logger.debug("Saved puzzle %s to Supabase", puzzle_id)
+    if SUPABASE_ENABLED:
+        body = {"id": puzzle_id, "data": payload}
+        with _sb() as c:
+            r = c.post("/puzzles", json=body)
+            r.raise_for_status()
+        logger.debug("Saved puzzle %s to Supabase", puzzle_id)
+        return
+    ensure_local_directories()
+    path = PUZZLES_DIR / f"{puzzle_id}{STATE_FILE_SUFFIX}"
+    data = _dump_json(payload)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp.name, path)
+    logger.debug("Saved puzzle %s to local storage", puzzle_id)
 
 def delete_puzzle(puzzle_id: str) -> None:
-    with _sb() as c:
-        r = c.delete("/puzzles", params={"id": f"eq.{puzzle_id}"})
-        r.raise_for_status()
-    logger.debug("Deleted puzzle %s from Supabase", puzzle_id)
+    if SUPABASE_ENABLED:
+        with _sb() as c:
+            r = c.delete("/puzzles", params={"id": f"eq.{puzzle_id}"})
+            r.raise_for_status()
+        logger.debug("Deleted puzzle %s from Supabase", puzzle_id)
+        return
+    path = PUZZLES_DIR / f"{puzzle_id}{STATE_FILE_SUFFIX}"
+    with suppress(FileNotFoundError):
+        path.unlink()
+        logger.debug("Deleted puzzle %s from local storage", puzzle_id)
 
 
 def _derive_legacy_chat_id(identifier: str | int | None) -> Optional[int]:
@@ -579,45 +603,83 @@ def _derive_legacy_chat_id(identifier: str | int | None) -> Optional[int]:
 
 def load_state(identifier: str | int) -> Optional[GameState]:
     game_id = str(identifier)
-    with _sb() as c:
-        # пробуем по game_id
-        r = c.get("/states", params={"game_id": f"eq.{game_id}", "select": "data"})
-        r.raise_for_status()
-        rows = r.json()
-        if not rows:
-            # легаси: попробовать по chat_id, если это число (как раньше делалось на диске)
-            legacy = _derive_legacy_chat_id(identifier)
-            if legacy is None:
-                return None
-            r2 = c.get("/states", params={"chat_id": f"eq.{legacy}", "select": "data"})
-            r2.raise_for_status()
-            rows = r2.json()
+    if SUPABASE_ENABLED:
+        with _sb() as c:
+            r = c.get("/states", params={"game_id": f"eq.{game_id}", "select": "data"})
+            r.raise_for_status()
+            rows = r.json()
             if not rows:
+                legacy = _derive_legacy_chat_id(identifier)
+                if legacy is None:
+                    return None
+                r2 = c.get("/states", params={"chat_id": f"eq.{legacy}", "select": "data"})
+                r2.raise_for_status()
+                rows = r2.json()
+                if not rows:
+                    return None
+            payload = rows[0]["data"]
+            try:
+                state = GameState.from_dict(payload)
+            except Exception:
+                logger.exception("Failed to restore state for %s from Supabase", identifier)
                 return None
-        payload = rows[0]["data"]
-        try:
-            state = GameState.from_dict(payload)
-        except Exception:
-            logger.exception("Failed to restore state for %s from Supabase", identifier)
-            return None
-        logger.debug("Loaded state for game %s from Supabase", state.game_id)
-        return state
+            logger.debug("Loaded state for game %s from Supabase", state.game_id)
+            return state
+    path = STATES_DIR / f"{game_id}{STATE_FILE_SUFFIX}"
+    payload = _load_json(path)
+    if payload is None:
+        legacy = _derive_legacy_chat_id(identifier)
+        if legacy is not None:
+            legacy_path = STATES_DIR / f"{legacy}{STATE_FILE_SUFFIX}"
+            payload = _load_json(legacy_path)
+    if payload is None:
+        return None
+    try:
+        state = GameState.from_dict(payload)
+    except Exception:
+        logger.exception("Failed to restore state for %s from local storage", identifier)
+        return None
+    logger.debug("Loaded state for game %s from local storage", state.game_id)
+    return state
 
 def save_state(state: GameState) -> None:
-    # сохраняем весь dict, как делали на диске
     payload = state.to_dict()
-    body = {
-        "game_id": state.game_id,
-        "chat_id": state.chat_id,
-        "data": payload,
-        "last_update": datetime.now(timezone.utc).isoformat(),
-        "status": getattr(state, "status", None),
-        "mode": getattr(state, "mode", None),
-    }
-    with _sb() as c:
-        r = c.post("/states", json=body)  # upsert via Prefer header
-        r.raise_for_status()
-    logger.debug("Saved state %s to Supabase", state.game_id)
+    if SUPABASE_ENABLED:
+        body = {
+            "game_id": state.game_id,
+            "chat_id": state.chat_id,
+            "data": payload,
+            "last_update": datetime.now(timezone.utc).isoformat(),
+            "status": getattr(state, "status", None),
+            "mode": getattr(state, "mode", None),
+        }
+        with _sb() as c:
+            r = c.post("/states", json=body)
+            r.raise_for_status()
+        logger.debug("Saved state %s to Supabase", state.game_id)
+        return
+    ensure_local_directories()
+    data = _dump_json(payload)
+    path = STATES_DIR / f"{state.game_id}{STATE_FILE_SUFFIX}"
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp.name, path)
+    legacy = _derive_legacy_chat_id(state.game_id)
+    if legacy is None:
+        legacy = state.chat_id
+    if legacy is not None:
+        legacy_path = STATES_DIR / f"{legacy}{STATE_FILE_SUFFIX}"
+        if legacy_path != path:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=legacy_path.parent
+            ) as tmp:
+                tmp.write(data)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp.name, legacy_path)
+    logger.debug("Saved state %s to local storage", state.game_id)
 
 def delete_state(identifier: str | int | GameState) -> None:
     targets: set[str] = set()
@@ -628,35 +690,58 @@ def delete_state(identifier: str | int | GameState) -> None:
         legacy = _derive_legacy_chat_id(identifier)
         if legacy is not None:
             targets.add(str(legacy))
-    with _sb() as c:
-        # удаляем по game_id
-        for name in targets:
-            r = c.delete("/states", params={"game_id": f"eq.{name}"})
-            # если 204/200 — хорошо; 404 тут не бывает в REST, поэтому просто raise_for_status
-            r.raise_for_status()
-    logger.debug("Deleted state(s) %s from Supabase", ", ".join(sorted(targets)))
+    if SUPABASE_ENABLED:
+        with _sb() as c:
+            for name in targets:
+                r = c.delete("/states", params={"game_id": f"eq.{name}"})
+                r.raise_for_status()
+        logger.debug(
+            "Deleted state(s) %s from Supabase", ", ".join(sorted(targets))
+        )
+        return
+    for name in targets:
+        path = STATES_DIR / f"{name}{STATE_FILE_SUFFIX}"
+        with suppress(FileNotFoundError):
+            path.unlink()
+    logger.debug("Deleted state(s) %s from local storage", ", ".join(sorted(targets)))
 
 def load_all_states() -> Dict[str, GameState]:
     results: Dict[str, GameState] = {}
-    with _sb() as c:
-        # берём все (по умолчанию лимит 1000; при необходимости введите пагинацию по Range)
-        r = c.get("/states", params={"select": "data,last_update"})
-        r.raise_for_status()
-        rows = r.json()
-    for row in rows:
-        payload = row.get("data")
-        if not isinstance(payload, dict):
+    if SUPABASE_ENABLED:
+        with _sb() as c:
+            r = c.get("/states", params={"select": "data,last_update"})
+            r.raise_for_status()
+            rows = r.json()
+        for row in rows:
+            payload = row.get("data")
+            if not isinstance(payload, dict):
+                continue
+            try:
+                state = GameState.from_dict(payload)
+            except Exception:
+                logger.exception("Failed to parse game state from Supabase row")
+                continue
+            existing = results.get(state.game_id)
+            if existing and existing.last_update >= state.last_update:
+                continue
+            results[state.game_id] = state
+        logger.info("Restored %s game states from Supabase", len(results))
+        return results
+    ensure_local_directories()
+    for path in STATES_DIR.glob(f"*{STATE_FILE_SUFFIX}"):
+        payload = _load_json(path)
+        if not isinstance(payload, Mapping):
             continue
         try:
             state = GameState.from_dict(payload)
         except Exception:
-            logger.exception("Failed to parse game state from Supabase row")
+            logger.exception("Failed to parse game state from %s", path)
             continue
         existing = results.get(state.game_id)
         if existing and existing.last_update >= state.last_update:
             continue
         results[state.game_id] = state
-    logger.info("Restored %s game states from Supabase", len(results))
+    logger.info("Restored %s game states from local storage", len(results))
     return results
 
 def prune_expired_states(active_states: Dict[str, GameState]) -> list[GameState]:
@@ -675,6 +760,8 @@ __all__ = [
     "Player",
     "STATE_CLEANUP_INTERVAL",
     "STATE_EXPIRATION_SECONDS",
+    "SUPABASE_ENABLED",
+    "ensure_local_directories",
     "delete_state",
     "load_all_states",
     "load_puzzle",
@@ -683,3 +770,10 @@ __all__ = [
     "save_puzzle",
     "save_state",
 ]
+def ensure_local_directories() -> None:
+    if SUPABASE_ENABLED:
+        return
+    for directory in (DATA_ROOT, PUZZLES_DIR, STATES_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
