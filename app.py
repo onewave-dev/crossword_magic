@@ -5104,6 +5104,12 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
     chat = update.effective_chat
     message = update.effective_message
     if chat is None or message is None or not message.text:
+        logger.debug(
+            "Ignoring button language input without chat/message/text: chat=%s, message=%s, has_text=%s",
+            getattr(chat, "id", None) if chat is not None else None,
+            getattr(message, "message_id", None) if message is not None else None,
+            bool(message and message.text),
+        )
         return
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
         logger.debug(
@@ -5113,6 +5119,10 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
         return
     flow_state = _ensure_button_flow_state(context, chat)
     if flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
+        logger.debug(
+            "Ignoring button language input while at button step %s",
+            flow_state.get(BUTTON_STEP_KEY),
+        )
         return
     user = getattr(update, "effective_user", None)
     if user is not None:
