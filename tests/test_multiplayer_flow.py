@@ -2875,3 +2875,52 @@ async def test_announce_turn_dm_failure_uses_primary_chat(monkeypatch, tmp_path,
         game_state.chat_id,
     ]
 
+
+@pytest.mark.anyio
+async def test_finish_game_clears_chat_modes(monkeypatch, fresh_state):
+    puzzle = Puzzle.from_size("turn-test", "Тест", "ru", 3, 3)
+    admin_id = 123
+    dm_chat_id = 500
+    dummy_player = Player(user_id=app.DUMMY_USER_ID, name=app.DUMMY_NAME, is_bot=True)
+    admin_player = Player(user_id=admin_id, name="Admin", dm_chat_id=dm_chat_id)
+    game_state = GameState(
+        chat_id=-100,
+        puzzle_id=puzzle.id,
+        score=0,
+        started_at=time.time(),
+        last_update=time.time(),
+        host_id=admin_id,
+        game_id="admin:-100",
+        mode="turn_based",
+        status="running",
+        players={admin_id: admin_player, app.DUMMY_USER_ID: dummy_player},
+        turn_order=[admin_id, app.DUMMY_USER_ID],
+        turn_index=0,
+        scoreboard={admin_id: 0, app.DUMMY_USER_ID: 0},
+        test_mode=True,
+    )
+
+    bot = SimpleNamespace(send_message=AsyncMock())
+    context = SimpleNamespace(
+        bot=bot,
+        application=SimpleNamespace(chat_data={}),
+    )
+    context.application.chat_data[game_state.chat_id] = {"chat_mode": app.MODE_IN_GAME}
+    context.application.chat_data[dm_chat_id] = {"chat_mode": app.MODE_IN_GAME}
+
+    monkeypatch.setattr(app, "_load_puzzle_for_state", lambda _state: puzzle)
+    monkeypatch.setattr(app, "_cancel_turn_timers", lambda *_: None)
+    monkeypatch.setattr(app, "_cancel_game_timers", lambda *_: None)
+    monkeypatch.setattr(app, "_cancel_dummy_job", lambda *_: None)
+    monkeypatch.setattr(app, "_store_state", lambda *_: None)
+
+    broadcast_result = app.BroadcastResult(successful_chats={dm_chat_id})
+    monkeypatch.setattr(
+        app, "_broadcast_to_players", AsyncMock(return_value=broadcast_result)
+    )
+
+    await app._finish_game(context, game_state)
+
+    assert "chat_mode" not in context.application.chat_data[dm_chat_id]
+    assert "chat_mode" not in context.application.chat_data[game_state.chat_id]
+
