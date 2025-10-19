@@ -1786,7 +1786,7 @@ async def _announce_turn(
         player,
         prefix=prefix,
     )
-    fallback_text = caption
+    fallback_text = caption if broadcast_board else None
     if send_clues:
         await _broadcast_clues_message(context, game_state, puzzle)
 
@@ -6400,6 +6400,7 @@ async def _launch_admin_test_game(
             else None
         ),
         send_clues=False,
+        broadcast_board=False,
     )
 
     return admin_state, cloned_puzzle
