@@ -338,7 +338,7 @@ def _render_single_grid_image(
     width = cols * CELL_SIZE + PADDING * 2
     height = rows * CELL_SIZE + PADDING * 2
 
-    number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)))
+    number_font = _load_font(max(14, math.floor(CELL_SIZE * 0.28)) + 1)
     letter_font = _load_font(max(18, math.floor(CELL_SIZE * 0.6)), bold=True)
 
     cell_slots = _cell_slot_mapping(puzzle)
