@@ -502,6 +502,18 @@ def is_chat_mode_set(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return isinstance(chat_data, dict) and "chat_mode" in chat_data
 
 
+def _set_chat_mode_for_chat(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int | None, mode: str
+) -> None:
+    """Persist the provided chat mode for an arbitrary chat via application storage."""
+
+    chat_data = _get_chat_data_for_chat(context, chat_id)
+    if mode == MODE_IDLE:
+        chat_data.pop("chat_mode", None)
+    else:
+        chat_data["chat_mode"] = mode
+
+
 def _normalise_thread_id(update: Update) -> int:
     message = update.effective_message
     thread_id = 0
@@ -1944,6 +1956,11 @@ async def _finish_game(
     game_state.status = "finished"
     game_state.active_slot_id = None
     game_state.last_update = time.time()
+    affected_chat_ids: set[int] = {game_state.chat_id}
+    for _, chat_id in _iter_player_dm_chats(game_state):
+        affected_chat_ids.add(chat_id)
+    for chat_id in affected_chat_ids:
+        _set_chat_mode_for_chat(context, chat_id, MODE_IDLE)
     summary = _format_leaderboard(game_state)
     language_text = html.escape((puzzle.language or "?").upper())
     theme_text = html.escape(puzzle.theme or "Без темы")
@@ -2095,6 +2112,7 @@ async def _finish_single_game(
 
     _cancel_reminder(context)
     set_chat_mode(context, MODE_IDLE)
+    _set_chat_mode_for_chat(context, game_state.chat_id, MODE_IDLE)
     game_state.status = "finished"
     game_state.active_slot_id = None
     game_state.last_update = time.time()
