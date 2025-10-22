@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram import InlineKeyboardMarkup
 from telegram.constants import ChatType
 
 import app
@@ -24,6 +25,10 @@ from app import (
     button_language_handler,
     button_theme_handler,
     completion_callback_handler,
+    language_callback_handler,
+    LANGUAGE_BUTTONS,
+    LANGUAGE_CALLBACK_PREFIX,
+    LANGUAGE_PROMPT_TEXT,
     state,
 )
 from utils.crossword import Puzzle
@@ -75,6 +80,39 @@ async def test_button_language_handler_initialises_flow_when_missing():
 
 
 @pytest.mark.anyio
+async def test_language_callback_handler_processes_selection():
+    chat = SimpleNamespace(id=321, type=ChatType.PRIVATE)
+    message = SimpleNamespace(
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+        edit_reply_markup=AsyncMock(),
+    )
+    query = SimpleNamespace(
+        data=f"{LANGUAGE_CALLBACK_PREFIX}de",
+        message=message,
+        answer=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_chat=chat,
+        callback_query=query,
+        effective_message=message,
+    )
+    context = SimpleNamespace(chat_data={}, user_data={})
+
+    app.set_chat_mode(context, app.MODE_AWAIT_LANGUAGE)
+
+    await language_callback_handler(update, context)
+
+    flow_state = context.user_data[BUTTON_NEW_GAME_KEY]
+    assert flow_state[BUTTON_LANGUAGE_KEY] == "de"
+    assert flow_state[BUTTON_STEP_KEY] == BUTTON_STEP_THEME
+    assert context.user_data["new_game_language"] == "de"
+    message.reply_text.assert_awaited_once_with("Отлично! Теперь укажите тему кроссворда.")
+    message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    query.answer.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_completion_callback_followed_by_language_message_uses_private_storage(monkeypatch):
     chat = SimpleNamespace(id=555, type=ChatType.PRIVATE)
     callback_message = SimpleNamespace(message_thread_id=None, edit_reply_markup=AsyncMock())
@@ -106,7 +144,19 @@ async def test_completion_callback_followed_by_language_message_uses_private_sto
     callback_message.edit_reply_markup.assert_awaited_once()
     send_call = context.bot.send_message.await_args
     assert send_call.kwargs["chat_id"] == chat.id
-    assert "Выберите язык" in send_call.kwargs["text"]
+    assert send_call.kwargs["text"] == LANGUAGE_PROMPT_TEXT
+    reply_markup = send_call.kwargs["reply_markup"]
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_buttons = [
+        button
+        for row in reply_markup.inline_keyboard
+        for button in row
+    ]
+    assert [button.text for button in flat_buttons] == [label for _, label in LANGUAGE_BUTTONS]
+    assert all(
+        button.callback_data.startswith(LANGUAGE_CALLBACK_PREFIX)
+        for button in flat_buttons
+    )
 
     language_message = SimpleNamespace(text=" En ", message_thread_id=None, reply_text=AsyncMock())
     update_language = SimpleNamespace(effective_chat=chat, effective_message=language_message)

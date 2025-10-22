@@ -604,6 +604,17 @@ def _clear_button_flow_state(context: ContextTypes.DEFAULT_TYPE, chat: Chat | No
     _set_button_flow_state(context, chat, None)
 
 
+def _build_language_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=label, callback_data=f"{LANGUAGE_CALLBACK_PREFIX}{code}"
+        )
+        for code, label in LANGUAGE_BUTTONS
+    ]
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(rows)
+
+
 def _get_pending_language(context: ContextTypes.DEFAULT_TYPE, chat: Chat | None) -> str | None:
     storage = _get_new_game_storage(context, chat)
     value = storage.get("new_game_language")
@@ -695,6 +706,19 @@ BUTTON_LANGUAGE_KEY = "language"
 BUTTON_STEP_LANGUAGE = "language"
 BUTTON_STEP_THEME = "theme"
 PENDING_ADMIN_TEST_KEY = "pending_admin_test"
+
+LANGUAGE_PROMPT_TEXT = "Выберите язык кроссворда."
+LANGUAGE_CALLBACK_PREFIX = "language:"
+LANGUAGE_BUTTONS: tuple[tuple[str, str], ...] = (
+    ("ru", "🇷🇺 RU"),
+    ("en", "🇬🇧 EN"),
+    ("de", "🇩🇪 DE"),
+    ("fr", "🇫🇷 FR"),
+    ("es", "🇪🇸 ES"),
+    ("it", "🇮🇹 IT"),
+    ("pt", "🇵🇹 PT"),
+    ("sr", "🇷🇸 SR"),
+)
 
 GENERATION_NOTICE_KEY = "puzzle_generation_notice"
 GENERATION_TOKEN_KEY = "puzzle_generation_token"
@@ -4677,9 +4701,16 @@ async def _start_new_private_game(
 
     _set_pending_language(context, chat, None)
     set_chat_mode(context, MODE_AWAIT_LANGUAGE)
+    if chat is not None:
+        _set_button_flow_state(
+            context,
+            chat,
+            {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE},
+        )
     if message:
         await message.reply_text(
-            "Выберите язык кроссворда (например: ru, en, it, es).",
+            LANGUAGE_PROMPT_TEXT,
+            reply_markup=_build_language_keyboard(),
         )
     return LANGUAGE_STATE
 
@@ -4751,8 +4782,14 @@ async def _start_new_group_game(
     _store_state(game_state)
     set_chat_mode(context, MODE_AWAIT_LANGUAGE)
     _set_pending_language(context, chat, None)
+    _set_button_flow_state(
+        context,
+        chat,
+        {BUTTON_STEP_KEY: BUTTON_STEP_LANGUAGE},
+    )
     await message.reply_text(
-        f"{host_name} создаёт новую игру! Укажите язык кроссворда (например: ru, en)."
+        f"{host_name} создаёт новую игру! Укажите язык кроссворда.",
+        reply_markup=_build_language_keyboard(),
     )
     return LANGUAGE_STATE
 
@@ -5116,6 +5153,46 @@ async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return THEME_STATE
 
 
+async def _apply_language_choice(
+    chat: Chat,
+    context: ContextTypes.DEFAULT_TYPE,
+    flow_state: dict,
+    language: str,
+    *,
+    message: Message | None,
+) -> bool:
+    normalised = (language or "").strip().lower()
+    if not normalised or not normalised.isalpha():
+        if message is not None:
+            await message.reply_text(
+                "Пожалуйста, введите язык одним словом, например ru."
+            )
+        return False
+
+    game_state = _load_state_for_chat(chat.id)
+    if (
+        game_state is not None
+        and game_state.mode == "turn_based"
+        and game_state.status == "lobby"
+    ):
+        game_state.language = normalised
+        game_state.last_update = time.time()
+        _store_state(game_state)
+
+    flow_state[BUTTON_LANGUAGE_KEY] = normalised
+    flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
+    set_chat_mode(context, MODE_AWAIT_THEME)
+    _set_pending_language(context, chat, normalised)
+    logger.debug(
+        "Chat %s selected language %s via button flow",
+        chat.id if chat else "<unknown>",
+        normalised,
+    )
+    if message is not None:
+        await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+    return True
+
+
 @command_entrypoint()
 async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _normalise_thread_id(update)
@@ -5158,29 +5235,56 @@ async def button_language_handler(update: Update, context: ContextTypes.DEFAULT_
             trimmed_text,
         )
         return
-    language = trimmed_text.lower()
-    if not language or not language.isalpha():
-        await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
-        return
-    game_state = _load_state_for_chat(chat.id)
-    if (
-        game_state is not None
-        and game_state.mode == "turn_based"
-        and game_state.status == "lobby"
-    ):
-        game_state.language = language
-        game_state.last_update = time.time()
-        _store_state(game_state)
-    flow_state[BUTTON_LANGUAGE_KEY] = language
-    flow_state[BUTTON_STEP_KEY] = BUTTON_STEP_THEME
-    set_chat_mode(context, MODE_AWAIT_THEME)
-    _set_pending_language(context, chat, language)
-    logger.debug(
-        "Chat %s selected language %s via button flow",
-        update.effective_chat.id if update.effective_chat else "<unknown>",
-        language,
+    await _apply_language_choice(
+        chat,
+        context,
+        flow_state,
+        trimmed_text,
+        message=message,
     )
-    await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+
+
+@command_entrypoint()
+async def language_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    _normalise_thread_id(update)
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith(LANGUAGE_CALLBACK_PREFIX):
+        return
+
+    await query.answer()
+
+    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
+        return
+
+    flow_state = _ensure_button_flow_state(context, chat)
+    if flow_state.get(BUTTON_STEP_KEY) != BUTTON_STEP_LANGUAGE:
+        return
+
+    message = query.message
+    applied = await _apply_language_choice(
+        chat,
+        context,
+        flow_state,
+        data[len(LANGUAGE_CALLBACK_PREFIX) :],
+        message=message,
+    )
+
+    if applied and message is not None:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramError:
+            logger.debug(
+                "Failed to clear language keyboard for chat %s",
+                chat.id if chat else "<unknown>",
+                exc_info=True,
+            )
 
 
 @command_entrypoint(fallback=ConversationHandler.END)
@@ -7750,7 +7854,8 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         set_chat_mode(context, MODE_AWAIT_LANGUAGE)
         await context.bot.send_message(
             chat_id=chat.id,
-            text="Выберите язык кроссворда (например: ru, en, it, es).",
+            text=LANGUAGE_PROMPT_TEXT,
+            reply_markup=_build_language_keyboard(),
         )
         return
 
@@ -7793,7 +7898,8 @@ async def completion_callback_handler(update: Update, context: ContextTypes.DEFA
         set_chat_mode(context, MODE_AWAIT_LANGUAGE)
         await context.bot.send_message(
             chat_id=chat.id,
-            text="Выберите язык кроссворда (например: ru, en, it, es).",
+            text=LANGUAGE_PROMPT_TEXT,
+            reply_markup=_build_language_keyboard(),
         )
         logger.info("Prompted chat %s to start new puzzle flow", chat.id)
         return
@@ -7902,6 +8008,13 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
     telegram_application.add_handler(CommandHandler("cancel", cancel_new_game))
     telegram_application.add_handler(CommandHandler("join", join_command))
     telegram_application.add_handler(CommandHandler("admin", admin_menu_command))
+    telegram_application.add_handler(
+        CallbackQueryHandler(
+            language_callback_handler,
+            pattern=rf"^{re.escape(LANGUAGE_CALLBACK_PREFIX)}",
+            block=False,
+        )
+    )
     telegram_application.add_handler(
         CallbackQueryHandler(
             completion_callback_handler,
