@@ -502,6 +502,63 @@ def is_chat_mode_set(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return isinstance(chat_data, dict) and "chat_mode" in chat_data
 
 
+def _conversation_entry_matches(
+    key: Any,
+    chat_id: int | None,
+    user_id: int | None,
+    thread_id: int | None,
+) -> bool:
+    if isinstance(key, (tuple, list, set, frozenset)):
+        return any(
+            _conversation_entry_matches(part, chat_id, user_id, thread_id)
+            for part in key
+        )
+    if not isinstance(key, int):
+        return False
+    if chat_id is not None and key == chat_id:
+        return True
+    if user_id is not None and key == user_id:
+        return True
+    if thread_id is not None and thread_id > 0 and key == thread_id:
+        return True
+    return False
+
+
+def _clear_new_game_conversation_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int | None,
+    user_id: int | None,
+    thread_id: int | None,
+) -> None:
+    if chat_id is None and user_id is None and thread_id is None:
+        return
+    application = getattr(context, "application", None)
+    if application is None:
+        return
+    conversation_data = getattr(application, "conversation_data", None)
+    if not isinstance(conversation_data, MutableMapping):
+        return
+    store = conversation_data.get("new_game_conversation")
+    if not isinstance(store, MutableMapping):
+        return
+    keys_to_remove = [
+        key
+        for key in list(store.keys())
+        if _conversation_entry_matches(key, chat_id, user_id, thread_id)
+    ]
+    for key in keys_to_remove:
+        store.pop(key, None)
+    if not store:
+        conversation_data.pop("new_game_conversation", None)
+    if keys_to_remove:
+        logger.debug(
+            "Cleared %s conversation entries for chat %s",
+            len(keys_to_remove),
+            chat_id,
+        )
+
+
 def _set_chat_mode_for_chat(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int | None, mode: str
 ) -> None:
@@ -4721,7 +4778,7 @@ async def _start_new_group_game(
     thread_id = _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     if chat is None or message is None:
         return ConversationHandler.END
     if chat.id in state.generating_chats:
@@ -4801,7 +4858,7 @@ async def _process_join_code(
 ) -> None:
     chat = update.effective_chat
     message = update.effective_message
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     if chat is None or message is None or user is None:
         return
     if chat.type != ChatType.PRIVATE:
@@ -4985,7 +5042,7 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     if chat and chat.type == ChatType.PRIVATE and context.args:
         first_arg = context.args[0]
         if first_arg and first_arg.lower().startswith("join_"):
@@ -7713,20 +7770,31 @@ async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.info("Revealed remaining slots via /solve (%s entries)", len(solved_now))
 
 @command_entrypoint()
-async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _normalise_thread_id(update)
+async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    thread_id = _normalise_thread_id(update)
     if not await _reject_group_chat(update):
-        return
+        return ConversationHandler.END
     chat = update.effective_chat
     message = update.effective_message
+    user = getattr(update, "effective_user", None)
+    chat_id = chat.id if chat else None
+    user_id = user.id if user else None
+    _clear_new_game_conversation_state(
+        context,
+        chat_id=chat_id,
+        user_id=user_id,
+        thread_id=thread_id if thread_id > 0 else None,
+    )
     if chat is None or message is None:
-        return
+        return ConversationHandler.END
 
     logger.info("Chat %s requested /quit", chat.id)
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
         set_chat_mode(context, MODE_IDLE)
-        await message.reply_text("Нет активной игры. Используйте /new, чтобы начать новую сессию.")
-        return
+        await message.reply_text(
+            "Нет активной игры. Используйте /new, чтобы начать новую сессию."
+        )
+        return ConversationHandler.END
     game_state = _load_state_for_chat(chat.id)
 
     _cancel_reminder(context)
@@ -7740,6 +7808,7 @@ async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     set_chat_mode(context, MODE_IDLE)
     await message.reply_text("Сессия завершена. Нажмите /start, чтобы начать заново")
+    return ConversationHandler.END
 
 
 @command_entrypoint()
@@ -7925,7 +7994,10 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
             LANGUAGE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_language)],
             THEME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_theme)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_new_game)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_new_game),
+            CommandHandler("quit", quit_command),
+        ],
         name="new_game_conversation",
         block=False,
     )
