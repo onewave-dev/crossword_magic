@@ -683,6 +683,29 @@ async def test_start_new_game_shows_menu_private(monkeypatch, fresh_state):
 
 
 @pytest.mark.anyio
+async def test_start_new_game_warns_about_active_session(monkeypatch, fresh_state):
+    chat = SimpleNamespace(id=202, type=ChatType.PRIVATE)
+    message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=77)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_message=message,
+        effective_user=user,
+    )
+    context = SimpleNamespace(args=[], chat_data={}, user_data={}, bot=SimpleNamespace())
+
+    active_state = GameState(chat_id=chat.id, puzzle_id="p-test", status="running")
+    state.active_games[active_state.game_id] = active_state
+    state.chat_to_game[chat.id] = active_state.game_id
+
+    result = await start_new_game(update, context)
+
+    assert result == ConversationHandler.END
+    message.reply_text.assert_awaited_once()
+    assert "/quit" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.anyio
 async def test_start_new_game_adds_admin_button_for_admin(monkeypatch, fresh_state):
     chat = SimpleNamespace(id=303, type=ChatType.PRIVATE)
     message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
