@@ -7806,17 +7806,30 @@ async def quit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     logger.info("Chat %s requested /quit", chat.id)
-    if is_chat_mode_set(context) and get_chat_mode(context) != MODE_IN_GAME:
+    current_mode = get_chat_mode(context) if is_chat_mode_set(context) else MODE_IDLE
+    game_state = _load_state_for_chat(chat.id)
+    token_present = bool(context.chat_data.get(GENERATION_TOKEN_KEY))
+    generation_pending = chat.id in state.generating_chats or token_present
+    if (
+        game_state is not None
+        and getattr(game_state, "generation_in_progress", False)
+    ):
+        generation_pending = True
+    has_pending_flow = current_mode in {MODE_AWAIT_LANGUAGE, MODE_AWAIT_THEME}
+
+    if not game_state and not generation_pending and not has_pending_flow:
         set_chat_mode(context, MODE_IDLE)
         await message.reply_text(
             "Нет активной игры. Используйте /new, чтобы начать новую сессию."
         )
         return ConversationHandler.END
-    game_state = _load_state_for_chat(chat.id)
 
     _cancel_reminder(context)
     context.chat_data.pop(GENERATION_TOKEN_KEY, None)
     _clear_generation_notice(context, chat.id)
+    _clear_pending_language(context, chat)
+    _clear_button_flow_state(context, chat)
+    _clear_pending_admin_test(context)
 
     if game_state is not None:
         _cleanup_game_state(game_state)
