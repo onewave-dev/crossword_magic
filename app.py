@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import html
 import os
 import random
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any, AsyncIterator, Iterable, Mapping, MutableMapping, Optional, Sequence
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -8107,11 +8109,25 @@ def configure_telegram_handlers(telegram_application: Application) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _hostname_resolves(hostname: str) -> bool:
+    """Check whether the provided hostname can be resolved via DNS."""
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, socket.getaddrinfo, hostname, None)
+    except socket.gaierror:
+        return False
+    return True
+
+
 async def monitor_webhook(application: Application, settings: Settings) -> None:
     """Background task to periodically ensure webhook registration is valid."""
 
     logger.debug("Starting webhook monitor task with interval %s seconds", settings.webhook_check_interval)
     expected_url = f"{settings.public_url}{settings.webhook_path}"
+    parsed_expected = urlparse(expected_url)
+    expected_hostname = parsed_expected.hostname
+    dns_failure_logged = False
     while True:
         try:
             info = await application.bot.get_webhook_info()
@@ -8119,12 +8135,35 @@ async def monitor_webhook(application: Application, settings: Settings) -> None:
             current_secret = getattr(info, "secret_token", None)
             if info.url != expected_url or (current_secret and current_secret != settings.webhook_secret):
                 logger.warning("Webhook mismatch detected. Expected url=%s secret token=%s", expected_url, settings.webhook_secret)
+                if expected_hostname:
+                    hostname_resolves = await _hostname_resolves(expected_hostname)
+                    if not hostname_resolves:
+                        log_method = logger.error if not dns_failure_logged else logger.warning
+                        log_method(
+                            "Skipping webhook re-registration because the host %s cannot be resolved. "
+                            "Check PUBLIC_URL DNS configuration before retrying.",
+                            expected_hostname,
+                        )
+                        dns_failure_logged = True
+                        await asyncio.sleep(settings.webhook_check_interval)
+                        continue
                 await application.bot.set_webhook(
                     url=expected_url,
                     secret_token=settings.webhook_secret,
                     allowed_updates=["message","callback_query","chat_member","my_chat_member","message_reaction","message_reaction_count"],
                 )
                 logger.info("Webhook re-registered due to mismatch")
+                dns_failure_logged = False
+        except BadRequest as exc:
+            message = str(exc)
+            if "failed to resolve host" in message.lower() and expected_hostname:
+                logger.error(
+                    "Telegram rejected webhook registration because host %s could not be resolved. "
+                    "Verify PUBLIC_URL DNS settings and connectivity.",
+                    expected_hostname,
+                )
+            else:
+                logger.exception("Failed to validate or reset webhook due to Telegram bad request")
         except Exception:  # noqa: BLE001 - We want to log all failures
             logger.exception("Failed to validate or reset webhook")
 
