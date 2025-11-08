@@ -5058,6 +5058,21 @@ async def start_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     admin_id = settings.admin_id if settings else None
     is_admin = user is not None and admin_id is not None and user.id == admin_id
 
+    existing_state: GameState | None = None
+    if chat is not None:
+        existing_state = _load_state_for_chat(chat.id)
+    if existing_state is not None and existing_state.status != "finished":
+        if message is not None:
+            status_text = (
+                "Сессия уже создана и ещё не завершена."
+                if existing_state.status == "lobby"
+                else "Сессия уже запущена."
+            )
+            await message.reply_text(
+                f"{status_text} Если хотите начать заново, сначала выйдите командой /quit.",
+            )
+        return ConversationHandler.END
+
     await _send_start_menu_prompt(
         context,
         chat,
