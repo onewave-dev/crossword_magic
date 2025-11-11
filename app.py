@@ -2763,6 +2763,7 @@ async def _run_lobby_puzzle_generation(
             refreshed.puzzle_ids = None
             refreshed.hinted_cells = set()
             refreshed.last_update = time.time()
+            refreshed.generation_in_progress = False
             _store_state(refreshed)
             try:
                 if game_id in state.lobby_messages:
@@ -2776,6 +2777,7 @@ async def _run_lobby_puzzle_generation(
                 )
         target_state = refreshed or base_state
         if target_state:
+            target_state.generation_in_progress = False
             _clear_generation_notice_for_game(context, target_state)
             try:
                 await _send_game_message(
@@ -2823,6 +2825,7 @@ async def _run_lobby_puzzle_generation(
     refreshed.theme = theme
     refreshed.last_update = time.time()
     refreshed.status = "lobby"
+    refreshed.generation_in_progress = False
     _store_state(refreshed)
     update_succeeded = True
     try:
@@ -5419,6 +5422,7 @@ async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         game_state.active_slot_id = None
         game_state.status = "lobby"
         game_state.last_update = time.time()
+        game_state.generation_in_progress = True
         _store_state(game_state)
         _clear_pending_language(context, chat)
         set_chat_mode(context, MODE_IDLE)
