@@ -4779,7 +4779,11 @@ async def _start_new_private_game(
 
 async def _start_new_group_game(
     update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+    ) -> int:
+    logger.info("flow:new_group start chat=%s user=%s thread=%s",
+        getattr(update.effective_chat, "id", None),
+        getattr(update.effective_user, "id", None),
+        _normalise_thread_id(update))
     thread_id = _normalise_thread_id(update)
     chat = update.effective_chat
     message = update.effective_message
@@ -5176,58 +5180,71 @@ async def new_game_menu_admin_proxy_handler(
 
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # нормализуем thread_id (если есть topics)
     _normalise_thread_id(update)
+
     chat = update.effective_chat
     message = update.effective_message
+
+    # базовая валидация
     if chat is None or message is None or not message.text:
+        logger.debug("flow:language invalid input (chat/message/text missing)")
         return LANGUAGE_STATE
+
+    # режим ожидания: должен быть MODE_AWAIT_LANGUAGE
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_LANGUAGE:
-        logger.debug(
-            "Ignoring language input while in mode %s",
-            get_chat_mode(context),
+        logger.warning(
+            "flow:language IGNORED (mode=%s, expected=%s). text=%r",
+            get_chat_mode(context), MODE_AWAIT_LANGUAGE, message.text
         )
         return LANGUAGE_STATE
-    language = message.text.strip().lower()
+
+    language = (message.text or "").strip().lower()
     if not language or not language.isalpha():
+        logger.info("flow:language bad format chat=%s text=%r", getattr(chat, "id", None), message.text)
         await message.reply_text("Пожалуйста, введите язык одним словом, например ru.")
         return LANGUAGE_STATE
-    logger.debug(
-        "Chat %s selected language %s",
-        chat.id if chat else "<unknown>",
-        language,
+
+    logger.info(
+        "flow:language chat=%s text=%r",
+        getattr(chat, "id", None), message.text
     )
+
+    # админский тестовый сценарий?
     pending_admin_chat = _get_pending_admin_test(context)
     is_admin_flow = chat is not None and pending_admin_chat == chat.id
-    game_state = _load_state_for_chat(chat.id)
-    lobby_mode = (
-        game_state is not None
-        and game_state.mode == "turn_based"
-        and game_state.status == "lobby"
+
+    # есть ли уже лобби/состояние для этого чата
+    game_state = _lookup_state(chat.id)
+
+    logger.debug(
+        "flow:language resolved language=%s chat_type=%s admin_flow=%s state_exists=%s",
+        language, getattr(chat, "type", None), is_admin_flow, bool(game_state)
     )
-    if chat.type in GROUP_CHAT_TYPES or lobby_mode:
-        if not lobby_mode:
-            await message.reply_text("Создайте новую игру командой /new в этом чате.")
-            set_chat_mode(context, MODE_IDLE)
-            _clear_pending_language(context, chat)
-            _clear_pending_admin_test(context)
-            return ConversationHandler.END
-        game_state.language = language
-        game_state.last_update = time.time()
-        _store_state(game_state)
-        _set_pending_language(context, chat, language)
-        set_chat_mode(context, MODE_AWAIT_THEME)
+
+    # если лобби уже существует — записываем язык прямо в state и переходим к теме
+    if game_state is not None and getattr(game_state, "status", "") == "lobby":
+        try:
+            game_state.language = language
+            _store_state(game_state)
+            logger.info("flow:language updated existing lobby chat=%s game_id=%s",
+                        chat.id, getattr(game_state, "game_id", None))
+        except Exception:  # noqa: BLE001
+            logger.exception("flow:language failed to store state for chat=%s", chat.id)
         if is_admin_flow:
-            await message.reply_text(
-                "Отлично! Теперь укажите тему для тестовой игры.",
-            )
+            await message.reply_text("Отлично! Теперь укажите тему для тестовой игры.")
         else:
             await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
+        logger.info("flow:language -> THEME_STATE chat=%s pending_language=%s", chat.id, language)
         return THEME_STATE
 
+    # «обычный» путь: язык сохраняем временно и ждём тему
     _set_pending_language(context, chat, language)
     set_chat_mode(context, MODE_AWAIT_THEME)
+    logger.info("flow:language set MODE_AWAIT_THEME chat=%s pending_language=%s", chat.id, language)
     await message.reply_text("Отлично! Теперь укажите тему кроссворда.")
     return THEME_STATE
+
 
 
 async def _apply_language_choice(
@@ -5366,272 +5383,185 @@ async def language_callback_handler(
 
 @command_entrypoint(fallback=ConversationHandler.END)
 async def handle_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # нормализуем thread_id (если есть topics)
     _normalise_thread_id(update)
+
     chat = update.effective_chat
     message = update.effective_message
+
     if chat is None or message is None or not message.text:
+        logger.debug("flow:theme invalid input (chat/message/text missing)")
         return THEME_STATE
+
     if is_chat_mode_set(context) and get_chat_mode(context) != MODE_AWAIT_THEME:
-        logger.debug(
-            "Ignoring theme input while in mode %s",
-            get_chat_mode(context),
+        logger.warning(
+            "flow:theme IGNORED (mode=%s, expected=%s). text=%r",
+            get_chat_mode(context), MODE_AWAIT_THEME, message.text
         )
         return THEME_STATE
+
+    logger.info(
+        "flow:theme chat=%s text=%r",
+        getattr(chat, "id", None), message.text
+    )
 
     user = getattr(update, "effective_user", None)
     pending_admin_chat = _get_pending_admin_test(context)
     is_admin_flow = chat is not None and pending_admin_chat == chat.id
-    game_state = _load_state_for_chat(chat.id)
-    lobby_mode = (
-        game_state is not None
-        and game_state.mode == "turn_based"
-        and game_state.status == "lobby"
+
+    game_state = _lookup_state(chat.id)
+    lobby_mode = bool(game_state and getattr(game_state, "status", "") == "lobby")
+
+    logger.debug(
+        "flow:theme admin_flow=%s state_exists=%s lobby=%s lang_in_state=%r",
+        is_admin_flow, game_state is not None, lobby_mode,
+        (getattr(game_state, "language", None) if game_state else None)
     )
+
+    # если тема приходит в группе (или лобби) — работаем непосредственно с лобби
     if chat.type in GROUP_CHAT_TYPES or lobby_mode:
         if not lobby_mode:
+            logger.warning("flow:theme NO_LOBBY for chat=%s (state=%r)", chat.id, game_state)
             await message.reply_text("Создайте новую игру командой /new в этом чате.")
             set_chat_mode(context, MODE_IDLE)
             _clear_pending_language(context, chat)
             _clear_pending_admin_test(context)
             return ConversationHandler.END
+
         theme = message.text.strip()
         if not theme:
             await message.reply_text("Введите тему, например: Древний Рим.")
             return THEME_STATE
+
         language = game_state.language or _get_pending_language(context, chat)
         if not language:
-            await message.reply_text("Сначала выберите язык через команду /new.")
-            set_chat_mode(context, MODE_IDLE)
-            _clear_pending_language(context, chat)
-            _clear_pending_admin_test(context)
-            return ConversationHandler.END
-        game_state.language = language
-        game_state.theme = theme
-        previous_puzzle_id = game_state.puzzle_id
-        if previous_puzzle_id:
-            delete_puzzle(previous_puzzle_id)
-        game_state.puzzle_id = ""
-        game_state.puzzle_ids = None
-        game_state.filled_cells.clear()
-        game_state.solved_slots.clear()
-        game_state.hinted_cells = set()
-        game_state.score = 0
-        game_state.scoreboard.clear()
-        game_state.turn_order.clear()
-        game_state.turn_index = 0
-        game_state.active_slot_id = None
-        game_state.status = "lobby"
-        game_state.last_update = time.time()
-        game_state.generation_in_progress = True
-        _store_state(game_state)
-        _clear_pending_language(context, chat)
-        set_chat_mode(context, MODE_IDLE)
+            logger.warning("flow:theme lobby has no language chat=%s", chat.id)
+            await message.reply_text("Сначала укажите язык (например, ru).")
+            set_chat_mode(context, MODE_AWAIT_LANGUAGE)
+            return LANGUAGE_STATE
+
+        logger.info(
+            "flow:theme accept theme=%r lang=%r chat=%s game_id=%s",
+            theme, language, chat.id, getattr(game_state, "game_id", None)
+        )
+
+        # сохраняем состояние, помечаем генерацию
+        try:
+            game_state.language = language
+            game_state.theme = theme
+            _store_state(game_state)
+            logger.debug("flow:theme state_saved status=%s generation_in_progress=%s",
+                         getattr(game_state, "status", None),
+                         getattr(game_state, "generation_in_progress", None))
+        except Exception:  # noqa: BLE001
+            logger.exception("flow:theme failed to store state chat=%s", chat.id)
+
+        # если вдруг осталась старая задача генерации — отменяем
         existing_task = state.lobby_generation_tasks.get(game_state.game_id)
         if existing_task:
-            state.lobby_generation_tasks.pop(game_state.game_id, None)
-            if not existing_task.done():
-                existing_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await existing_task
+            logger.warning("flow:theme generation task already exists for game_id=%s", game_state.game_id)
+            existing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await existing_task
+
+        # админский 1×1 тест vs обычное лобби
         if is_admin_flow:
             state.lobby_generation_tasks.pop(game_state.game_id, None)
             await message.reply_text(
-                "\n".join(
-                    [
-                        "[адм.] Тестовая игра 1×1 запущена!",
-                        f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
-                    ]
-                )
+                "\n".join([
+                    "[адм.] Тестовая игра 1×1 запущена!",
+                    f"Игроки: {_user_display_name(user)} и {DUMMY_NAME}.",
+                ])
             )
-            await message.reply_text(
-                "[адм.] Готовлю тестовый кроссворд, это может занять немного времени.",
-            )
+            await message.reply_text("[адм.] Готовлю тестовый кроссворд, это может занять немного времени.")
             loop = asyncio.get_running_loop()
             puzzle: Puzzle | CompositePuzzle | None = None
             generated_state: GameState | None = None
             state.generating_chats.add(chat.id)
             try:
                 puzzle, generated_state = await _run_generate_puzzle(
-                    loop,
-                    chat.id,
-                    language,
-                    theme,
+                    loop, chat.id, language, theme,
                     game_state.thread_id if getattr(game_state, "thread_id", 0) else 0,
                 )
             except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Failed to generate admin test puzzle for chat %s", chat.id
-                )
-                await message.reply_text(
-                    "Не удалось подготовить тестовую игру. Попробуйте снова через /admin.",
-                )
-                _clear_pending_admin_test(context)
-                return ConversationHandler.END
+                logger.exception("generation:prepare FAILED (admin) chat=%s", chat.id)
             finally:
                 state.generating_chats.discard(chat.id)
-            if generated_state is None or puzzle is None:
-                await message.reply_text(
-                    "Не удалось подготовить тестовую игру. Попробуйте снова через /admin.",
-                )
+
+            if generated_state is None:
+                await message.reply_text("Не удалось подготовить кроссворд для тестовой игры 😕")
                 _clear_pending_admin_test(context)
                 return ConversationHandler.END
-            game_state.puzzle_id = generated_state.puzzle_id
-            game_state.puzzle_ids = generated_state.puzzle_ids
-            game_state.last_update = time.time()
-            _store_state(game_state)
-            if user is None:
-                logger.warning(
-                    "Admin test flow missing user context for chat %s", chat.id
-                )
-                await message.reply_text(
-                    "Не удалось определить администратора для тестовой игры.",
-                )
-                _clear_pending_admin_test(context)
-                return ConversationHandler.END
-            try:
-                await _launch_admin_test_game(
-                    context,
-                    base_state=game_state,
-                    puzzle=puzzle,
-                    admin_user=user,
-                    source_chat=chat,
-                    announce_start=False,
-                )
-            except PermissionError:
-                await message.reply_text(
-                    "Недостаточно прав для запуска тестовой игры.",
-                )
-                _clear_pending_admin_test(context)
-                return ConversationHandler.END
-            except RuntimeError:
-                await message.reply_text("Режим тестовой игры недоступен.")
-                _clear_pending_admin_test(context)
-                return ConversationHandler.END
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Failed to start admin test game from theme flow for chat %s",
-                    chat.id,
-                )
-                await message.reply_text(
-                    "Не удалось запустить тестовую игру. Попробуйте снова через /admin.",
-                )
-                _clear_pending_admin_test(context)
-                return ConversationHandler.END
-            _clear_pending_admin_test(context)
-            return ConversationHandler.END
-        await _send_generation_notice_to_game(
-            context,
-            game_state,
-            "Тема сохранена! Готовим кроссворд, это может занять немного времени.",
-            message=message,
-        )
-        if game_state.game_id not in state.lobby_messages:
-            await _publish_lobby_message(context, game_state)
-        else:
-            await _update_lobby_message(context, game_state)
-        generation_task = asyncio.create_task(
-            _run_lobby_puzzle_generation(
-                context, game_state.game_id, language, theme
+
+            logger.info(
+                "generation:prepared game_id=%s puzzle_id=%s",
+                getattr(generated_state, "game_id", None),
+                getattr(generated_state, "puzzle_id", None)
             )
-        )
-        state.lobby_generation_tasks[game_state.game_id] = generation_task
-        return ConversationHandler.END
 
-    if chat.id in state.generating_chats:
-        await message.reply_text(
-            "Мы всё ещё готовим ваш кроссворд. Пожалуйста, подождите."
-        )
+            try:
+                await _deliver_admin_test_game(update, context, user, generated_state, puzzle)
+                logger.info("lobby:sent (admin test) chat=%s game_id=%s", chat.id, generated_state.game_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("generation:deliver FAILED (admin) chat=%s game_id=%s", chat.id, generated_state.game_id)
+            finally:
+                _clear_pending_admin_test(context)
+            return ConversationHandler.END
+
+        # обычный групповой режим: ставим асинхронную генерацию и показываем лобби
+        task = asyncio.create_task(_spawn_group_generation(update, context, game_state, language, theme))
+        state.lobby_generation_tasks[game_state.game_id] = task
+        logger.info("flow:theme generation task scheduled game_id=%s", game_state.game_id)
+
+        try:
+            await _send_group_lobby(update, context, game_state)
+            logger.info("lobby:sent chat=%s game_id=%s", chat.id, game_state.game_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("lobby:send FAILED chat=%s game_id=%s", chat.id, game_state.game_id)
+
         set_chat_mode(context, MODE_IDLE)
         _clear_pending_language(context, chat)
         return ConversationHandler.END
 
-    language = _get_pending_language(context, chat)
-    if not language:
-        await message.reply_text("Сначала выберите язык через команду /new.")
-        set_chat_mode(context, MODE_IDLE)
-        _clear_pending_language(context, chat)
-        return ConversationHandler.END
-
+    # приватный чат (создание приватного лобби)
     theme = message.text.strip()
     if not theme:
         await message.reply_text("Введите тему, например: Древний Рим.")
         return THEME_STATE
 
-    logger.info("Chat %s selected theme %s", chat.id, theme)
-    _cancel_reminder(context)
-    await _send_generation_notice(
-        context,
-        chat.id,
-        "Готовлю кроссворд, это может занять немного времени...",
-        message=message,
-    )
-    loop = asyncio.get_running_loop()
-    generation_token = secrets.token_hex(16)
-    context.chat_data[GENERATION_TOKEN_KEY] = generation_token
+    language = _get_pending_language(context, chat)
+    if not language:
+        logger.warning("flow:theme private has no pending language chat=%s", chat.id)
+        await message.reply_text("Сначала укажите язык (например, ru).")
+        set_chat_mode(context, MODE_AWAIT_LANGUAGE)
+        return LANGUAGE_STATE
+
+    logger.info("flow:theme (private) accept theme=%r lang=%r chat=%s", theme, language, chat.id)
+
     try:
-        puzzle: Puzzle | CompositePuzzle | None = None
-        game_state: GameState | None = None
-        state.generating_chats.add(chat.id)
-        try:
-            puzzle, game_state = await _run_generate_puzzle(
-                loop,
-                chat.id,
-                language,
-                theme,
-                state.chat_threads.get(chat.id, 0),
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to generate puzzle for chat %s", chat.id)
-            _cleanup_chat_resources(chat.id)
-            _clear_generation_notice(context, chat.id)
-            await message.reply_text(
-                "Сейчас не получилось подготовить кроссворд. Попробуйте выполнить /new чуть позже."
-            )
-            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-            set_chat_mode(context, MODE_IDLE)
-            return ConversationHandler.END
-        finally:
-            state.generating_chats.discard(chat.id)
-
-        stored_token = context.chat_data.get(GENERATION_TOKEN_KEY)
-        if stored_token != generation_token:
-            logger.info(
-                "Skipping delivery for chat %s because generation was cancelled",
-                chat.id,
-            )
-            set_chat_mode(context, MODE_IDLE)
-            if game_state is not None:
-                _cleanup_game_state(game_state)
-            _clear_generation_notice(context, chat.id)
-            context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-            return ConversationHandler.END
-
-        context.chat_data.pop(GENERATION_TOKEN_KEY, None)
-        set_chat_mode(context, MODE_IN_GAME)
-        delivered = await _deliver_puzzle_via_bot(context, chat.id, puzzle, game_state)
-        if not delivered:
-            set_chat_mode(context, MODE_IDLE)
-            _cleanup_game_state(game_state)
-            _clear_generation_notice(context, chat.id)
-            await message.reply_text(
-                "Возникла ошибка при подготовке кроссворда. Попробуйте начать новую игру командой /new."
-            )
-            return ConversationHandler.END
-
-        if context.job_queue:
-            job = context.job_queue.run_once(
-                _reminder_job,
-                REMINDER_DELAY_SECONDS,
-                chat_id=chat.id,
-                name=f"hint-reminder-{chat.id}",
-            )
-            context.chat_data["reminder_job"] = job
-
-        _clear_generation_notice(context, chat.id)
-        logger.info("Delivered freshly generated puzzle to chat")
-        return ConversationHandler.END
-    finally:
+        game_state = await _create_or_get_private_lobby(update, context, language, theme)
+        logger.debug("flow:theme (private) state_saved game_id=%s", getattr(game_state, "game_id", None))
+    except Exception:  # noqa: BLE001
+        logger.exception("flow:theme (private) failed to create lobby chat=%s", chat.id)
+        await message.reply_text("Не удалось создать лобби. Попробуйте ещё раз.")
+        set_chat_mode(context, MODE_IDLE)
         _clear_pending_language(context, chat)
+        return ConversationHandler.END
+
+    # планируем генерацию и отправляем лобби
+    task = asyncio.create_task(_spawn_group_generation(update, context, game_state, language, theme))
+    state.lobby_generation_tasks[game_state.game_id] = task
+    logger.info("flow:theme (private) generation task scheduled game_id=%s", game_state.game_id)
+
+    try:
+        await _send_group_lobby(update, context, game_state)
+        logger.info("lobby:sent (private) chat=%s game_id=%s", chat.id, game_state.game_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("lobby:send FAILED (private) chat=%s game_id=%s", chat.id, game_state.game_id)
+
+    set_chat_mode(context, MODE_IDLE)
+    _clear_pending_language(context, chat)
+    return ConversationHandler.END
 
 
 @command_entrypoint()
