@@ -917,6 +917,7 @@ async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
     async def fake_run(context_arg, game_id_arg, language_arg, theme_arg):
         generation_calls.append((context_arg, game_id_arg, language_arg, theme_arg))
         state.lobby_generation_tasks.pop(game_id_arg, None)
+        state.active_games[game_id_arg].generation_in_progress = False
 
     monkeypatch.setattr(app, "_run_lobby_puzzle_generation", fake_run)
     run_generate_mock = AsyncMock()
@@ -925,11 +926,13 @@ async def test_private_multiplayer_flow_from_dm(monkeypatch, fresh_state):
     theme_result = await app.handle_theme(update_theme, context)
 
     assert theme_result == ConversationHandler.END
+    assert game_state.generation_in_progress is True
     await asyncio.sleep(0)
     assert generation_calls == [(context, game_id, "ru", "История")]
     run_generate_mock.assert_not_awaited()
     theme_message.reply_text.assert_awaited()
     assert game_state.theme == "История"
+    assert game_state.generation_in_progress is False
     assert state.lobby_host_invites[game_id][0] == chat.id
     assert send_message_mock.await_count >= 1
     assert state.lobby_generation_tasks.get(game_id) is None
